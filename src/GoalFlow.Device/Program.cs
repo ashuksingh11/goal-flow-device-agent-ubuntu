@@ -39,6 +39,27 @@ var dispatch = JsonSerializer.Deserialize<Dispatch>(contractJson, ContractJson.O
     ?? throw new InvalidOperationException($"Unable to deserialize dispatch contract '{options.ContractPath}'.");
 
 var planReady = await pipeline.RunAsync(dispatch);
+if (options.SimulateApprovalPath is not null)
+{
+    var approvalJson = await File.ReadAllTextAsync(options.SimulateApprovalPath);
+    var approval = JsonSerializer.Deserialize<Approval>(approvalJson, ContractJson.Options)
+        ?? throw new InvalidOperationException($"Unable to deserialize approval '{options.SimulateApprovalPath}'.");
+    foreach (var status in await pipeline.OnApprovalAsync(approval))
+    {
+        Console.WriteLine(JsonSerializer.Serialize(status, ContractJson.Options));
+    }
+
+    if (options.ReplaySimulatedApproval)
+    {
+        foreach (var status in await pipeline.OnApprovalAsync(approval))
+        {
+            Console.WriteLine(JsonSerializer.Serialize(status, ContractJson.Options));
+        }
+    }
+
+    return;
+}
+
 Console.WriteLine(JsonSerializer.Serialize(planReady, ContractJson.Options));
 
 static Pipeline BuildPipeline(CliOptions options, IClock clock, ITrace trace)
@@ -63,16 +84,25 @@ static Pipeline BuildPipeline(CliOptions options, IClock clock, ITrace trace)
         _ => throw new ArgumentException($"Unknown planner '{options.Planner}'. Use rules, llm, or scripted."),
     };
 
+    var shoppingList = new MockShoppingListApi(Path.Combine(options.DataDir, "shopping_list.json"));
+    var reminders = new MockReminderApi(Path.Combine(options.DataDir, "reminders.json"));
     var grounding = new Grounding(
         new MockInventoryApi(Path.Combine(options.DataDir, "inventory.json")),
         new MockCalendarApi(Path.Combine(options.DataDir, "calendar.json")),
         new MockRecipeApi(Path.Combine(options.DataDir, "recipes.json")),
-        new MockShoppingListApi(Path.Combine(options.DataDir, "shopping_list.json")),
-        new MockReminderApi(Path.Combine(options.DataDir, "reminders.json")),
+        shoppingList,
+        reminders,
         clock,
         trace);
 
-    return new Pipeline(planner, grounding, new SafetyGate(trace, clock), new ApprovalBroker(clock, trace), clock, trace);
+    return new Pipeline(
+        planner,
+        grounding,
+        new SafetyGate(trace, clock),
+        new ApprovalBroker(clock, trace),
+        new EffectExecutor(shoppingList, reminders, clock, trace),
+        clock,
+        trace);
 }
 
 static void LoadDotEnv(string path)
@@ -120,6 +150,12 @@ internal sealed record CliOptions
     /// <summary>--data (optional): mock-world directory. Default: ./data.</summary>
     public string DataDir { get; init; } = "data";
 
+    /// <summary>--simulate-approval: path to approval JSON to feed after planning.</summary>
+    public string? SimulateApprovalPath { get; init; }
+
+    /// <summary>--replay-simulated-approval: feed the same approval twice for idempotency verification.</summary>
+    public bool ReplaySimulatedApproval { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         // Minimal deliberate parser — no external dependency.
@@ -127,6 +163,8 @@ internal sealed record CliOptions
         var connect = false;
         var planner = "rules";
         var dataDir = "data";
+        string? simulateApproval = null;
+        var replaySimulatedApproval = false;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -143,17 +181,31 @@ internal sealed record CliOptions
                 case "--data":
                     dataDir = RequireValue(args, ref i, "--data");
                     break;
+                case "--simulate-approval":
+                    simulateApproval = RequireValue(args, ref i, "--simulate-approval");
+                    break;
+                case "--replay-simulated-approval":
+                    replaySimulatedApproval = true;
+                    break;
             }
         }
 
         if (!connect && contract is null)
         {
-            Console.Error.WriteLine("usage: dotnet run -- --contract <file.json> [--planner rules|llm|scripted] [--data <dir>]");
+            Console.Error.WriteLine("usage: dotnet run -- --contract <file.json> [--planner rules|llm|scripted] [--data <dir>] [--simulate-approval <approval.json>]");
             Console.Error.WriteLine("   or: dotnet run -- --connect [--planner rules|llm|scripted] [--data <dir>]  (WS_URL defaults to ws://localhost:8000/ws)");
             Environment.Exit(2);
         }
 
-        return new CliOptions { ContractPath = contract, Connect = connect, Planner = planner, DataDir = dataDir };
+        return new CliOptions
+        {
+            ContractPath = contract,
+            Connect = connect,
+            Planner = planner,
+            DataDir = dataDir,
+            SimulateApprovalPath = simulateApproval,
+            ReplaySimulatedApproval = replaySimulatedApproval,
+        };
     }
 
     private static string RequireValue(string[] args, ref int index, string option)

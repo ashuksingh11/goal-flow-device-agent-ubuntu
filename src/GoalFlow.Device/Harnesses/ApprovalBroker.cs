@@ -32,6 +32,9 @@ public interface IApprovalBroker
     /// <summary>Current state of one proposal; null when unknown.</summary>
     PendingProposal? Find(string proposalId);
 
+    /// <summary>Marks approved proposals as executed after effects complete.</summary>
+    void MarkExecuted(IReadOnlyList<PendingProposal> executed);
+
     /// <summary>All proposals still awaiting a decision for the goal.</summary>
     IReadOnlyList<PendingProposal> PendingFor(string goalId);
 
@@ -47,6 +50,7 @@ public enum ApprovalState
 {
     Pending,
     Approved,
+    Executed,
     Rejected,
     Expired,
 }
@@ -137,6 +141,21 @@ public sealed class ApprovalBroker : IApprovalBroker
         }
 
         return approved;
+    }
+
+    public void MarkExecuted(IReadOnlyList<PendingProposal> executed)
+    {
+        foreach (var proposal in executed)
+        {
+            var key = Key(proposal.CorrelationId, proposal.Proposal.ProposalId);
+            if (!_proposals.TryGetValue(key, out var pending) || pending.State != ApprovalState.Approved)
+            {
+                continue;
+            }
+
+            _proposals[key] = pending with { State = ApprovalState.Executed };
+            TraceDecision(pending.GoalId, pending.Proposal.ProposalId, "executed");
+        }
     }
 
     public PendingProposal? Find(string proposalId) =>

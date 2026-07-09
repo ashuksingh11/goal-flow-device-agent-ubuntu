@@ -41,6 +41,26 @@ public sealed record PlanReadyPayload
     /// <summary>Deterministic safety-gate verdict for this plan.</summary>
     [JsonPropertyName("safety")]
     public required SafetyResult Safety { get; init; }
+
+    /// <summary>Device-computed impact metrics for the proposed plan.</summary>
+    [JsonPropertyName("impact")]
+    public ImpactMetrics? Impact { get; init; }
+}
+
+/// <summary>Deterministic plan impact metrics computed on-device.</summary>
+public sealed record ImpactMetrics
+{
+    [JsonPropertyName("items_used_before_expiry")]
+    public required int ItemsUsedBeforeExpiry { get; init; }
+
+    [JsonPropertyName("pork_meals")]
+    public required int PorkMeals { get; init; }
+
+    [JsonPropertyName("veg_forward_dinners")]
+    public required int VegForwardDinners { get; init; }
+
+    [JsonPropertyName("grocery_items")]
+    public required int GroceryItems { get; init; }
 }
 
 /// <summary>One planned dinner, e.g. { "day":"Mon", "dish":"spinach dal rice bowl", "why":[...] }.</summary>

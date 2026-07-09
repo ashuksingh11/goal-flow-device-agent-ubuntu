@@ -137,6 +137,18 @@ public sealed class WsClient : IAsyncDisposable
                     Console.Error.WriteLine("received hello_ack");
                     break;
 
+                case MessageTypes.Approval:
+                    var approval = JsonSerializer.Deserialize<Approval>(json, ContractJson.Options)
+                        ?? throw new InvalidOperationException("Unable to deserialize approval frame.");
+                    var statuses = await _pipeline.OnApprovalAsync(approval, cancellationToken);
+                    foreach (var status in statuses)
+                    {
+                        await SendAsync(status, cancellationToken);
+                        Console.Error.WriteLine($"sent status {status.TaskStatus} for {status.GoalId}/{status.CorrelationId}");
+                    }
+
+                    break;
+
                 default:
                     Console.Error.WriteLine($"ignoring websocket frame type '{typeElement.GetString()}'");
                     break;

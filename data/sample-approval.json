@@ -1,0 +1,13 @@
+{
+  "type": "approval",
+  "goal_id": "meal-2026-w29",
+  "correlation_id": "disp-001",
+  "payload": {
+    "decisions": [
+      {
+        "proposal_id": "p1",
+        "approved": true
+      }
+    ]
+  }
+}

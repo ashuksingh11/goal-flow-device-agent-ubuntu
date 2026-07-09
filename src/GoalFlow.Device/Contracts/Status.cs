@@ -29,6 +29,25 @@ public sealed record StatusMessage
 /// <summary>Payload of <see cref="StatusMessage"/>.</summary>
 public sealed record StatusPayload
 {
+    [JsonPropertyName("executed")]
+    public IReadOnlyList<ExecutedEffect>? Executed { get; init; }
+
     [JsonPropertyName("note")]
     public required string Note { get; init; }
+}
+
+/// <summary>One executed approved effect reported in a status payload.</summary>
+public sealed record ExecutedEffect
+{
+    [JsonPropertyName("proposal_id")]
+    public required string ProposalId { get; init; }
+
+    [JsonPropertyName("action")]
+    public required string Action { get; init; }
+
+    [JsonPropertyName("result")]
+    public required string Result { get; init; }
+
+    [JsonPropertyName("detail")]
+    public required string Detail { get; init; }
 }
