@@ -1,0 +1,31 @@
+{
+  "type": "dispatch",
+  "goal_id": "meal-2026-w29",
+  "correlation_id": "disp-001",
+  "objective": "healthier family dinners, less food waste",
+  "scope": {
+    "meal": "dinner",
+    "days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
+  },
+  "time_window": {
+    "start": "2026-07-13",
+    "end": "2026-07-17"
+  },
+  "constraints": {
+    "hard": {
+      "allergens": [],
+      "dietary": ["no_pork"],
+      "medical": []
+    },
+    "soft": {
+      "dislikes": ["mushrooms"],
+      "prefer": ["more_vegetables", "more_protein"]
+    }
+  },
+  "optimization": ["reduce_processed", "reduce_waste"],
+  "autonomy": "propose_all",
+  "context_hints": {
+    "notes": "son has sports Wednesday"
+  },
+  "reply_to": "kb/device/meal-2026-w29"
+}

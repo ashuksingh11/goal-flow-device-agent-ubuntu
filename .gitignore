@@ -1,0 +1,35 @@
+# .NET build output
+bin/
+obj/
+out/
+artifacts/
+
+# User-specific / IDE
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+*.swp
+
+# Rider
+*.sln.iml
+
+# NuGet
+*.nupkg
+packages/
+
+# Test results / coverage
+TestResults/
+coverage*.json
+coverage*.xml
+*.coverage
+
+# Secrets / local env
+.env
+*.local.json
+appsettings.local.json
+
+# OS cruft
+.DS_Store
+Thumbs.db

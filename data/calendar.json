@@ -1,0 +1,21 @@
+{
+  "as_of": "2026-07-12",
+  "events": [
+    {
+      "id": "cal-001",
+      "title": "Aarav football practice",
+      "date": "2026-07-15",
+      "start": "18:00",
+      "end": "19:30",
+      "attendee": "Aarav"
+    },
+    {
+      "id": "cal-002",
+      "title": "Parent-teacher call",
+      "date": "2026-07-16",
+      "start": "17:00",
+      "end": "17:30",
+      "attendee": "Priya"
+    }
+  ]
+}

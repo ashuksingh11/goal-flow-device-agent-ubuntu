@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>GoalFlow.Device</RootNamespace>
+    <!-- Design-phase skeleton: bodies throw NotImplementedException. -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Versions intentionally loose (floating) during the design phase.
+         DI and System.Text.Json float to whatever Semantic Kernel's
+         transitive graph requires (avoids NU1605 downgrade errors). -->
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.*" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="*" />
+    <PackageReference Include="System.Text.Json" Version="*" />
+  </ItemGroup>
+
+</Project>

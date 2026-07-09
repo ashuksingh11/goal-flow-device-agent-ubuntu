@@ -1,0 +1,44 @@
+{
+  "recipes": [
+    {
+      "id": "rcp-001",
+      "name": "spinach dal rice bowl",
+      "ingredients": ["spinach", "toor dal", "rice", "onions", "tomatoes"],
+      "tags": ["vegetarian", "more_vegetables", "more_protein", "uses_inventory"],
+      "contains": [],
+      "prep_minutes": 35
+    },
+    {
+      "id": "rcp-002",
+      "name": "paneer veggie wraps",
+      "ingredients": ["paneer", "tortilla wraps", "bell peppers", "onions", "yogurt"],
+      "tags": ["vegetarian", "more_protein", "more_vegetables"],
+      "contains": ["dairy", "gluten"],
+      "prep_minutes": 25
+    },
+    {
+      "id": "rcp-003",
+      "name": "lentil soup + toast",
+      "ingredients": ["lentils", "carrots", "onions", "tomatoes", "bread"],
+      "tags": ["vegetarian", "more_protein", "light"],
+      "contains": ["gluten"],
+      "prep_minutes": 30
+    },
+    {
+      "id": "rcp-004",
+      "name": "chickpea salad bowl",
+      "ingredients": ["chickpeas", "carrots", "tomatoes", "onions", "yogurt"],
+      "tags": ["vegetarian", "more_protein", "more_vegetables", "quick"],
+      "contains": ["dairy"],
+      "prep_minutes": 15
+    },
+    {
+      "id": "rcp-005",
+      "name": "veg pasta with yogurt dip",
+      "ingredients": ["pasta", "carrots", "bell peppers", "tomatoes", "yogurt"],
+      "tags": ["vegetarian", "more_vegetables", "kid_friendly"],
+      "contains": ["dairy", "gluten"],
+      "prep_minutes": 30
+    }
+  ]
+}
