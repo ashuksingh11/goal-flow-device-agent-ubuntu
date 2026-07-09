@@ -1,5 +1,9 @@
 namespace GoalFlow.Device.Harnesses.Adapters;
 
+using GoalFlow.Device.Contracts;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
 /// <summary>
 /// Product API adapter: reminders — an ACTUATOR. Writes happen ONLY via the
 /// EffectExecutor after an approval. Reminders fire off the virtual clock
@@ -23,10 +27,43 @@ public sealed class MockReminderApi : IReminderApi
     /// <param name="dataPath">Path to reminders.json.</param>
     public MockReminderApi(string dataPath) => _dataPath = dataPath;
 
-    public Task<IReadOnlyList<Reminder>> GetRemindersAsync(CancellationToken cancellationToken = default) =>
-        throw new NotImplementedException("Design stub.");
+    public async Task<IReadOnlyList<Reminder>> GetRemindersAsync(CancellationToken cancellationToken = default)
+    {
+        var data = await ReadAsync(cancellationToken);
+        return data.Reminders;
+    }
 
-    public Task CreateReminderAsync(Reminder reminder, CancellationToken cancellationToken = default) =>
-        // TODO: dedupe on reminder.CorrelationId (idempotent), then rewrite the file.
-        throw new NotImplementedException("Design stub.");
+    public async Task CreateReminderAsync(Reminder reminder, CancellationToken cancellationToken = default)
+    {
+        var data = await ReadAsync(cancellationToken);
+        if (reminder.CorrelationId is not null &&
+            data.Reminders.Any(item => string.Equals(item.CorrelationId, reminder.CorrelationId, StringComparison.Ordinal)))
+        {
+            return;
+        }
+
+        await WriteAsync(data with { Reminders = data.Reminders.Concat([reminder]).ToArray() }, cancellationToken);
+    }
+
+    private async Task<ReminderFile> ReadAsync(CancellationToken cancellationToken)
+    {
+        await using var stream = File.OpenRead(_dataPath);
+        return await JsonSerializer.DeserializeAsync<ReminderFile>(stream, ContractJson.Options, cancellationToken)
+            ?? throw new InvalidOperationException($"Unable to deserialize reminder data '{_dataPath}'.");
+    }
+
+    private async Task WriteAsync(ReminderFile data, CancellationToken cancellationToken)
+    {
+        await using var stream = File.Create(_dataPath);
+        await JsonSerializer.SerializeAsync(stream, data, ContractJson.Options, cancellationToken);
+    }
+
+    private sealed record ReminderFile
+    {
+        [JsonPropertyName("as_of")]
+        public string? AsOf { get; init; }
+
+        [JsonPropertyName("reminders")]
+        public IReadOnlyList<Reminder> Reminders { get; init; } = [];
+    }
 }

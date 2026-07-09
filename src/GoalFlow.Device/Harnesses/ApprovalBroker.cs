@@ -75,6 +75,7 @@ public sealed class ApprovalBroker : IApprovalBroker
 {
     private readonly IClock _clock;
     private readonly ITrace _trace;
+    private readonly Dictionary<string, PendingProposal> _proposals = new(StringComparer.Ordinal);
 
     public ApprovalBroker(IClock clock, ITrace trace)
     {
@@ -82,20 +83,95 @@ public sealed class ApprovalBroker : IApprovalBroker
         _trace = trace;
     }
 
-    public void Submit(string goalId, string correlationId, IReadOnlyList<ProposalItem> proposals) =>
-        throw new NotImplementedException("Design stub.");
+    public void Submit(string goalId, string correlationId, IReadOnlyList<ProposalItem> proposals)
+    {
+        foreach (var proposal in proposals)
+        {
+            var key = Key(correlationId, proposal.ProposalId);
+            if (_proposals.ContainsKey(key))
+            {
+                continue;
+            }
 
-    public IReadOnlyList<PendingProposal> ApplyDecisions(Approval approval) =>
-        // TODO: match approval.CorrelationId + decision.ProposalId; dedupe
-        // replays; trace each transition.
-        throw new NotImplementedException("Design stub.");
+            _proposals[key] = new PendingProposal
+            {
+                GoalId = goalId,
+                CorrelationId = correlationId,
+                Proposal = proposal,
+                State = ApprovalState.Pending,
+                SubmittedAt = _clock.Now,
+            };
+        }
+
+        _trace.Record(new TraceEvent
+        {
+            At = _clock.Now,
+            GoalId = goalId,
+            Phase = TracePhase.Gate,
+            Source = nameof(ApprovalBroker),
+            Kind = "proposals_submitted",
+            Message = $"{proposals.Count} proposals pending approval",
+        });
+    }
+
+    public IReadOnlyList<PendingProposal> ApplyDecisions(Approval approval)
+    {
+        var approved = new List<PendingProposal>();
+        foreach (var decision in approval.Payload.Decisions)
+        {
+            var key = Key(approval.CorrelationId, decision.ProposalId);
+            if (!_proposals.TryGetValue(key, out var pending) || pending.State != ApprovalState.Pending)
+            {
+                TraceDecision(approval.GoalId, decision.ProposalId, "ignored");
+                continue;
+            }
+
+            var next = pending with { State = decision.Approved ? ApprovalState.Approved : ApprovalState.Rejected };
+            _proposals[key] = next;
+            if (decision.Approved)
+            {
+                approved.Add(next);
+            }
+
+            TraceDecision(approval.GoalId, decision.ProposalId, next.State.ToString().ToLowerInvariant());
+        }
+
+        return approved;
+    }
 
     public PendingProposal? Find(string proposalId) =>
-        throw new NotImplementedException("Design stub.");
+        _proposals.Values.FirstOrDefault(item =>
+            string.Equals(item.Proposal.ProposalId, proposalId, StringComparison.Ordinal));
 
     public IReadOnlyList<PendingProposal> PendingFor(string goalId) =>
-        throw new NotImplementedException("Design stub.");
+        _proposals.Values
+            .Where(item => string.Equals(item.GoalId, goalId, StringComparison.Ordinal) && item.State == ApprovalState.Pending)
+            .ToArray();
 
-    public void ExpireOverdue() =>
-        throw new NotImplementedException("Design stub.");
+    public void ExpireOverdue()
+    {
+        foreach (var (key, proposal) in _proposals.ToArray())
+        {
+            if (proposal.State == ApprovalState.Pending &&
+                proposal.ExpiresAt is not null &&
+                proposal.ExpiresAt <= _clock.Now)
+            {
+                _proposals[key] = proposal with { State = ApprovalState.Expired };
+                TraceDecision(proposal.GoalId, proposal.Proposal.ProposalId, "expired");
+            }
+        }
+    }
+
+    private void TraceDecision(string goalId, string proposalId, string state) =>
+        _trace.Record(new TraceEvent
+        {
+            At = _clock.Now,
+            GoalId = goalId,
+            Phase = TracePhase.Gate,
+            Source = nameof(ApprovalBroker),
+            Kind = "approval_state",
+            Message = $"{proposalId} {state}",
+        });
+
+    private static string Key(string correlationId, string proposalId) => $"{correlationId}:{proposalId}";
 }

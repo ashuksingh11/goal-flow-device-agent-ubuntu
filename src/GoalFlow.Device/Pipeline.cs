@@ -15,18 +15,24 @@ namespace GoalFlow.Device;
 public sealed class Pipeline
 {
     private readonly IPlanner _planner;
+    private readonly IGrounding _grounding;
     private readonly ISafetyGate _safetyGate;
+    private readonly IApprovalBroker _approvalBroker;
     private readonly IClock _clock;
     private readonly ITrace _trace;
 
     public Pipeline(
         IPlanner planner,
+        IGrounding grounding,
         ISafetyGate safetyGate,
+        IApprovalBroker approvalBroker,
         IClock clock,
         ITrace trace)
     {
         _planner = planner;
+        _grounding = grounding;
         _safetyGate = safetyGate;
+        _approvalBroker = approvalBroker;
         _clock = clock;
         _trace = trace;
     }
@@ -47,16 +53,7 @@ public sealed class Pipeline
             Message = "dispatch accepted",
         });
 
-        var world = new WorldState
-        {
-            AsOf = _clock.Now,
-            Inventory = [],
-            Calendar = [],
-            Recipes = [],
-            ShoppingList = [],
-            Reminders = [],
-            ExpiringSoon = [],
-        };
+        var world = await _grounding.AssembleAsync(contract, cancellationToken);
 
         _trace.Record(new TraceEvent
         {
@@ -65,7 +62,7 @@ public sealed class Pipeline
             Phase = TracePhase.Sense,
             Source = nameof(Pipeline),
             Kind = "world_snapshot",
-            Message = "using M1 empty world snapshot",
+            Message = $"world snapshot assembled with {world.Inventory.Count} inventory items, {world.Calendar.Count} events, {world.Recipes.Count} recipes",
         });
 
         var plan = await _planner.CreatePlanAsync(contract, world, cancellationToken);
@@ -81,6 +78,10 @@ public sealed class Pipeline
 
         var safety = _safetyGate.Check(plan, contract.Constraints.Hard, world);
         var proposals = safety.Gate == SafetyResult.GatePassed ? plan.Proposals : [];
+        if (proposals.Count > 0)
+        {
+            _approvalBroker.Submit(contract.GoalId, contract.CorrelationId ?? contract.GoalId, proposals);
+        }
 
         _trace.Record(new TraceEvent
         {

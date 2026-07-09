@@ -1,6 +1,7 @@
 using GoalFlow.Device;
 using GoalFlow.Device.Contracts;
 using GoalFlow.Device.Harnesses;
+using GoalFlow.Device.Harnesses.Adapters;
 using GoalFlow.Device.Transport;
 using System.Text.Json;
 
@@ -9,13 +10,11 @@ using System.Text.Json;
 // Usage:
 //   dotnet run -- --contract path/to/contract.json [--planner rules|llm|scripted] [--data ./data]
 //
-// M1 behavior: read a Task Contract JSON (a `dispatch` message), run the
-// harness pipeline, print the resulting `plan_ready` JSON to stdout.
-// A canned plan (ScriptedPlanner) is acceptable for M1.
-// The WebSocket shell (Transport/WsClient.cs) is snapped on in a later
-// milestone and drives this exact same Pipeline.
+// Contract mode prints only the resulting `plan_ready` JSON to stdout.
+// Trace/log output goes to stderr so harnesses can script against stdout.
 
 var options = CliOptions.Parse(args);
+LoadDotEnv(Path.Combine(Directory.GetCurrentDirectory(), ".env"));
 var clock = new VirtualClock(DateTimeOffset.Parse("2026-07-12T09:00:00+00:00"));
 var trace = new InMemoryTrace();
 var pipeline = BuildPipeline(options, clock, trace);
@@ -45,14 +44,65 @@ Console.WriteLine(JsonSerializer.Serialize(planReady, ContractJson.Options));
 static Pipeline BuildPipeline(CliOptions options, IClock clock, ITrace trace)
 {
     var fixturePath = Path.Combine(options.DataDir, "golden-plan_ready.json");
+    var rulesPlanner = new RulesPlanner(trace, clock);
+    var scriptedPlanner = new ScriptedPlanner(fixturePath);
     IPlanner planner = options.Planner switch
     {
-        "scripted" or "rules" => new ScriptedPlanner(fixturePath),
-        "llm" => throw new NotImplementedException("LlmPlanner stays unimplemented until a later milestone."),
-        _ => throw new ArgumentException($"Unknown planner '{options.Planner}'. Use scripted for M1."),
+        "rules" => rulesPlanner,
+        "scripted" => scriptedPlanner,
+        "llm" => new LlmPlanner(
+            new LlmPlannerOptions
+            {
+                ApiKey = Environment.GetEnvironmentVariable("OPENROUTER_API_KEY"),
+                BaseUrl = Environment.GetEnvironmentVariable("OPENROUTER_BASE_URL") ?? "https://openrouter.ai/api/v1",
+                Model = Environment.GetEnvironmentVariable("OPENROUTER_MODEL") ?? "anthropic/claude-sonnet-5",
+            },
+            rulesPlanner,
+            trace,
+            clock),
+        _ => throw new ArgumentException($"Unknown planner '{options.Planner}'. Use rules, llm, or scripted."),
     };
 
-    return new Pipeline(planner, new SafetyGate(trace, clock), clock, trace);
+    var grounding = new Grounding(
+        new MockInventoryApi(Path.Combine(options.DataDir, "inventory.json")),
+        new MockCalendarApi(Path.Combine(options.DataDir, "calendar.json")),
+        new MockRecipeApi(Path.Combine(options.DataDir, "recipes.json")),
+        new MockShoppingListApi(Path.Combine(options.DataDir, "shopping_list.json")),
+        new MockReminderApi(Path.Combine(options.DataDir, "reminders.json")),
+        clock,
+        trace);
+
+    return new Pipeline(planner, grounding, new SafetyGate(trace, clock), new ApprovalBroker(clock, trace), clock, trace);
+}
+
+static void LoadDotEnv(string path)
+{
+    if (!File.Exists(path))
+    {
+        return;
+    }
+
+    foreach (var rawLine in File.ReadAllLines(path))
+    {
+        var line = rawLine.Trim();
+        if (line.Length == 0 || line.StartsWith('#'))
+        {
+            continue;
+        }
+
+        var equals = line.IndexOf('=');
+        if (equals <= 0)
+        {
+            continue;
+        }
+
+        var key = line[..equals].Trim();
+        var value = line[(equals + 1)..].Trim().Trim('"');
+        if (Environment.GetEnvironmentVariable(key) is null)
+        {
+            Environment.SetEnvironmentVariable(key, value);
+        }
+    }
 }
 
 /// <summary>Parsed command-line options for the M1 entry point.</summary>
@@ -64,8 +114,8 @@ internal sealed record CliOptions
     /// <summary>--connect: run the outbound WebSocket transport loop.</summary>
     public bool Connect { get; init; }
 
-    /// <summary>--planner (optional): scripted for M1. Default: scripted.</summary>
-    public string Planner { get; init; } = "scripted";
+    /// <summary>--planner (optional): rules, llm, or scripted. Default: rules.</summary>
+    public string Planner { get; init; } = "rules";
 
     /// <summary>--data (optional): mock-world directory. Default: ./data.</summary>
     public string DataDir { get; init; } = "data";
@@ -75,7 +125,7 @@ internal sealed record CliOptions
         // Minimal deliberate parser — no external dependency.
         string? contract = null;
         var connect = false;
-        var planner = "scripted";
+        var planner = "rules";
         var dataDir = "data";
         for (var i = 0; i < args.Length; i++)
         {
@@ -98,8 +148,8 @@ internal sealed record CliOptions
 
         if (!connect && contract is null)
         {
-            Console.Error.WriteLine("usage: dotnet run -- --contract <file.json> [--planner scripted] [--data <dir>]");
-            Console.Error.WriteLine("   or: dotnet run -- --connect [--data <dir>]  (WS_URL defaults to ws://localhost:8000/ws)");
+            Console.Error.WriteLine("usage: dotnet run -- --contract <file.json> [--planner rules|llm|scripted] [--data <dir>]");
+            Console.Error.WriteLine("   or: dotnet run -- --connect [--planner rules|llm|scripted] [--data <dir>]  (WS_URL defaults to ws://localhost:8000/ws)");
             Environment.Exit(2);
         }
 

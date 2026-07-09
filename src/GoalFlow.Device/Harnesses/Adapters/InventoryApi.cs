@@ -1,5 +1,9 @@
 namespace GoalFlow.Device.Harnesses.Adapters;
 
+using GoalFlow.Device.Contracts;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
 /// <summary>
 /// Product API adapter: fridge/pantry inventory (read-only in the POC).
 /// Build effort: REAL INTERFACE + MOCK DATA. Tizen port swaps in a Family
@@ -19,7 +23,17 @@ public sealed class MockInventoryApi : IInventoryApi
     /// <param name="dataPath">Path to inventory.json.</param>
     public MockInventoryApi(string dataPath) => _dataPath = dataPath;
 
-    public Task<IReadOnlyList<InventoryItem>> GetInventoryAsync(CancellationToken cancellationToken = default) =>
-        // TODO: deserialize data/inventory.json ("items" array) via ContractJson.Options.
-        throw new NotImplementedException("Design stub.");
+    public async Task<IReadOnlyList<InventoryItem>> GetInventoryAsync(CancellationToken cancellationToken = default)
+    {
+        await using var stream = File.OpenRead(_dataPath);
+        var data = await JsonSerializer.DeserializeAsync<InventoryFile>(stream, ContractJson.Options, cancellationToken)
+            ?? throw new InvalidOperationException($"Unable to deserialize inventory data '{_dataPath}'.");
+        return data.Items;
+    }
+
+    private sealed record InventoryFile
+    {
+        [JsonPropertyName("items")]
+        public IReadOnlyList<InventoryItem> Items { get; init; } = [];
+    }
 }

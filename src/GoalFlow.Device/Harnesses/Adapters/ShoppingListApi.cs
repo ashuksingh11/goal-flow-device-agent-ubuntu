@@ -1,5 +1,9 @@
 namespace GoalFlow.Device.Harnesses.Adapters;
 
+using GoalFlow.Device.Contracts;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
 /// <summary>
 /// Product API adapter: shopping list — an ACTUATOR. Writes happen ONLY via
 /// the EffectExecutor after an approval; nothing else calls
@@ -29,14 +33,56 @@ public sealed class MockShoppingListApi : IShoppingListApi
     /// <param name="dataPath">Path to shopping_list.json.</param>
     public MockShoppingListApi(string dataPath) => _dataPath = dataPath;
 
-    public Task<IReadOnlyList<ShoppingListEntry>> GetListAsync(CancellationToken cancellationToken = default) =>
-        throw new NotImplementedException("Design stub.");
+    public async Task<IReadOnlyList<ShoppingListEntry>> GetListAsync(CancellationToken cancellationToken = default)
+    {
+        var data = await ReadAsync(cancellationToken);
+        return data.Items;
+    }
 
-    public Task AddItemsAsync(
+    public async Task AddItemsAsync(
         IReadOnlyList<string> items,
         string? reason,
         string correlationId,
-        CancellationToken cancellationToken = default) =>
-        // TODO: skip items whose correlation_id already exists (idempotent), then rewrite the file.
-        throw new NotImplementedException("Design stub.");
+        CancellationToken cancellationToken = default)
+    {
+        var data = await ReadAsync(cancellationToken);
+        if (data.Items.Any(item => string.Equals(item.CorrelationId, correlationId, StringComparison.Ordinal)))
+        {
+            return;
+        }
+
+        var existing = data.Items.ToList();
+        var next = existing.Count + 1;
+        existing.AddRange(items.Select(item => new ShoppingListEntry
+        {
+            Id = $"shop-{next++:000}",
+            Item = item,
+            Reason = reason,
+            CorrelationId = correlationId,
+        }));
+
+        await WriteAsync(data with { Items = existing }, cancellationToken);
+    }
+
+    private async Task<ShoppingListFile> ReadAsync(CancellationToken cancellationToken)
+    {
+        await using var stream = File.OpenRead(_dataPath);
+        return await JsonSerializer.DeserializeAsync<ShoppingListFile>(stream, ContractJson.Options, cancellationToken)
+            ?? throw new InvalidOperationException($"Unable to deserialize shopping-list data '{_dataPath}'.");
+    }
+
+    private async Task WriteAsync(ShoppingListFile data, CancellationToken cancellationToken)
+    {
+        await using var stream = File.Create(_dataPath);
+        await JsonSerializer.SerializeAsync(stream, data, ContractJson.Options, cancellationToken);
+    }
+
+    private sealed record ShoppingListFile
+    {
+        [JsonPropertyName("as_of")]
+        public string? AsOf { get; init; }
+
+        [JsonPropertyName("items")]
+        public IReadOnlyList<ShoppingListEntry> Items { get; init; } = [];
+    }
 }

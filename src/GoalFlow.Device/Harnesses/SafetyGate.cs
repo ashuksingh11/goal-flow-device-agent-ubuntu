@@ -53,10 +53,20 @@ public sealed class SafetyGate : ISafetyGate
         var violations = new List<string>();
         foreach (var item in plan.Plan)
         {
-            var dish = Normalize(item.Dish);
+            var recipe = world.Recipes.FirstOrDefault(recipe =>
+                string.Equals(recipe.Name, item.Dish, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(recipe.Id, item.Dish, StringComparison.OrdinalIgnoreCase));
+
+            if (recipe is null)
+            {
+                violations.Add($"{item.Day}:{item.Dish}:unknown_recipe");
+                continue;
+            }
+
+            var recipeTerms = RecipeTerms(recipe);
             foreach (var term in excludedTerms)
             {
-                if (ContainsTerm(dish, term))
+                if (recipeTerms.Contains(term))
                 {
                     violations.Add($"{item.Day}:{item.Dish}:contains_{term}");
                 }
@@ -103,7 +113,25 @@ public sealed class SafetyGate : ISafetyGate
     private static string Normalize(string value) =>
         value.Trim().Replace('_', ' ').Replace('-', ' ').ToLowerInvariant();
 
-    private static bool ContainsTerm(string value, string term) =>
-        value.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Contains(term, StringComparer.Ordinal);
+    private static HashSet<string> RecipeTerms(Recipe recipe)
+    {
+        var terms = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var value in recipe.Ingredients.Concat(recipe.Contains).Concat(recipe.Tags).Append(recipe.Name))
+        {
+            var normalized = Normalize(value);
+            if (normalized.Length == 0)
+            {
+                continue;
+            }
+
+            terms.Add(normalized);
+            foreach (var token in normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                terms.Add(token);
+            }
+        }
+
+        return terms;
+    }
 }
