@@ -40,6 +40,16 @@ public sealed record WorldChange
 
     /// <summary>Virtual-clock instant observed.</summary>
     public required DateTimeOffset ObservedAt { get; init; }
+
+    public string? EventDate { get; init; }
+
+    public string? EventStart { get; init; }
+
+    public string? EventEnd { get; init; }
+
+    public string? PlannedDay { get; init; }
+
+    public string? PlannedDish { get; init; }
 }
 
 /// <summary>Materiality decision plus rationale (traced either way).</summary>
@@ -49,6 +59,10 @@ public sealed record MaterialityVerdict
 
     /// <summary>Which policy rule fired, e.g. "event_overlaps_prep_window".</summary>
     public required string Rule { get; init; }
+
+    public string? AffectedDay { get; init; }
+
+    public string? AffectedDish { get; init; }
 }
 
 /// <summary>Skeleton implementation — logic lands in M4.</summary>
@@ -63,13 +77,88 @@ public sealed class ChangeWatcher : IChangeWatcher
         _trace = trace;
     }
 
-    public MaterialityVerdict Evaluate(WorldChange change, GoalTask task, WorldState world) =>
-        // TODO(M4): policy table — calendar event overlapping a planned prep
-        // window => material; cosmetic changes => not material. Trace both.
-        throw new NotImplementedException("Design stub (M4).");
+    public MaterialityVerdict Evaluate(WorldChange change, GoalTask task, WorldState world)
+    {
+        var verdict = EvaluateCalendarPrepWindow(change, task, world);
+        _trace.Record(new TraceEvent
+        {
+            At = _clock.Now,
+            GoalId = task.GoalId,
+            Phase = TracePhase.Sustain,
+            Source = nameof(ChangeWatcher),
+            Kind = verdict.IsMaterial ? "material_change" : "quiet_change",
+            Message = $"{verdict.Rule}: {change.Summary}",
+            Data = new Dictionary<string, string>
+            {
+                ["material"] = verdict.IsMaterial.ToString().ToLowerInvariant(),
+                ["affected_day"] = verdict.AffectedDay ?? string.Empty,
+                ["affected_dish"] = verdict.AffectedDish ?? string.Empty,
+            },
+        });
+
+        return verdict;
+    }
 
     public Task RunAsync(
         Func<WorldChange, CancellationToken, Task> onMaterialChange,
         CancellationToken cancellationToken = default) =>
-        throw new NotImplementedException("Design stub (M4).");
+        Task.CompletedTask;
+
+    private static MaterialityVerdict EvaluateCalendarPrepWindow(
+        WorldChange change,
+        GoalTask task,
+        WorldState world)
+    {
+        if (!string.Equals(change.Source, "calendar", StringComparison.OrdinalIgnoreCase) ||
+            change.EventDate is null ||
+            !DateOnly.TryParse(change.EventDate, out var eventDate) ||
+            !TimeOnly.TryParse(change.EventStart, out var eventStart))
+        {
+            return Quiet("no_material_policy_match");
+        }
+
+        var eventEnd = TimeOnly.TryParse(change.EventEnd, out var parsedEnd)
+            ? parsedEnd
+            : eventStart.AddHours(1);
+        var day = DayForDate(task.Contract, eventDate);
+        var planItem = task.ActivePlan.FirstOrDefault(item =>
+            string.Equals(item.Day, day, StringComparison.OrdinalIgnoreCase));
+        if (planItem is null)
+        {
+            return Quiet("calendar_event_outside_planned_day");
+        }
+
+        var recipe = world.Recipes.FirstOrDefault(recipe =>
+            string.Equals(recipe.Name, planItem.Dish, StringComparison.OrdinalIgnoreCase));
+        var prepMinutes = Math.Max(recipe?.PrepMinutes ?? 30, 30);
+        var dinnerAt = new TimeOnly(18, 30);
+        var prepStart = dinnerAt.AddMinutes(-prepMinutes);
+        var overlaps = eventStart < dinnerAt && eventEnd > prepStart;
+
+        return overlaps
+            ? new MaterialityVerdict
+            {
+                IsMaterial = true,
+                Rule = "event_overlaps_prep_window",
+                AffectedDay = planItem.Day,
+                AffectedDish = planItem.Dish,
+            }
+            : Quiet("calendar_event_outside_prep_window");
+    }
+
+    private static MaterialityVerdict Quiet(string rule) =>
+        new()
+        {
+            IsMaterial = false,
+            Rule = rule,
+        };
+
+    private static string? DayForDate(GoalFlow.Device.Contracts.Dispatch contract, DateOnly date)
+    {
+        var start = DateOnly.Parse(contract.TimeWindow.Start);
+        var offset = date.DayNumber - start.DayNumber;
+        return offset >= 0 && offset < contract.Scope.Days.Count
+            ? contract.Scope.Days[offset]
+            : null;
+    }
 }

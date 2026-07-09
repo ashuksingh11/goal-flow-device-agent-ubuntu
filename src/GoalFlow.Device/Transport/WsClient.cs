@@ -149,6 +149,18 @@ public sealed class WsClient : IAsyncDisposable
 
                     break;
 
+                case MessageTypes.Control:
+                    var control = JsonSerializer.Deserialize<Control>(json, ContractJson.Options)
+                        ?? throw new InvalidOperationException("Unable to deserialize control frame.");
+                    var messages = await _pipeline.OnControlAsync(control, cancellationToken);
+                    foreach (var message in messages)
+                    {
+                        await SendAsync(message, cancellationToken);
+                        Console.Error.WriteLine($"sent control response for {control.GoalId}/{control.Command}");
+                    }
+
+                    break;
+
                 default:
                     Console.Error.WriteLine($"ignoring websocket frame type '{typeElement.GetString()}'");
                     break;

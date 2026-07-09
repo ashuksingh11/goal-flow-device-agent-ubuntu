@@ -1,5 +1,7 @@
 namespace GoalFlow.Device.Harnesses;
 
+using GoalFlow.Device.Contracts;
+
 /// <summary>
 /// Sustain-phase harness (M4): fires time-based actions (reminder due,
 /// proposal expiry sweep, day rollover) off the VIRTUAL clock
@@ -8,6 +10,12 @@ namespace GoalFlow.Device.Harnesses;
 /// </summary>
 public interface IScheduler
 {
+    /// <summary>Advances the virtual clock one day and runs the sustain tick for the new date.</summary>
+    Task<SustainTickResult> AdvanceDayAsync(
+        string goalId,
+        Func<DateOnly, CancellationToken, Task<SustainTickResult>> sustainTick,
+        CancellationToken cancellationToken = default);
+
     /// <summary>Registers an action to fire at a virtual-clock instant.</summary>
     void Schedule(ScheduledAction action);
 
@@ -40,7 +48,14 @@ public sealed record ScheduledAction
     public string? Description { get; init; }
 }
 
-/// <summary>Skeleton implementation — simple real logic in M4.</summary>
+public sealed record SustainTickResult
+{
+    public required StatusMessage Status { get; init; }
+
+    public Proposal? Proposal { get; init; }
+}
+
+/// <summary>Simple virtual-clock scheduler implementation.</summary>
 public sealed class Scheduler : IScheduler
 {
     private readonly IClock _clock;
@@ -52,16 +67,80 @@ public sealed class Scheduler : IScheduler
         _trace = trace;
     }
 
+    private readonly List<ScheduledAction> _pending = [];
+
     public IReadOnlyList<ScheduledAction> Pending =>
-        throw new NotImplementedException("Design stub (M4).");
+        _pending.OrderBy(action => action.DueAt).ToArray();
 
-    public void Schedule(ScheduledAction action) =>
-        throw new NotImplementedException("Design stub (M4).");
+    public async Task<SustainTickResult> AdvanceDayAsync(
+        string goalId,
+        Func<DateOnly, CancellationToken, Task<SustainTickResult>> sustainTick,
+        CancellationToken cancellationToken = default)
+    {
+        if (_clock is not VirtualClock virtualClock)
+        {
+            throw new InvalidOperationException("advance_day requires a VirtualClock.");
+        }
 
-    public bool Cancel(string actionId) =>
-        throw new NotImplementedException("Design stub (M4).");
+        virtualClock.Advance(TimeSpan.FromDays(1));
+        _trace.Record(new TraceEvent
+        {
+            At = _clock.Now,
+            GoalId = goalId,
+            Phase = TracePhase.Sustain,
+            Source = nameof(Scheduler),
+            Kind = "advance_day",
+            Message = $"virtual clock advanced to {_clock.Today:yyyy-MM-dd}",
+        });
 
-    public Task RunAsync(CancellationToken cancellationToken = default) =>
-        // TODO(M4): loop — _clock.WaitUntilAsync(next.DueAt), fire, trace.
-        throw new NotImplementedException("Design stub (M4).");
+        await FireDueAsync(cancellationToken);
+        return await sustainTick(_clock.Today, cancellationToken);
+    }
+
+    public void Schedule(ScheduledAction action)
+    {
+        Cancel(action.Id);
+        _pending.Add(action);
+        _pending.Sort((left, right) => left.DueAt.CompareTo(right.DueAt));
+    }
+
+    public bool Cancel(string actionId)
+    {
+        var removed = _pending.RemoveAll(action => string.Equals(action.Id, actionId, StringComparison.Ordinal));
+        return removed > 0;
+    }
+
+    public async Task RunAsync(CancellationToken cancellationToken = default)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var next = Pending.FirstOrDefault();
+            if (next is null)
+            {
+                await _clock.WaitUntilAsync(DateTimeOffset.MaxValue, cancellationToken);
+                continue;
+            }
+
+            await _clock.WaitUntilAsync(next.DueAt, cancellationToken);
+            await FireDueAsync(cancellationToken);
+        }
+    }
+
+    private async Task FireDueAsync(CancellationToken cancellationToken)
+    {
+        foreach (var action in _pending.Where(action => action.DueAt <= _clock.Now).ToArray())
+        {
+            _pending.Remove(action);
+            _trace.Record(new TraceEvent
+            {
+                At = _clock.Now,
+                GoalId = action.GoalId,
+                Phase = TracePhase.Sustain,
+                Source = nameof(Scheduler),
+                Kind = "scheduled_action",
+                Message = action.Description ?? action.Id,
+            });
+            await action.Callback(cancellationToken);
+        }
+    }
 }

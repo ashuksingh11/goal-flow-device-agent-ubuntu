@@ -42,6 +42,9 @@ public sealed class VirtualClock : IClock
     /// <summary>Advance the virtual clock (drives Scheduler/ChangeWatcher in demos).</summary>
     public void Advance(TimeSpan delta) => _now += delta;
 
+    /// <summary>Reset to a known virtual instant (used by operator reset control).</summary>
+    public void Reset(DateTimeOffset instant) => _now = instant;
+
     public Task WaitUntilAsync(DateTimeOffset until, CancellationToken cancellationToken = default) =>
         _now >= until ? Task.CompletedTask : Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
 }

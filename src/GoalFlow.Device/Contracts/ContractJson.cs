@@ -37,6 +37,7 @@ public static class MessageTypes
     public const string Proposal = "proposal";
     public const string Approval = "approval";
     public const string Status = "status";
+    public const string Control = "control";
 }
 
 /// <summary>
@@ -48,6 +49,7 @@ public static class TaskStatuses
 {
     public const string Created = "created";
     public const string Planning = "planning";
+    public const string Monitoring = "monitoring";
     public const string AwaitingApproval = "awaiting_approval";
     public const string Executing = "executing";
     public const string Adapting = "adapting";

@@ -42,6 +42,9 @@ public sealed record GoalTask
 
     /// <summary>Virtual-clock instant the task was created.</summary>
     public required DateTimeOffset CreatedAt { get; init; }
+
+    /// <summary>Latest approved/planned meal slice used by sustain materiality checks.</summary>
+    public IReadOnlyList<PlanItem> ActivePlan { get; init; } = [];
 }
 
 /// <summary>Skeleton implementation — full logic in the implementation phase.</summary>

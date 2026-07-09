@@ -19,8 +19,15 @@ public sealed class Pipeline
     private readonly ISafetyGate _safetyGate;
     private readonly IApprovalBroker _approvalBroker;
     private readonly IEffectExecutor _effectExecutor;
+    private readonly IScheduler _scheduler;
+    private readonly IChangeWatcher _changeWatcher;
     private readonly IClock _clock;
     private readonly ITrace _trace;
+    private readonly DateTimeOffset _clockAnchor;
+    private readonly Action? _resetData;
+    private Dispatch? _activeDispatch;
+    private CandidatePlan? _activePlan;
+    private int _adaptationSequence;
 
     public Pipeline(
         IPlanner planner,
@@ -28,16 +35,24 @@ public sealed class Pipeline
         ISafetyGate safetyGate,
         IApprovalBroker approvalBroker,
         IEffectExecutor effectExecutor,
+        IScheduler scheduler,
+        IChangeWatcher changeWatcher,
         IClock clock,
-        ITrace trace)
+        ITrace trace,
+        DateTimeOffset clockAnchor,
+        Action? resetData = null)
     {
         _planner = planner;
         _grounding = grounding;
         _safetyGate = safetyGate;
         _approvalBroker = approvalBroker;
         _effectExecutor = effectExecutor;
+        _scheduler = scheduler;
+        _changeWatcher = changeWatcher;
         _clock = clock;
         _trace = trace;
+        _clockAnchor = clockAnchor;
+        _resetData = resetData;
     }
 
     /// <summary>
@@ -69,6 +84,8 @@ public sealed class Pipeline
         });
 
         var plan = await _planner.CreatePlanAsync(contract, world, cancellationToken);
+        _activeDispatch = contract;
+        _activePlan = plan;
         _trace.Record(new TraceEvent
         {
             At = _clock.Now,
@@ -201,11 +218,209 @@ public sealed class Pipeline
         WorldChange change,
         CancellationToken cancellationToken = default)
     {
-        // TODO(M4): re-run sense→decide→gate for the impacted portion; freeze
-        // the resulting side-effect as a ProposalItem (trigger = change.Summary);
-        // submit to _approvalBroker; return the proposal message.
-        throw new NotImplementedException("Design stub — M4.");
+        var proposalId = $"a{++_adaptationSequence}";
+        var correlationId = $"{change.Source}-{change.EventDate ?? _clock.Today.ToString("yyyy-MM-dd")}-{proposalId}";
+        var item = new ProposalItem
+        {
+            ProposalId = proposalId,
+            Action = "add_prep_task",
+            Detail = $"prep {change.PlannedDay ?? "affected day"}'s dish before the evening crunch",
+            Trigger = change.Summary,
+            RequiresApproval = true,
+        };
+
+        _approvalBroker.Submit(goalId, correlationId, [item]);
+        var proposal = new Proposal
+        {
+            GoalId = goalId,
+            CorrelationId = correlationId,
+            TaskStatus = TaskStatuses.Adapting,
+            Payload = item,
+        };
+
+        _trace.Record(new TraceEvent
+        {
+            At = _clock.Now,
+            GoalId = goalId,
+            Phase = TracePhase.Sustain,
+            Source = nameof(Pipeline),
+            Kind = "adaptation_proposal",
+            Message = $"{item.ProposalId}: {item.Trigger}",
+        });
+
+        return Task.FromResult(proposal);
     }
+
+    public Task<IReadOnlyList<object>> OnControlAsync(Control control, CancellationToken cancellationToken = default)
+    {
+        return control.Command switch
+        {
+            ControlCommands.AdvanceDay => AdvanceDayControlAsync(control, cancellationToken),
+            ControlCommands.Reset => ResetControlAsync(control),
+            _ => throw new InvalidOperationException($"Unsupported control command '{control.Command}'."),
+        };
+    }
+
+    public async Task<SustainTickResult> AdvanceDayAsync(string goalId, CancellationToken cancellationToken = default) =>
+        await _scheduler.AdvanceDayAsync(goalId, (date, token) => SustainTickAsync(goalId, date, token), cancellationToken);
+
+    private async Task<IReadOnlyList<object>> AdvanceDayControlAsync(Control control, CancellationToken cancellationToken)
+    {
+        var result = await AdvanceDayAsync(control.GoalId, cancellationToken);
+        return result.Proposal is null ? [result.Status] : [result.Status, result.Proposal];
+    }
+
+    private Task<IReadOnlyList<object>> ResetControlAsync(Control control)
+    {
+        _resetData?.Invoke();
+        if (_clock is VirtualClock virtualClock)
+        {
+            virtualClock.Reset(_clockAnchor);
+        }
+
+        _activeDispatch = null;
+        _activePlan = null;
+        _adaptationSequence = 0;
+        var status = new StatusMessage
+        {
+            GoalId = control.GoalId,
+            CorrelationId = $"reset-{_clock.Today:yyyyMMdd}",
+            TaskStatus = TaskStatuses.Done,
+            Payload = new StatusPayload
+            {
+                Day = DayName(_clock.Today),
+                SimDate = _clock.Today.ToString("yyyy-MM-dd"),
+                Note = "reset complete; seed data restored and virtual clock returned to anchor",
+                Material = false,
+            },
+        };
+        return Task.FromResult<IReadOnlyList<object>>([status]);
+    }
+
+    private async Task<SustainTickResult> SustainTickAsync(
+        string goalId,
+        DateOnly date,
+        CancellationToken cancellationToken)
+    {
+        var dispatch = _activeDispatch ?? throw new InvalidOperationException("No active dispatch; run planning before sustain.");
+        var plan = _activePlan ?? throw new InvalidOperationException("No active plan; run planning before sustain.");
+        var world = await _grounding.AssembleAsync(dispatch, cancellationToken);
+        var day = DayName(date);
+        var planItem = plan.Plan.FirstOrDefault(item => string.Equals(item.Day, day, StringComparison.OrdinalIgnoreCase));
+        var eventsToday = world.Calendar
+            .Where(evt => DateOnly.TryParse(evt.Date, out var eventDate) && eventDate == date)
+            .ToArray();
+
+        var task = new GoalTask
+        {
+            GoalId = dispatch.GoalId,
+            Contract = dispatch,
+            Status = TaskStatuses.Monitoring,
+            CreatedAt = world.AsOf,
+            ActivePlan = plan.Plan,
+        };
+
+        MaterialityVerdict? material = null;
+        WorldChange? materialChange = null;
+        foreach (var evt in eventsToday)
+        {
+            var change = new WorldChange
+            {
+                Source = "calendar",
+                Kind = "updated",
+                Summary = $"calendar: {evt.Title} {day} {evt.Start} - prep window shrinks",
+                ObservedAt = _clock.Now,
+                EventDate = evt.Date,
+                EventStart = evt.Start,
+                EventEnd = evt.End,
+                PlannedDay = day,
+                PlannedDish = planItem?.Dish,
+            };
+            var verdict = _changeWatcher.Evaluate(change, task, world);
+            if (verdict.IsMaterial)
+            {
+                material = verdict;
+                materialChange = change;
+                break;
+            }
+        }
+
+        var isMaterial = material?.IsMaterial == true;
+        var proposal = isMaterial && materialChange is not null
+            ? await OnMaterialChangeAsync(goalId, materialChange, cancellationToken)
+            : null;
+        var status = new StatusMessage
+        {
+            GoalId = goalId,
+            CorrelationId = $"sustain-{date:yyyyMMdd}",
+            TaskStatus = TaskStatuses.Monitoring,
+            Payload = new StatusPayload
+            {
+                Day = day,
+                SimDate = date.ToString("yyyy-MM-dd"),
+                Note = SustainNote(date, day, plan, world, isMaterial),
+                Material = isMaterial,
+            },
+        };
+
+        _trace.Record(new TraceEvent
+        {
+            At = _clock.Now,
+            GoalId = goalId,
+            Phase = TracePhase.Sustain,
+            Source = nameof(Pipeline),
+            Kind = "status_ready",
+            Message = $"{day} sustain tick material={isMaterial.ToString().ToLowerInvariant()}",
+        });
+
+        return new SustainTickResult
+        {
+            Status = status,
+            Proposal = proposal,
+        };
+    }
+
+    private static string SustainNote(
+        DateOnly date,
+        string day,
+        CandidatePlan plan,
+        WorldState world,
+        bool material)
+    {
+        var tomorrow = date.AddDays(1);
+        var tomorrowDay = DayName(tomorrow);
+        var tomorrowDish = plan.Plan.FirstOrDefault(item =>
+            string.Equals(item.Day, tomorrowDay, StringComparison.OrdinalIgnoreCase))?.Dish;
+        var expiring = world.ExpiringSoon
+            .Where(item => DateOnly.TryParse(item.ExpiresOn, out var expires) && expires <= date.AddDays(1))
+            .Select(item => item.Name)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (material)
+        {
+            return "calendar conflict overlaps the planned dinner prep window; adaptation proposed";
+        }
+
+        var reminder = tomorrowDish is null
+            ? "on track"
+            : $"on track; reminder set for {tomorrowDay} {tomorrowDish}";
+        return expiring.Length == 0
+            ? reminder
+            : $"reconciled inventory ({string.Join(", ", expiring)} soon); {reminder}";
+    }
+
+    private static string DayName(DateOnly date) =>
+        date.DayOfWeek switch
+        {
+            DayOfWeek.Monday => "Mon",
+            DayOfWeek.Tuesday => "Tue",
+            DayOfWeek.Wednesday => "Wed",
+            DayOfWeek.Thursday => "Thu",
+            DayOfWeek.Friday => "Fri",
+            DayOfWeek.Saturday => "Sat",
+            _ => "Sun",
+        };
 
     private static ImpactMetrics ComputeImpact(
         CandidatePlan plan,

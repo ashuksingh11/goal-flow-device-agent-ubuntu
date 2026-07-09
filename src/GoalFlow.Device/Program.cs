@@ -15,9 +15,55 @@ using System.Text.Json;
 
 var options = CliOptions.Parse(args);
 LoadDotEnv(Path.Combine(Directory.GetCurrentDirectory(), ".env"));
-var clock = new VirtualClock(DateTimeOffset.Parse("2026-07-12T09:00:00+00:00"));
+var clockAnchor = DateTimeOffset.Parse("2026-07-12T09:00:00+00:00");
+var clock = new VirtualClock(clockAnchor);
 var trace = new InMemoryTrace();
-var pipeline = BuildPipeline(options, clock, trace);
+var runDataDir = options.DataDir;
+string? tempDataDir = null;
+if (options.SimulateWeek)
+{
+    tempDataDir = Path.Combine(Path.GetTempPath(), $"goalflow-m4-{Guid.NewGuid():N}");
+    CopyDirectory(options.DataDir, tempDataDir);
+    runDataDir = tempDataDir;
+}
+
+var seedStore = new DataSeedStore(runDataDir);
+var pipeline = BuildPipeline(options with { DataDir = runDataDir }, clock, trace, clockAnchor, seedStore.Restore);
+
+if (options.SimulateWeek)
+{
+    try
+    {
+        var simulateContractJson = await File.ReadAllTextAsync(options.ContractPath ?? Path.Combine(runDataDir, "sample-contract.json"));
+        var simulateDispatch = JsonSerializer.Deserialize<Dispatch>(simulateContractJson, ContractJson.Options)
+            ?? throw new InvalidOperationException("Unable to deserialize simulate-week contract.");
+        await pipeline.RunAsync(simulateDispatch);
+        for (var i = 0; i < 5; i++)
+        {
+            var result = await pipeline.AdvanceDayAsync(simulateDispatch.GoalId);
+            Console.WriteLine(JsonSerializer.Serialize(result.Status, ContractJson.Options));
+            if (result.Proposal is not null)
+            {
+                Console.WriteLine(JsonSerializer.Serialize(result.Proposal, ContractJson.Options));
+            }
+        }
+
+        var reset = new Control { GoalId = simulateDispatch.GoalId, Command = ControlCommands.Reset };
+        foreach (var message in await pipeline.OnControlAsync(reset))
+        {
+            Console.WriteLine(JsonSerializer.Serialize(message, ContractJson.Options));
+        }
+    }
+    finally
+    {
+        if (tempDataDir is not null && Directory.Exists(tempDataDir))
+        {
+            Directory.Delete(tempDataDir, recursive: true);
+        }
+    }
+
+    return;
+}
 
 if (options.Connect)
 {
@@ -62,7 +108,7 @@ if (options.SimulateApprovalPath is not null)
 
 Console.WriteLine(JsonSerializer.Serialize(planReady, ContractJson.Options));
 
-static Pipeline BuildPipeline(CliOptions options, IClock clock, ITrace trace)
+static Pipeline BuildPipeline(CliOptions options, IClock clock, ITrace trace, DateTimeOffset clockAnchor, Action? resetData)
 {
     var fixturePath = Path.Combine(options.DataDir, "golden-plan_ready.json");
     var rulesPlanner = new RulesPlanner(trace, clock);
@@ -101,8 +147,21 @@ static Pipeline BuildPipeline(CliOptions options, IClock clock, ITrace trace)
         new SafetyGate(trace, clock),
         new ApprovalBroker(clock, trace),
         new EffectExecutor(shoppingList, reminders, clock, trace),
+        new Scheduler(clock, trace),
+        new ChangeWatcher(clock, trace),
         clock,
-        trace);
+        trace,
+        clockAnchor,
+        resetData);
+}
+
+static void CopyDirectory(string sourceDir, string targetDir)
+{
+    Directory.CreateDirectory(targetDir);
+    foreach (var file in Directory.EnumerateFiles(sourceDir))
+    {
+        File.Copy(file, Path.Combine(targetDir, Path.GetFileName(file)), overwrite: true);
+    }
 }
 
 static void LoadDotEnv(string path)
@@ -135,6 +194,39 @@ static void LoadDotEnv(string path)
     }
 }
 
+internal sealed class DataSeedStore
+{
+    private readonly string _dataDir;
+    private readonly Dictionary<string, byte[]> _seed = new(StringComparer.Ordinal);
+
+    public DataSeedStore(string dataDir)
+    {
+        _dataDir = dataDir;
+        foreach (var file in Directory.EnumerateFiles(dataDir, "*.json"))
+        {
+            _seed[Path.GetFileName(file)] = File.ReadAllBytes(file);
+        }
+    }
+
+    public void Restore()
+    {
+        Directory.CreateDirectory(_dataDir);
+        foreach (var file in Directory.EnumerateFiles(_dataDir, "*.json"))
+        {
+            var name = Path.GetFileName(file);
+            if (!_seed.ContainsKey(name))
+            {
+                File.Delete(file);
+            }
+        }
+
+        foreach (var (name, bytes) in _seed)
+        {
+            File.WriteAllBytes(Path.Combine(_dataDir, name), bytes);
+        }
+    }
+}
+
 /// <summary>Parsed command-line options for the M1 entry point.</summary>
 internal sealed record CliOptions
 {
@@ -156,6 +248,9 @@ internal sealed record CliOptions
     /// <summary>--replay-simulated-approval: feed the same approval twice for idempotency verification.</summary>
     public bool ReplaySimulatedApproval { get; init; }
 
+    /// <summary>--simulate-week: headless M4 virtual-clock sustain demo.</summary>
+    public bool SimulateWeek { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         // Minimal deliberate parser — no external dependency.
@@ -165,6 +260,7 @@ internal sealed record CliOptions
         var dataDir = "data";
         string? simulateApproval = null;
         var replaySimulatedApproval = false;
+        var simulateWeek = false;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -187,13 +283,17 @@ internal sealed record CliOptions
                 case "--replay-simulated-approval":
                     replaySimulatedApproval = true;
                     break;
+                case "--simulate-week":
+                    simulateWeek = true;
+                    break;
             }
         }
 
-        if (!connect && contract is null)
+        if (!connect && !simulateWeek && contract is null)
         {
             Console.Error.WriteLine("usage: dotnet run -- --contract <file.json> [--planner rules|llm|scripted] [--data <dir>] [--simulate-approval <approval.json>]");
             Console.Error.WriteLine("   or: dotnet run -- --connect [--planner rules|llm|scripted] [--data <dir>]  (WS_URL defaults to ws://localhost:8000/ws)");
+            Console.Error.WriteLine("   or: dotnet run -- --simulate-week [--data <dir>]");
             Environment.Exit(2);
         }
 
@@ -205,6 +305,7 @@ internal sealed record CliOptions
             DataDir = dataDir,
             SimulateApprovalPath = simulateApproval,
             ReplaySimulatedApproval = replaySimulatedApproval,
+            SimulateWeek = simulateWeek,
         };
     }
 

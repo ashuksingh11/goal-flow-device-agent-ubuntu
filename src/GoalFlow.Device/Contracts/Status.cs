@@ -32,8 +32,17 @@ public sealed record StatusPayload
     [JsonPropertyName("executed")]
     public IReadOnlyList<ExecutedEffect>? Executed { get; init; }
 
+    [JsonPropertyName("day")]
+    public string? Day { get; init; }
+
+    [JsonPropertyName("sim_date")]
+    public string? SimDate { get; init; }
+
     [JsonPropertyName("note")]
     public required string Note { get; init; }
+
+    [JsonPropertyName("material")]
+    public bool? Material { get; init; }
 }
 
 /// <summary>One executed approved effect reported in a status payload.</summary>
