@@ -89,6 +89,7 @@ public sealed class CapabilityRegistry
         "Recipes" => typeof(RecipePlugin),
         "ShoppingList" => typeof(ShoppingListPlugin),
         "Reminders" => typeof(ReminderPlugin),
+        "Guests" => typeof(GuestsPlugin),
         "Appliance" => typeof(ApplianceControlPlugin),
         "FamilyProfiles" => typeof(FamilyProfilesPlugin),
         "Budget" => typeof(BudgetPlugin),

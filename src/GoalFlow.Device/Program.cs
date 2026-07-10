@@ -48,6 +48,7 @@ services.AddSingleton<CalendarPlugin>();
 services.AddSingleton<RecipePlugin>();
 services.AddSingleton<ShoppingListPlugin>();
 services.AddSingleton<ReminderPlugin>();
+services.AddSingleton<GuestsPlugin>();
 services.AddSingleton<ApplianceControlPlugin>();
 services.AddSingleton<FamilyProfilesPlugin>();
 services.AddSingleton<BudgetPlugin>();

@@ -72,7 +72,7 @@ public sealed class GoalAgent
     ///   1. OpenRouter chat completion (OpenAI-compatible connector; model
     ///      <see cref="AgentSettings.ModelId"/>, endpoint <see cref="AgentSettings.BaseUrl"/>).
     ///   2. Capability plugins from DI, each under its advertised module name:
-    ///      Inventory, Calendar, Recipes, ShoppingList, Reminders, Appliance,
+    ///      Inventory, Calendar, Recipes, ShoppingList, Reminders, Guests, Appliance,
     ///      FamilyProfiles, Budget, Notify.
     ///   3. The <see cref="SafetyFilter"/> as an <see cref="IFunctionInvocationFilter"/>
     ///      service — every auto-invoked function passes through it.
@@ -95,6 +95,7 @@ public sealed class GoalAgent
         builder.Plugins.AddFromObject(services.GetRequiredService<RecipePlugin>(), "Recipes");
         builder.Plugins.AddFromObject(services.GetRequiredService<ShoppingListPlugin>(), "ShoppingList");
         builder.Plugins.AddFromObject(services.GetRequiredService<ReminderPlugin>(), "Reminders");
+        builder.Plugins.AddFromObject(services.GetRequiredService<GuestsPlugin>(), "Guests");
         builder.Plugins.AddFromObject(services.GetRequiredService<ApplianceControlPlugin>(), "Appliance");
         builder.Plugins.AddFromObject(services.GetRequiredService<FamilyProfilesPlugin>(), "FamilyProfiles");
         builder.Plugins.AddFromObject(services.GetRequiredService<BudgetPlugin>(), "Budget");
@@ -145,7 +146,9 @@ public sealed class GoalAgent
 
         Grounding rules:
         - This is LLM-only planning. Use Semantic Kernel read-only tools for grounding; do not invent inventory, calendar, recipe, reminder, or shopping-list facts.
-        - Call these read tools when relevant: Inventory.ListItems, Inventory.GetExpiringItems, Calendar.GetBusyEvenings, Calendar.GetEvents, Recipes.FindRecipes, ShoppingList.GetList, Reminders.List.
+        - Call these read tools when relevant: Inventory.ListItems, Inventory.GetExpiringItems, Calendar.GetBusyEvenings, Calendar.GetEvents, Recipes.FindRecipes, ShoppingList.GetList, Reminders.List, Guests.GetEvent, Guests.GetGuests, Guests.GetDietaryConstraints, Appliance.ListAppliances.
+        - Guest tools are relevant only when the contract domain/objective/scope/context mentions guests, hosting, RSVPs, or a dinner party. Do not use guest data for an ordinary meal_plan goal.
+        - For domain guest_dinner, ground guests, dietary constraints, appliance state, recipes, inventory, calendar, shopping list, and reminders; Appliance.ListAppliances is the read-only source for oven/dishwasher/fridge availability.
         - During planning side effects are intentionally not exposed as tools.
         - Do not produce the final plan yet.
         - Return a concise grounding summary of the facts, constraints, candidate recipes, missing items, and scheduling context that the final plan must use.
@@ -161,6 +164,16 @@ public sealed class GoalAgent
         - Use the grounded facts and tool results already present in this conversation. Do not call tools in this step.
         - During planning side effects are intentionally not exposed as tools. Propose mutations in the final JSON instead.
         - Proposal module/function/args must match real side-effecting functions exactly.
+        - Valid side-effecting guest-dinner proposal functions include:
+          ShoppingList.Add args {"items":["..."],"reason":"..."}
+          ShoppingList.PlaceOrder args {"estimatedTotal":42.50}
+          Appliance.PreheatOven args {"targetC":180,"atTime":"YYYY-MM-DDTHH:mm"}
+          Appliance.RunProgram args {"appliance":"dishwasher","program":"eco","atTime":"YYYY-MM-DDTHH:mm"}
+          Appliance.Defrost args {"item":"...","atTime":"YYYY-MM-DDTHH:mm"}
+          Reminders.Create args {"title":"...","date":"YYYY-MM-DD","time":"HH:mm"}
+        - Do not invent proposal functions such as Appliance.Preheat, Reminders.Add, or Reminder.Create.
+        - For guest_dinner, include a menu that honors guest dietary constraints, a prep timeline whose plan item "when" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders.
+        - For guest_dinner appliance prep, prefer concrete proposals when grounded appliances support them: Appliance.PreheatOven before an oven-warmed dish, Appliance.RunProgram for dishwasher cleanup before quiet_hours, and Appliance.Defrost only when a frozen item needs thawing.
         - Do not propose ingredients or recipes that violate hard constraints.
         - Use ISO dates inside the contract time_window. Never use a hardcoded anchor date.
         - The response must start with { and end with }. Do not output whitespace, Markdown, code fences, or prose outside the JSON object.
@@ -168,7 +181,7 @@ public sealed class GoalAgent
         Final answer must be only valid JSON with this shape:
         {
           "plan": [
-            {"id":"s1","title":"...","detail":"...","when":"YYYY-MM-DD","why":["..."],"tags":["..."]}
+            {"id":"s1","title":"...","detail":"...","when":"YYYY-MM-DD or YYYY-MM-DDTHH:mm","why":["..."],"tags":["..."]}
           ],
           "proposals": [
             {"proposal_id":"p1","action":"add missing groceries","module":"ShoppingList","function":"Add","args":{"items":["..."],"reason":"..."},"tier":"light","reason":"...","requires_approval":true},
@@ -431,7 +444,11 @@ public sealed class GoalAgent
             ("Recipes", "FindRecipes"),
             ("Recipes", "GetRecipe"),
             ("ShoppingList", "GetList"),
-            ("Reminders", "List")
+            ("Reminders", "List"),
+            ("Guests", "GetEvent"),
+            ("Guests", "GetGuests"),
+            ("Guests", "GetDietaryConstraints"),
+            ("Appliance", "ListAppliances")
         };
         return names.Select(n => _kernel.Plugins.GetFunction(n.Module, n.Function)).ToArray();
     }

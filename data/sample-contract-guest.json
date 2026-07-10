@@ -1,0 +1,44 @@
+{
+  "type": "dispatch",
+  "goal_id": "guest-dinner-demo",
+  "correlation_id": "disp-guest-001",
+  "domain": "guest_dinner",
+  "objective": "host Saturday dinner for 6",
+  "success_criteria": [
+    "menu honors all attending guest dietary constraints",
+    "prep timeline includes defrost, prep, preheat, and cleanup timing",
+    "shopping and appliance actions are tiered proposals",
+    "appliance prep includes an oven preheat before service and dishwasher cleanup before quiet hours",
+    "no nut-containing dish or shopping item is proposed"
+  ],
+  "constraints": {
+    "hard": {
+      "allergens": ["nuts"],
+      "dietary": ["no_beef", "no_pork"],
+      "medical": [],
+      "budget_cap": 90.0,
+      "quiet_hours": {
+        "start": "22:00",
+        "end": "07:00"
+      }
+    },
+    "soft": {
+      "prefer": ["vegetarian", "more_vegetables", "uses_inventory"],
+      "style": "casual family dinner"
+    }
+  },
+  "scope": {
+    "hosted_event": "Dinner party",
+    "meal": "dinner",
+    "headcount": 6,
+    "target_day": "Saturday"
+  },
+  "time_window": {
+    "start": "${today}",
+    "end": "${today+1}"
+  },
+  "autonomy": "tiered",
+  "context": {
+    "notes": "Use guest RSVP data and household appliances to sort dinner prep end to end. Include an oven-warmed vegetarian dish if compatible with constraints."
+  }
+}

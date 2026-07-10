@@ -185,7 +185,7 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
             return null;
         }
 
-        var timeText = GetString(arguments, "time");
+        var timeText = GetString(arguments, "time") ?? ExtractTime(GetString(arguments, "atTime"));
         if (timeText is null)
         {
             return null;
@@ -269,6 +269,21 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
 
     private static string? GetString(KernelArguments args, string name)
         => args.TryGetValue(name, out var value) ? value?.ToString() : null;
+
+    private static string? ExtractTime(string? atTime)
+    {
+        if (string.IsNullOrWhiteSpace(atTime))
+        {
+            return null;
+        }
+
+        if (DateTimeOffset.TryParse(atTime, out var dto))
+        {
+            return TimeOnly.FromDateTime(dto.DateTime).ToString("HH:mm");
+        }
+
+        return TimeOnly.TryParse(atTime, out var time) ? time.ToString("HH:mm") : null;
+    }
 
     private static IEnumerable<string> ArgumentStrings(KernelArguments args, string name)
     {

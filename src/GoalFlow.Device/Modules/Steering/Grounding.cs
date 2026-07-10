@@ -39,7 +39,7 @@ public sealed class Grounding
             $"domain: {dispatch.Domain}",
             $"objective: {dispatch.Objective}",
             $"time_window: {window.Start}..{window.End}",
-            "Use read-only tools to ground inventory, calendar, recipes, reminders, and shopping list before finalizing."
+            "Use read-only tools to ground inventory, calendar, recipes, reminders, shopping list, guests, dietary constraints, and appliance state before finalizing."
         ]);
 
         return Task.FromResult(new GroundingContext

@@ -1,0 +1,76 @@
+{
+  "comment": "GENERIC CLOCK RULE: hosted event dates use day_offset from IClock.Today, resolved to date at read time. No absolute dates in mock data.",
+  "events": [
+    {
+      "id": "guest-evt-001",
+      "title": "Dinner party",
+      "day_offset": 1,
+      "start": "18:30",
+      "end": "21:30",
+      "headcount": 6,
+      "style": "casual vegetarian-friendly family dinner"
+    }
+  ],
+  "guests": [
+    {
+      "id": "gst-001",
+      "name": "Maya",
+      "rsvp": "attending",
+      "dietary_constraints": {
+        "dietary": ["vegetarian"],
+        "allergies": [],
+        "avoid": []
+      }
+    },
+    {
+      "id": "gst-002",
+      "name": "Leo",
+      "rsvp": "attending",
+      "dietary_constraints": {
+        "dietary": [],
+        "allergies": ["nuts"],
+        "avoid": []
+      }
+    },
+    {
+      "id": "gst-003",
+      "name": "Sam",
+      "rsvp": "attending",
+      "dietary_constraints": {
+        "dietary": [],
+        "allergies": [],
+        "avoid": ["beef"]
+      }
+    },
+    {
+      "id": "gst-004",
+      "name": "Nina",
+      "rsvp": "attending",
+      "dietary_constraints": {
+        "dietary": [],
+        "allergies": [],
+        "avoid": []
+      }
+    },
+    {
+      "id": "gst-005",
+      "name": "Owen",
+      "rsvp": "attending",
+      "dietary_constraints": {
+        "dietary": [],
+        "allergies": [],
+        "avoid": []
+      }
+    },
+    {
+      "id": "gst-006",
+      "name": "Priya",
+      "rsvp": "attending",
+      "dietary_constraints": {
+        "dietary": ["no_pork"],
+        "allergies": [],
+        "avoid": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "comment": "SmartThings-style mock appliance state. Scheduled actions use ISO local date-time strings supplied by proposals; appliance inventory itself is date-free.",
+  "appliances": [
+    {
+      "id": "oven",
+      "name": "oven",
+      "type": "oven",
+      "state": "idle",
+      "location": "kitchen",
+      "supports": ["preheat"],
+      "max_temperature_c": 250
+    },
+    {
+      "id": "dishwasher",
+      "name": "dishwasher",
+      "type": "dishwasher",
+      "state": "idle",
+      "location": "kitchen",
+      "programs": ["eco", "quick", "heavy"]
+    },
+    {
+      "id": "fridge",
+      "name": "fridge",
+      "type": "fridge",
+      "state": "online",
+      "location": "kitchen",
+      "supports": ["defrost_reminder", "thaw_zone"]
+    }
+  ],
+  "scheduled_actions": []
+}
