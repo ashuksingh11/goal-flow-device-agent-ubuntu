@@ -111,8 +111,13 @@ public sealed class MonitorAdapt
         foreach (var ev in calendarEvents.Select(n => n?.AsObject()).OfType<JsonObject>())
         {
             var title = ev["title"]?.GetValue<string>() ?? "";
+            var evDate = ev["date"]?.GetValue<string>();
+            // Fire when the clock REACHES OR PASSES the football day — not only on the
+            // exact day — so advancing to (or a bit past) it always triggers the
+            // adaptation. Deduped once by the stable Key below.
             if (!title.Contains("football", StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(ev["date"]?.GetValue<string>(), today, StringComparison.Ordinal))
+                evDate is null ||
+                string.CompareOrdinal(today, evDate) < 0)
             {
                 continue;
             }
@@ -124,7 +129,7 @@ public sealed class MonitorAdapt
 
             changes.Add(new WorldChange
             {
-                Key = $"meal:{ev["id"]?.GetValue<string>() ?? title}:{today}",
+                Key = $"meal:{ev["id"]?.GetValue<string>() ?? title}:football",
                 Kind = "calendar.event_overlap",
                 Description = $"{title} runs {ev["start"]?.GetValue<string>()}-{ev["end"]?.GetValue<string>()} on {today}, overlapping the planned dinner prep window.",
                 AffectedPlanItems = affected,
