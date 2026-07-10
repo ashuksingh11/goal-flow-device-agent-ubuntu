@@ -30,10 +30,11 @@ public sealed record AgentSettings
 /// Hosts the Semantic Kernel: capability plugins registered as tools, the
 /// SafetyFilter in the invocation pipeline, and OpenRouter as the
 /// OpenAI-compatible chat model. Planning is ONE streaming chat invocation
-/// with <c>FunctionChoiceBehavior.Auto</c>: the LLM decides which
-/// [KernelFunction]s to call, the kernel invokes them (through the filter),
-/// and this class narrates everything as <c>agent_event</c> frames via Trace.
-/// LLM-ONLY: there is no rules/scripted fallback.
+/// with <c>FunctionChoiceBehavior.Auto</c> for grounding, followed by a
+/// no-tools JSON-mode compose call. The LLM decides which [KernelFunction]s to
+/// call, the kernel invokes them (through the filter), and this class narrates
+/// everything as <c>agent_event</c> frames via Trace. LLM-ONLY: there is no
+/// rules/scripted fallback.
 /// </summary>
 public sealed class GoalAgent
 {
@@ -105,9 +106,8 @@ public sealed class GoalAgent
     /// <summary>
     /// Runs one dispatch to a plan, STREAMING agent_events throughout:
     ///   phase(grounding)  → Grounding.AssembleAsync; SafetyFilter.SetPolicy(constraints.hard)
-    ///   phase(planning)   → streaming chat completion with FunctionChoiceBehavior.Auto;
-    ///                       thinking/tool_call/tool_result/plan_progress events as tokens
-    ///                       and function invocations flow
+    ///   phase(planning)   → compose the final JSON plan without tools;
+    ///                       thinking/tool_call/tool_result/plan_progress events still flow
     ///   phase(checking)   → collect SafetyFilter verdict + freeze side-effects into
     ///                       tiered proposals via ApprovalCoordinator
     ///   phase(awaiting_approval) → return the plan_ready frame.
@@ -135,19 +135,35 @@ public sealed class GoalAgent
     public Task<(Status Status, Proposal? Adaptation)> HandleControlAsync(Control control, CancellationToken ct = default)
         => HandleControlCoreAsync(control, ct);
 
-    /// <summary>The planning instruction (user message) rendered from the contract.</summary>
+    private const int MaxComposeAttempts = 2;
+
+    /// <summary>The grounding instruction (user message) rendered from the contract.</summary>
+    internal static string BuildGroundingInstruction(Dispatch dispatch)
+        => $$"""
+        Task Contract:
+        {{ContractJson.Serialize(dispatch)}}
+
+        Grounding rules:
+        - This is LLM-only planning. Use Semantic Kernel read-only tools for grounding; do not invent inventory, calendar, recipe, reminder, or shopping-list facts.
+        - Call these read tools when relevant: Inventory.ListItems, Inventory.GetExpiringItems, Calendar.GetBusyEvenings, Calendar.GetEvents, Recipes.FindRecipes, ShoppingList.GetList, Reminders.List.
+        - During planning side effects are intentionally not exposed as tools.
+        - Do not produce the final plan yet.
+        - Return a concise grounding summary of the facts, constraints, candidate recipes, missing items, and scheduling context that the final plan must use.
+        """;
+
+    /// <summary>The final no-tools compose instruction rendered from the contract.</summary>
     internal static string BuildPlanningInstruction(Dispatch dispatch)
         => $$"""
         Task Contract:
         {{ContractJson.Serialize(dispatch)}}
 
-        Planning rules:
-        - This is LLM-only planning. Use Semantic Kernel read-only tools for grounding; do not invent inventory, calendar, recipe, reminder, or shopping-list facts.
-        - Before final JSON, call these read tools when relevant: Inventory.ListItems, Inventory.GetExpiringItems, Calendar.GetBusyEvenings, Recipes.FindRecipes, ShoppingList.GetList.
+        Compose rules:
+        - Use the grounded facts and tool results already present in this conversation. Do not call tools in this step.
         - During planning side effects are intentionally not exposed as tools. Propose mutations in the final JSON instead.
         - Proposal module/function/args must match real side-effecting functions exactly.
         - Do not propose ingredients or recipes that violate hard constraints.
         - Use ISO dates inside the contract time_window. Never use a hardcoded anchor date.
+        - The response must start with { and end with }. Do not output whitespace, Markdown, code fences, or prose outside the JSON object.
 
         Final answer must be only valid JSON with this shape:
         {
@@ -163,6 +179,24 @@ public sealed class GoalAgent
         }
         """;
 
+    private static string BuildPlanningRetryInstruction(string error)
+        => $$"""
+        The previous compose response could not be parsed as the required plan JSON.
+        Parser error: {{error}}
+
+        Return ONLY the JSON plan object matching this schema, no prose, no Markdown, no code fence:
+        {
+          "plan": [
+            {"id":"s1","title":"...","detail":"...","when":"YYYY-MM-DD","why":["..."],"tags":["..."]}
+          ],
+          "proposals": [
+            {"proposal_id":"p1","action":"...","module":"ShoppingList","function":"Add","args":{"items":["..."],"reason":"..."},"tier":"light","reason":"...","requires_approval":true}
+          ],
+          "impact": [{"label":"...","value":"..."}],
+          "explanation": "one concise paragraph"
+        }
+        """;
+
     private async Task<PlanReady> RunCoreAsync(Dispatch dispatch, CancellationToken ct)
     {
         using var scope = _trace.BeginGoalScope(dispatch.GoalId, dispatch.CorrelationId);
@@ -173,12 +207,11 @@ public sealed class GoalAgent
         await _trace.PhaseAsync("grounding");
         var ground = await _grounding.AssembleAsync(dispatch, _kernel, ct);
 
-        await _trace.PhaseAsync("planning");
         var history = new ChatHistory();
         history.AddSystemMessage(_grounding.RenderPrompt(ground));
-        history.AddUserMessage(BuildPlanningInstruction(dispatch));
+        history.AddUserMessage(BuildGroundingInstruction(dispatch));
 
-        var settings = new OpenAIPromptExecutionSettings
+        var groundingSettings = new OpenAIPromptExecutionSettings
         {
             FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(ReadOnlyPlanningFunctions(), autoInvoke: true, options: new FunctionChoiceBehaviorOptions
             {
@@ -190,18 +223,25 @@ public sealed class GoalAgent
         };
 
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
-        var final = new StringBuilder();
-        await foreach (var chunk in chat.GetStreamingChatMessageContentsAsync(history, settings, _kernel, ct))
+        var groundingSummary = new StringBuilder();
+        await foreach (var chunk in chat.GetStreamingChatMessageContentsAsync(history, groundingSettings, _kernel, ct))
         {
             if (!string.IsNullOrEmpty(chunk.Content))
             {
-                final.Append(chunk.Content);
+                groundingSummary.Append(chunk.Content);
                 await _trace.ThinkingAsync(chunk.Content);
             }
         }
 
+        if (groundingSummary.Length > 0)
+        {
+            history.AddAssistantMessage(groundingSummary.ToString());
+        }
+
+        await _trace.PhaseAsync("planning");
+        var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
+
         await _trace.PhaseAsync("checking");
-        var modelPlan = ParseModelPlan(final.ToString());
         var proposals = modelPlan.Proposals.Select(NormalizeProposal).Select(_approvals.Register).ToArray();
         foreach (var item in modelPlan.Plan)
         {
@@ -228,25 +268,109 @@ public sealed class GoalAgent
         return ready;
     }
 
+    private async Task<ModelPlan> ComposeModelPlanAsync(IChatCompletionService chat, ChatHistory history, Dispatch dispatch, CancellationToken ct)
+    {
+        history.AddUserMessage(BuildPlanningInstruction(dispatch));
+        string? lastError = null;
+
+        for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
+        {
+            if (attempt > 1)
+            {
+                history.AddUserMessage(BuildPlanningRetryInstruction(lastError ?? "Planner did not return a valid JSON object."));
+            }
+
+            var raw = await GetComposeContentAsync(chat, history, ct);
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                await _trace.ThinkingAsync(raw);
+                history.AddAssistantMessage(raw);
+            }
+
+            if (TryParseModelPlan(raw, out var modelPlan, out var error))
+            {
+                return modelPlan;
+            }
+
+            lastError = error;
+            var note = $"planner_notice: compose attempt {attempt}/{MaxComposeAttempts} did not return parseable plan JSON: {error}";
+            _logger.LogWarning("{Note}", note);
+            await _trace.ThinkingAsync(note);
+        }
+
+        var failure = $"Planner failed to return a valid JSON plan after {MaxComposeAttempts} compose attempt(s). Last error: {lastError}";
+        _logger.LogError("{Failure}", failure);
+        await _trace.ThinkingAsync($"planner_error: {failure}");
+        throw new JsonException(failure);
+    }
+
+    private async Task<string> GetComposeContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
+    {
+        var jsonSettings = new OpenAIPromptExecutionSettings
+        {
+            Temperature = 0.1,
+            MaxTokens = 6000,
+            ResponseFormat = "json_object"
+        };
+
+        try
+        {
+            var response = await chat.GetChatMessageContentAsync(history, jsonSettings, _kernel, ct);
+            var content = response.Content ?? "";
+            if (!string.IsNullOrWhiteSpace(content))
+            {
+                return content;
+            }
+
+            var note = "planner_notice: provider returned empty content with JSON response_format; retrying compose with strict JSON prompt only.";
+            _logger.LogWarning("{Note}", note);
+            await _trace.ThinkingAsync(note);
+            return await GetStrictComposeContentAsync(chat, history, ct);
+        }
+        catch (Exception ex) when (LooksLikeResponseFormatRejection(ex))
+        {
+            var note = $"planner_notice: provider rejected JSON response_format; retrying compose with strict JSON prompt only. Error: {ex.Message}";
+            _logger.LogWarning(ex, "{Note}", note);
+            await _trace.ThinkingAsync(note);
+            return await GetStrictComposeContentAsync(chat, history, ct);
+        }
+    }
+
+    private async Task<string> GetStrictComposeContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
+    {
+        var strictSettings = new OpenAIPromptExecutionSettings
+        {
+            Temperature = 0.1,
+            MaxTokens = 6000
+        };
+        var response = await chat.GetChatMessageContentAsync(history, strictSettings, _kernel, ct);
+        return response.Content ?? "";
+    }
+
     private async Task<Status> ApplyApprovalCoreAsync(Approval approval, CancellationToken ct)
     {
         using var scope = _trace.BeginGoalScope(approval.GoalId, approval.CorrelationId);
         _safety.SetTrace(_trace);
         await _trace.PhaseAsync("executing");
         var cleared = _approvals.ApplyDecisions(approval);
-        var executed = new List<string>();
+        var executed = new List<ExecutedEffect>();
 
         foreach (var proposal in cleared)
         {
             var function = _kernel.Plugins.GetFunction(proposal.Module, proposal.Function);
             var args = ToKernelArguments(proposal.Args);
             _logger.LogInformation("execute_proposal {ProposalId} {Module}.{Function}", proposal.ProposalId, proposal.Module, proposal.Function);
-            await _kernel.InvokeAsync(function, args, ct);
+            var invokeResult = await _kernel.InvokeAsync(function, args, ct);
             _approvals.MarkExecuted(proposal.ProposalId);
-            executed.Add(proposal.ProposalId);
+            executed.Add(new ExecutedEffect
+            {
+                ProposalId = proposal.ProposalId,
+                Action = $"{proposal.Module}.{proposal.Function}",
+                Result = "executed",
+                Detail = invokeResult.ToString()
+            });
         }
 
-        var allExecuted = _approvals.ExecutedIds();
         return new Status
         {
             GoalId = approval.GoalId,
@@ -255,7 +379,7 @@ public sealed class GoalAgent
             Payload = new StatusPayload
             {
                 SimDate = _clock.Today.ToString("yyyy-MM-dd"),
-                Executed = allExecuted,
+                Executed = executed,
                 Note = executed.Count == 0 ? "No new proposals executed; approval may be a replay or rejection." : $"Executed {executed.Count} proposal(s)."
             }
         };
@@ -363,34 +487,121 @@ public sealed class GoalAgent
         return value.GetValue<string>();
     }
 
-    private static ModelPlan ParseModelPlan(string raw)
+    private static ModelPlan ParseModelPlan(string? raw)
     {
         var json = ExtractJson(raw);
         return JsonSerializer.Deserialize<ModelPlan>(json, ContractJson.Options)
             ?? throw new JsonException("Planner returned null JSON.");
     }
 
-    private static string ExtractJson(string raw)
+    private static bool TryParseModelPlan(string? raw, out ModelPlan modelPlan, out string error)
     {
-        var trimmed = raw.Trim();
-        if (trimmed.StartsWith("```", StringComparison.Ordinal))
+        try
         {
-            var firstNewline = trimmed.IndexOf('\n');
-            var lastFence = trimmed.LastIndexOf("```", StringComparison.Ordinal);
-            if (firstNewline >= 0 && lastFence > firstNewline)
-            {
-                trimmed = trimmed[(firstNewline + 1)..lastFence].Trim();
-            }
+            modelPlan = ParseModelPlan(raw);
+            error = "";
+            return true;
+        }
+        catch (Exception ex) when (ex is JsonException or NotSupportedException)
+        {
+            modelPlan = new ModelPlan();
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private static string ExtractJson(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            throw new JsonException("Planner did not return any content for the JSON plan.");
         }
 
+        var trimmed = StripCodeFence(raw.Trim());
         var start = trimmed.IndexOf('{');
-        var end = trimmed.LastIndexOf('}');
-        if (start < 0 || end <= start)
+        if (start < 0)
         {
             throw new JsonException($"Planner did not return a JSON object. Raw: {raw}");
         }
 
+        var end = FindMatchingObjectEnd(trimmed, start);
+        if (end < 0)
+        {
+            throw new JsonException($"Planner returned an incomplete JSON object. Raw: {raw}");
+        }
+
         return trimmed[start..(end + 1)];
+    }
+
+    private static string StripCodeFence(string text)
+    {
+        var trimmed = text.Trim();
+        if (!trimmed.StartsWith("```", StringComparison.Ordinal))
+        {
+            return trimmed;
+        }
+
+        var firstNewline = trimmed.IndexOf('\n');
+        var lastFence = trimmed.LastIndexOf("```", StringComparison.Ordinal);
+        return firstNewline >= 0 && lastFence > firstNewline
+            ? trimmed[(firstNewline + 1)..lastFence].Trim()
+            : trimmed;
+    }
+
+    private static int FindMatchingObjectEnd(string text, int start)
+    {
+        var depth = 0;
+        var inString = false;
+        var escaping = false;
+
+        for (var i = start; i < text.Length; i++)
+        {
+            var ch = text[i];
+
+            if (inString)
+            {
+                if (escaping)
+                {
+                    escaping = false;
+                }
+                else if (ch == '\\')
+                {
+                    escaping = true;
+                }
+                else if (ch == '"')
+                {
+                    inString = false;
+                }
+                continue;
+            }
+
+            if (ch == '"')
+            {
+                inString = true;
+            }
+            else if (ch == '{')
+            {
+                depth++;
+            }
+            else if (ch == '}')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    return i;
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool LooksLikeResponseFormatRejection(Exception ex)
+    {
+        var message = ex.ToString();
+        return message.Contains("response_format", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("json_object", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("ResponseFormat", StringComparison.OrdinalIgnoreCase);
     }
 
     private sealed record ModelPlan

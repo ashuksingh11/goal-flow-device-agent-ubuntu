@@ -95,7 +95,17 @@ public sealed class Trace
             Payload = payload
         };
         _logger.LogInformation("agent_event {Event} seq={Seq} payload={Payload}", kind, evt.Seq, payload.ToJsonString(ContractJson.Options));
-        await _emit(evt);
+        // Best-effort: a dropped/failed trace frame must NEVER crash planning.
+        // The structured log above is the durable record; the streamed frame is
+        // a live nicety.
+        try
+        {
+            await _emit(evt);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "agent_event emit failed (seq={Seq}); continuing", evt.Seq);
+        }
     }
 
     private sealed class NullScope : IDisposable

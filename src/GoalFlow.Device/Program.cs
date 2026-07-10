@@ -100,23 +100,40 @@ if (options.ConnectUrl is { } url)
     await using var ws = new WsClient(new Uri(url), loggerFactory.CreateLogger<WsClient>());
     liveWs = ws;
     var capabilities = provider.GetRequiredService<CapabilityRegistry>().BuildCapabilitiesMessage(kernel);
+    var connectLogger = loggerFactory.CreateLogger("Connect");
     await ws.ConnectAsync(capabilities);
-    ws.FrameReceived += async (type, raw) =>
+    // Handle each frame on a BACKGROUND task so the receive loop keeps pumping —
+    // planning takes 30-60s of LLM calls, and blocking the loop here means the
+    // device can't answer WS pings, so the cloud's keepalive closes the socket
+    // mid-plan. Fire-and-forget with error logging; WsClient.SendAsync is
+    // serialized by its own send lock.
+    ws.FrameReceived += (type, raw) =>
     {
-        switch (type)
+        _ = Task.Run(async () =>
         {
-            case MessageTypes.Dispatch:
-                await ws.SendAsync(await agent.RunAsync(ContractJson.Deserialize<Dispatch>(raw)));
-                break;
-            case MessageTypes.Approval:
-                await ws.SendAsync(await agent.ApplyApprovalAsync(ContractJson.Deserialize<Approval>(raw)));
-                break;
-            case MessageTypes.Control:
-                var (status, proposal) = await agent.HandleControlAsync(ContractJson.Deserialize<Control>(raw));
-                await ws.SendAsync(status);
-                if (proposal is not null) await ws.SendAsync(proposal);
-                break;
-        }
+            try
+            {
+                switch (type)
+                {
+                    case MessageTypes.Dispatch:
+                        await ws.SendAsync(await agent.RunAsync(ContractJson.Deserialize<Dispatch>(raw)));
+                        break;
+                    case MessageTypes.Approval:
+                        await ws.SendAsync(await agent.ApplyApprovalAsync(ContractJson.Deserialize<Approval>(raw)));
+                        break;
+                    case MessageTypes.Control:
+                        var (status, proposal) = await agent.HandleControlAsync(ContractJson.Deserialize<Control>(raw));
+                        await ws.SendAsync(status);
+                        if (proposal is not null) await ws.SendAsync(proposal);
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                connectLogger.LogError(ex, "frame handling failed for {Type}", type);
+            }
+        });
+        return Task.CompletedTask;
     };
     await ws.RunReceiveLoopAsync();
 }

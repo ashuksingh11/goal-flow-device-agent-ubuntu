@@ -29,8 +29,25 @@ public sealed record StatusPayload
     /// <summary>Whether the last observed world change was material (triggered adaptation).</summary>
     public bool Material { get; init; }
 
-    /// <summary>Proposal ids executed so far.</summary>
-    public IReadOnlyList<string> Executed { get; init; } = [];
+    /// <summary>Effects executed by this approval (objects, not bare ids), so the
+    /// UI can confirm what happened (e.g. "5 items added to shopping list").</summary>
+    public IReadOnlyList<ExecutedEffect> Executed { get; init; } = [];
 
     public string? Note { get; init; }
+}
+
+/// <summary>One executed side-effect, reported in <see cref="StatusPayload.Executed"/>.
+/// Serializes snake_case: proposal_id / action / result / detail.</summary>
+public sealed record ExecutedEffect
+{
+    public required string ProposalId { get; init; }
+
+    /// <summary>The action performed, e.g. "ShoppingList.Add".</summary>
+    public string? Action { get; init; }
+
+    /// <summary>Outcome marker, e.g. "executed".</summary>
+    public string? Result { get; init; }
+
+    /// <summary>Human-readable detail, e.g. the tool's returned summary.</summary>
+    public string? Detail { get; init; }
 }
