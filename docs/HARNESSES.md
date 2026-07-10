@@ -1,5 +1,12 @@
 # Harness Catalog (v2)
 
+**Count:** **11 harness modules** (the reusable, domain-agnostic orchestration
+layer — the "star") + **10 capability plugins** (the SK tools the LLM calls).
+The two are different categories: harness modules *steer/orchestrate*; capability
+plugins are the *toolbox*. Of the 11 harness modules, 2 are cloud-side (Goal
+Interpreter, Memory & Constraints) and 9 are device-side. Of the 10 capability
+plugins, 7 are implemented and 3 (FamilyProfiles, Budget, Notify) are named stubs.
+
 The reusable star of GoalFlow is the set of **11 domain-agnostic harness
 modules** from the v2 design proposal. This page maps each one to the REAL
 primitive it is built on and the REAL file that implements it in this repo —
@@ -45,20 +52,25 @@ advertised with `kind: "capability"` and per-function
 `side_effecting`/`tier` metadata. Mock-world access goes through
 `MockWorldStore` (relative dates; see `data/README.md`).
 
-| Plugin (module name) | Domain | [KernelFunction]s (side-effecting → tier) |
-|---|---|---|
-| `InventoryPlugin` (Inventory) | meal | `ListItems`, `GetExpiringItems`, `CheckAvailability`, `ConsumeItem` → auto |
-| `CalendarPlugin` (Calendar) | shared | `GetEvents`, `GetBusyEvenings`, `AddEvent` → light |
-| `RecipePlugin` (Recipes) | meal | `FindRecipes`, `GetRecipe` |
-| `ShoppingListPlugin` (ShoppingList) | shared | `GetList`, `Add` → light, `Remove` → light, `PlaceOrder` → **firm** (spends money) |
-| `ReminderPlugin` (Reminders) | shared | `List`, `Create` → auto, `Delete` → auto |
-| `ApplianceControlPlugin` (Appliance) | shared (SmartThings) | `ListAppliances`, `PreheatOven` → light, `RunProgram` → light, `Defrost` → auto *(signatures only; guest_dinner milestone)* |
-| `FamilyProfilesPlugin` (FamilyProfiles) | shared | `GetProfiles`, `GetMember` *(signatures only)* |
-| `BudgetPlugin` (Budget) | shared | `GetBudgetStatus`, `EstimateCost` *(signatures only; enforcement is SafetyFilter's)* |
-| `NotifyPlugin` (Notify) | shared | `SendNotification` → auto, `Announce` → light *(signatures only)* |
+**10 capability plugins** (7 implemented + 3 stubs). `MockWorldStore` is shared
+infra, not a plugin.
 
-**Generality in one line:** the `guest_dinner` domain adds a Guests/RSVP
-plugin and *reuses* Calendar, Reminders, Appliance, ShoppingList, Recipes and
-FamilyProfiles — same steering modules, same protocol, different toolbox
-subset. Not every goal uses every module; the pipeline is composed from the
-registry per goal.
+| Plugin (module name) | Domain | Status | [KernelFunction]s (side-effecting → tier) |
+|---|---|---|---|
+| `InventoryPlugin` (Inventory) | meal | ✅ | `ListItems`, `GetExpiringItems`, `CheckAvailability`, `ConsumeItem`, `MarkConsumed` → auto |
+| `CalendarPlugin` (Calendar) | shared | ✅ | `GetEvents`, `GetBusyEvenings`, `AddEvent` → light |
+| `RecipePlugin` (Recipes) | meal | ✅ | `FindRecipes`, `GetRecipe` |
+| `ShoppingListPlugin` (ShoppingList) | shared | ✅ | `GetList`, `Add` → light, `Remove` → light, `PlaceOrder` → **firm** (spends money) |
+| `ReminderPlugin` (Reminders) | shared | ✅ | `List`, `Create` → auto, `Delete` → auto |
+| `GuestsPlugin` (Guests) | guest_dinner | ✅ | `GetEvent`, `GetGuests`, `GetDietaryConstraints` (read-only; RSVPs + merged allergy/diet constraints) |
+| `ApplianceControlPlugin` (Appliance) | shared (SmartThings) | ✅ | `ListAppliances`, `PreheatOven` → light, `RunProgram` → light, `Defrost` → auto |
+| `FamilyProfilesPlugin` (FamilyProfiles) | shared | 🚧 stub | `GetProfiles`, `GetMember` *(extension point — NotImplementedException)* |
+| `BudgetPlugin` (Budget) | shared | 🚧 stub | `GetBudgetStatus`, `EstimateCost` *(extension point; the cap is enforced by SafetyFilter regardless)* |
+| `NotifyPlugin` (Notify) | shared | 🚧 stub | `SendNotification` → auto, `Announce` → light *(extension point)* |
+
+**Generality in one line:** the `guest_dinner` domain (built in v2-M4) adds the
+`GuestsPlugin` and *reuses* Calendar, Reminders, Appliance, ShoppingList and
+Recipes — same 11 steering/harness modules, same protocol, a different toolbox
+subset. Not every goal uses every plugin; the toolbox is composed from the
+registry per goal. Adding a third domain = add its capability plugin(s); the 11
+harness modules don't change.
