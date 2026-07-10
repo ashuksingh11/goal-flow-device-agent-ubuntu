@@ -1,4 +1,6 @@
 using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
 using GoalFlow.Device.Contracts;
 using Microsoft.Extensions.Logging;
 
@@ -20,6 +22,8 @@ public sealed class WsClient : IAsyncDisposable
     private readonly ILogger<WsClient> _logger;
     private ClientWebSocket? _socket;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private readonly HashSet<string> _seenCorrelations = [];
+    private CapabilitiesMessage? _capabilities;
 
     public WsClient(Uri endpoint, ILogger<WsClient> logger)
     {
@@ -35,7 +39,10 @@ public sealed class WsClient : IAsyncDisposable
     /// capabilities advertisement. Retries with exponential backoff.
     /// </summary>
     public Task ConnectAsync(CapabilitiesMessage capabilities, CancellationToken ct = default)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+    {
+        _capabilities = capabilities;
+        return ConnectOnceAsync(ct);
+    }
 
     /// <summary>
     /// Receive pump: reassembles text frames, peeks <c>type</c> via
@@ -44,7 +51,7 @@ public sealed class WsClient : IAsyncDisposable
     /// reconnects on drop.
     /// </summary>
     public Task RunReceiveLoopAsync(CancellationToken ct = default)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => ReceiveLoopAsync(ct);
 
     /// <summary>
     /// Sends one contract message (ContractJson snake_case). Safe to call
@@ -52,8 +59,93 @@ public sealed class WsClient : IAsyncDisposable
     /// sends, so writes are serialized on <see cref="_sendLock"/>.
     /// </summary>
     public Task SendAsync<T>(T message, CancellationToken ct = default)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => SendCoreAsync(message, ct);
 
     public ValueTask DisposeAsync()
-        => throw new NotImplementedException("v2-M0 design skeleton");
+    {
+        _socket?.Dispose();
+        _sendLock.Dispose();
+        return ValueTask.CompletedTask;
+    }
+
+    private async Task ConnectOnceAsync(CancellationToken ct)
+    {
+        _socket?.Dispose();
+        _socket = new ClientWebSocket();
+        await _socket.ConnectAsync(_endpoint, ct);
+        _logger.LogInformation("ws_connected {Endpoint}", _endpoint);
+        await SendAsync(new Hello(), ct);
+        await SendAsync(_capabilities!, ct);
+    }
+
+    private async Task ReceiveLoopAsync(CancellationToken ct)
+    {
+        var buffer = new byte[16 * 1024];
+        while (!ct.IsCancellationRequested)
+        {
+            if (_socket is null || _socket.State != WebSocketState.Open)
+            {
+                await ConnectOnceAsync(ct);
+            }
+
+            using var ms = new MemoryStream();
+            WebSocketReceiveResult result;
+            do
+            {
+                result = await _socket!.ReceiveAsync(buffer, ct);
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", ct);
+                    return;
+                }
+
+                ms.Write(buffer, 0, result.Count);
+            }
+            while (!result.EndOfMessage);
+
+            var raw = Encoding.UTF8.GetString(ms.ToArray());
+            var type = ContractJson.PeekType(raw);
+            if (type is null)
+            {
+                continue;
+            }
+
+            var correlation = TryGetCorrelation(raw);
+            if (correlation is not null && !_seenCorrelations.Add($"{type}:{correlation}"))
+            {
+                _logger.LogInformation("ws_duplicate_ignored type={Type} correlation_id={CorrelationId}", type, correlation);
+                continue;
+            }
+
+            if (FrameReceived is not null)
+            {
+                await FrameReceived.Invoke(type, raw);
+            }
+        }
+    }
+
+    private async Task SendCoreAsync<T>(T message, CancellationToken ct)
+    {
+        if (_socket is null || _socket.State != WebSocketState.Open)
+        {
+            throw new InvalidOperationException("WebSocket is not open.");
+        }
+
+        var bytes = Encoding.UTF8.GetBytes(ContractJson.Serialize(message));
+        await _sendLock.WaitAsync(ct);
+        try
+        {
+            await _socket.SendAsync(bytes, WebSocketMessageType.Text, true, ct);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
+
+    private static string? TryGetCorrelation(string raw)
+    {
+        using var doc = JsonDocument.Parse(raw);
+        return doc.RootElement.TryGetProperty("correlation_id", out var c) ? c.GetString() : null;
+    }
 }

@@ -44,14 +44,13 @@ public sealed class SimulatedClock : IClock
     /// <summary>Handles <c>control: set_date</c>. <paramref name="isoDate"/> e.g. "2026-07-14".</summary>
     public void SetDate(string isoDate)
     {
-        // TODO(M1): parse ISO date, validate, emit a status frame with the new sim_date.
-        throw new NotImplementedException("v2-M0 design skeleton");
+        _today = DateOnly.Parse(isoDate);
     }
 
     /// <summary>Handles <c>control: advance_day</c>; returns the new today.</summary>
     public DateOnly AdvanceDay()
     {
-        // TODO(M1): step _today forward one day and let MonitorAdapt re-evaluate the world.
-        throw new NotImplementedException("v2-M0 design skeleton");
+        _today = _today.AddDays(1);
+        return _today;
     }
 }

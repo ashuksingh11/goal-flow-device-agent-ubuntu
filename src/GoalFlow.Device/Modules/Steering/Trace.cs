@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using System.Text.Json;
 using GoalFlow.Device.Contracts;
 using Microsoft.Extensions.Logging;
 
@@ -32,29 +33,74 @@ public sealed class Trace
 
     /// <summary>Starts a goal scope: resets seq, pins goal_id/correlation_id on every frame + log line.</summary>
     public IDisposable BeginGoalScope(string goalId, string? correlationId)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+    {
+        _seq = 0;
+        _goalId = goalId;
+        _correlationId = correlationId;
+        return _logger.BeginScope(new Dictionary<string, object?>
+        {
+            ["goal_id"] = goalId,
+            ["correlation_id"] = correlationId
+        }) ?? NullScope.Instance;
+    }
 
     /// <summary>Emits a phase change (grounding | planning | checking | awaiting_approval).</summary>
     public Task PhaseAsync(string phase)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => EmitAsync(AgentEventKinds.Phase, new JsonObject { ["phase"] = phase });
 
     /// <summary>Streams a chunk of model thinking/narration text.</summary>
     public Task ThinkingAsync(string text)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => string.IsNullOrWhiteSpace(text)
+            ? Task.CompletedTask
+            : EmitAsync(AgentEventKinds.Thinking, new JsonObject { ["text"] = text });
 
     /// <summary>Emits a tool_call chip as the kernel is about to invoke {module}.{function}(args).</summary>
     public Task ToolCallAsync(string module, string function, JsonObject? args)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => EmitAsync(AgentEventKinds.ToolCall, new JsonObject
+        {
+            ["module"] = module,
+            ["function"] = function,
+            ["args"] = args?.DeepClone()
+        });
 
     /// <summary>Emits a tool_result chip with a short human summary of what came back.</summary>
     public Task ToolResultAsync(string module, string function, string summary)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => EmitAsync(AgentEventKinds.ToolResult, new JsonObject
+        {
+            ["module"] = module,
+            ["function"] = function,
+            ["summary"] = summary.Length <= 800 ? summary : summary[..800]
+        });
 
     /// <summary>Emits plan_progress as each plan item materializes.</summary>
     public Task PlanProgressAsync(PlanItem item)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => EmitAsync(AgentEventKinds.PlanProgress, new JsonObject
+        {
+            ["item"] = JsonSerializer.SerializeToNode(item, ContractJson.Options)
+        });
 
-    // TODO(M1): private Task EmitAsync(string kind, JsonObject payload)
-    //   -> builds AgentEvent { GoalId=_goalId, CorrelationId=_correlationId, Seq=Interlocked.Increment(ref _seq), ... }
-    //   -> _logger.Log(structured, with EventId per kind) AND await _emit(evt).
+    private async Task EmitAsync(string kind, JsonObject payload)
+    {
+        if (_goalId is null)
+        {
+            throw new InvalidOperationException("Trace scope has not been started.");
+        }
+
+        var evt = new AgentEvent
+        {
+            GoalId = _goalId,
+            CorrelationId = _correlationId,
+            Seq = Interlocked.Increment(ref _seq),
+            Event = kind,
+            Payload = payload
+        };
+        _logger.LogInformation("agent_event {Event} seq={Seq} payload={Payload}", kind, evt.Seq, payload.ToJsonString(ContractJson.Options));
+        await _emit(evt);
+    }
+
+    private sealed class NullScope : IDisposable
+    {
+        public static readonly NullScope Instance = new();
+        public void Dispose() { }
+    }
 }

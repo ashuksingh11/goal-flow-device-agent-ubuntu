@@ -1,5 +1,6 @@
 using System.Reflection;
 using GoalFlow.Device.Contracts;
+using GoalFlow.Device.Modules.Capabilities;
 using Microsoft.SemanticKernel;
 
 namespace GoalFlow.Device.Modules.Steering;
@@ -40,19 +41,60 @@ public sealed class CapabilityRegistry
     /// </summary>
     public CapabilitiesMessage BuildCapabilitiesMessage(Kernel kernel)
     {
-        // TODO(M1): foreach plugin in kernel.Plugins:
-        //   foreach f in plugin: map f.Name/f.Description; resolve the backing
-        //   MethodInfo to read SideEffectAttribute -> side_effecting + tier.
-        // Then append SteeringModules below.
-        throw new NotImplementedException("v2-M0 design skeleton");
+        var modules = kernel.Plugins.Select(DescribePlugin).Concat(SteeringModules).ToArray();
+        return new CapabilitiesMessage { Modules = modules };
     }
 
     /// <summary>Descriptor for one plugin — unit-testable slice of the walk above.</summary>
     public ModuleDescriptor DescribePlugin(KernelPlugin plugin)
     {
-        // TODO(M1): implement (see BuildCapabilitiesMessage).
-        throw new NotImplementedException("v2-M0 design skeleton");
+        var functions = plugin.GetFunctionsMetadata()
+            .Select(f =>
+            {
+                var tier = GetSideEffectTier(plugin.Name, f.Name);
+                return new FunctionDescriptor
+                {
+                    Name = f.Name,
+                    Description = f.Description,
+                    SideEffecting = tier is not null,
+                    Tier = tier
+                };
+            })
+            .OrderBy(f => f.Name, StringComparer.Ordinal)
+            .ToArray();
+
+        return new ModuleDescriptor
+        {
+            Name = plugin.Name,
+            Kind = ModuleKinds.Capability,
+            Description = PluginType(plugin.Name)?.GetCustomAttribute<System.ComponentModel.DescriptionAttribute>()?.Description ?? plugin.Description,
+            Functions = functions
+        };
     }
+
+    public static string? GetSideEffectTier(string module, string function)
+    {
+        var method = PluginType(module)?.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .FirstOrDefault(m => string.Equals(m.Name, function, StringComparison.OrdinalIgnoreCase));
+        return method?.GetCustomAttribute<SideEffectAttribute>()?.Tier;
+    }
+
+    public static bool IsSideEffecting(string module, string function)
+        => GetSideEffectTier(module, function) is not null;
+
+    private static Type? PluginType(string module) => module switch
+    {
+        "Inventory" => typeof(InventoryPlugin),
+        "Calendar" => typeof(CalendarPlugin),
+        "Recipes" => typeof(RecipePlugin),
+        "ShoppingList" => typeof(ShoppingListPlugin),
+        "Reminders" => typeof(ReminderPlugin),
+        "Appliance" => typeof(ApplianceControlPlugin),
+        "FamilyProfiles" => typeof(FamilyProfilesPlugin),
+        "Budget" => typeof(BudgetPlugin),
+        "Notify" => typeof(NotifyPlugin),
+        _ => null
+    };
 
     /// <summary>The steering half of the advertisement (fixed, code-defined).</summary>
     public static IReadOnlyList<ModuleDescriptor> SteeringModules { get; } =

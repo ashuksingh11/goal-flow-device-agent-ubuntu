@@ -1,4 +1,7 @@
 using System.ComponentModel;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using GoalFlow.Device.Contracts;
 using GoalFlow.Device.Modules.Steering;
 using Microsoft.SemanticKernel;
 
@@ -20,29 +23,80 @@ public sealed class InventoryPlugin
 
     [KernelFunction]
     [Description("Lists every item currently in the fridge/pantry with quantity, unit, category and expiry date.")]
-    public Task<string> ListItems(CancellationToken ct = default)
-        => throw new NotImplementedException("TODO(M1): read inventory.json via MockWorldStore, resolved dates");
+    public async Task<string> ListItems(CancellationToken ct = default)
+    {
+        var doc = await _store.LoadResolvedAsync("inventory", ct);
+        return Json(doc["items"]);
+    }
 
     [KernelFunction]
     [Description("Lists items that will expire within the given number of days from today — prime candidates for waste-rescue meals.")]
-    public Task<string> GetExpiringItems(
+    public async Task<string> GetExpiringItems(
         [Description("Look-ahead horizon in days from today, e.g. 3.")] int withinDays,
         CancellationToken ct = default)
-        => throw new NotImplementedException("TODO(M1): filter by resolved expires_on <= today + withinDays");
+    {
+        var doc = await _store.LoadResolvedAsync("inventory", ct);
+        var cutoff = _store.Clock.Today.AddDays(withinDays);
+        var items = doc["items"]?.AsArray()
+            .Where(n => n?["expires_in_days"] is not null && n["expires_in_days"]!.GetValueKind() != JsonValueKind.Null)
+            .Where(n => _store.Clock.Today.AddDays(n!["expires_in_days"]!.GetValue<int>()) <= cutoff)
+            .Select(n => n!.DeepClone())
+            .ToArray() ?? [];
+        return Json(new JsonArray(items));
+    }
 
     [KernelFunction]
     [Description("Checks which of the given ingredients are available in sufficient quantity; returns available vs missing.")]
-    public Task<string> CheckAvailability(
+    public async Task<string> CheckAvailability(
         [Description("Ingredient names to check, e.g. [\"spinach\",\"rice\"].")] string[] ingredients,
         CancellationToken ct = default)
-        => throw new NotImplementedException("TODO(M1): diff ingredients against inventory items");
+    {
+        var doc = await _store.LoadResolvedAsync("inventory", ct);
+        var available = new JsonArray();
+        var missing = new JsonArray();
+        var inventory = doc["items"]?.AsArray()
+            .Select(n => n!.AsObject())
+            .ToDictionary(o => o["name"]!.GetValue<string>(), StringComparer.OrdinalIgnoreCase)
+            ?? [];
+
+        foreach (var ingredient in ingredients)
+        {
+            if (inventory.TryGetValue(ingredient, out var item) && Quantity(item) > 0)
+            {
+                available.Add(item.DeepClone());
+            }
+            else
+            {
+                missing.Add(ingredient);
+            }
+        }
+
+        return Json(new JsonObject { ["available"] = available, ["missing"] = missing });
+    }
 
     [KernelFunction]
-    [SideEffect(Contracts.ApprovalTiers.Auto)]
+    [SideEffect(ApprovalTiers.Auto)]
     [Description("Marks a quantity of an item as used/consumed (e.g. after a planned dinner). Reversible bookkeeping.")]
-    public Task<string> ConsumeItem(
+    public async Task<string> ConsumeItem(
         [Description("Inventory item name, e.g. \"spinach\".")] string name,
         [Description("Quantity consumed, in the item's unit.")] double quantity,
         CancellationToken ct = default)
-        => throw new NotImplementedException("TODO(M1): decrement quantity, persist via MockWorldStore.SaveAsync");
+    {
+        var doc = await _store.LoadResolvedAsync("inventory", ct);
+        var item = doc["items"]?.AsArray()
+            .Select(n => n!.AsObject())
+            .FirstOrDefault(o => string.Equals(o["name"]?.GetValue<string>(), name, StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException($"Inventory item '{name}' was not found.");
+
+        var remaining = Math.Max(0, Quantity(item) - quantity);
+        item["quantity"] = remaining;
+        await _store.SaveAsync("inventory", doc, ct);
+        return Json(new JsonObject { ["status"] = "consumed", ["name"] = name, ["remaining"] = remaining });
+    }
+
+    private static double Quantity(JsonObject item)
+        => item["quantity"]?.GetValue<double>() ?? 0;
+
+    private static string Json(JsonNode? node)
+        => (node ?? new JsonObject()).ToJsonString(ContractJson.Options);
 }

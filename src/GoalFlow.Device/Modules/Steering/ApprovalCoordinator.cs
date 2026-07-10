@@ -35,11 +35,16 @@ public sealed class ApprovalCoordinator
     /// executing it. Returns the registered proposal (id assigned here).
     /// </summary>
     public ProposalItem Register(ProposalItem proposal)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+    {
+        _ledger[proposal.ProposalId] = (proposal, ProposalState.Pending);
+        _logger.LogInformation("proposal_registered {ProposalId} {Module}.{Function} tier={Tier}", proposal.ProposalId, proposal.Module, proposal.Function, proposal.Tier);
+        return proposal;
+    }
 
     /// <summary>Classifies a function's tier from its <see cref="SideEffectAttribute"/> metadata.</summary>
     public string TierOf(string module, string function)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => CapabilityRegistry.GetSideEffectTier(module, function)
+           ?? throw new InvalidOperationException($"{module}.{function} is not marked as side-effecting.");
 
     /// <summary>
     /// Applies an <c>approval</c> frame: each decision flips its proposal to
@@ -47,17 +52,56 @@ public sealed class ApprovalCoordinator
     /// (the Actuator in GoalAgent invokes them and calls <see cref="MarkExecuted"/>).
     /// </summary>
     public IReadOnlyList<ProposalItem> ApplyDecisions(Approval approval)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+    {
+        var approved = new List<ProposalItem>();
+        foreach (var decision in approval.Payload.Decisions)
+        {
+            if (!_ledger.TryGetValue(decision.ProposalId, out var entry))
+            {
+                _logger.LogWarning("approval_unknown_proposal {ProposalId}", decision.ProposalId);
+                continue;
+            }
+
+            if (entry.State == ProposalState.Executed)
+            {
+                _logger.LogInformation("approval_replay_already_executed {ProposalId}", decision.ProposalId);
+                continue;
+            }
+
+            var next = decision.Approved ? ProposalState.Approved : ProposalState.Rejected;
+            _ledger[decision.ProposalId] = (entry.Item, next);
+            _logger.LogInformation("approval_decision {ProposalId} approved={Approved}", decision.ProposalId, decision.Approved);
+            if (next == ProposalState.Approved)
+            {
+                approved.Add(entry.Item);
+            }
+        }
+
+        return approved;
+    }
 
     /// <summary>Records idempotent execution: Approved → Executed exactly once.</summary>
     public void MarkExecuted(string proposalId)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+    {
+        if (!_ledger.TryGetValue(proposalId, out var entry))
+        {
+            return;
+        }
+
+        if (entry.State == ProposalState.Executed)
+        {
+            return;
+        }
+
+        _ledger[proposalId] = (entry.Item, ProposalState.Executed);
+        _logger.LogInformation("proposal_executed {ProposalId}", proposalId);
+    }
 
     /// <summary>All proposals for the plan_ready payload (any state).</summary>
     public IReadOnlyList<ProposalItem> All()
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => _ledger.Values.Select(v => v.Item).ToArray();
 
     /// <summary>Ids in Executed state — for the status frame's <c>executed</c> list.</summary>
     public IReadOnlyList<string> ExecutedIds()
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => _ledger.Where(kv => kv.Value.State == ProposalState.Executed).Select(kv => kv.Key).ToArray();
 }

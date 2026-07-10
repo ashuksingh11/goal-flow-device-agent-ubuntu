@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
 using GoalFlow.Device.Modules.Steering;
 using Microsoft.SemanticKernel;
@@ -20,24 +21,53 @@ public sealed class ReminderPlugin
 
     [KernelFunction]
     [Description("Lists all active reminders with their due date/time.")]
-    public Task<string> List(CancellationToken ct = default)
-        => throw new NotImplementedException("TODO(M1): read reminders.json, resolve due offsets");
+    public async Task<string> List(CancellationToken ct = default)
+    {
+        var doc = await _store.LoadResolvedAsync("reminders", ct);
+        return Json(doc["reminders"]);
+    }
 
     [KernelFunction]
     [SideEffect(ApprovalTiers.Auto)]
     [Description("Creates a reminder (e.g. 'defrost the paneer tonight'). Cheap and reversible — auto tier.")]
-    public Task<string> Create(
+    public async Task<string> Create(
         [Description("Reminder text.")] string title,
         [Description("Due ISO date, e.g. \"2026-07-14\".")] string date,
         [Description("Optional due time HH:mm.")] string? time = null,
         CancellationToken ct = default)
-        => throw new NotImplementedException("TODO(M1): append (stored as offset from today), persist");
+    {
+        var doc = await _store.LoadResolvedAsync("reminders", ct);
+        var reminders = doc["reminders"]!.AsArray();
+        var id = $"rem-{reminders.Count + 1:000}";
+        reminders.Add(new JsonObject
+        {
+            ["id"] = id,
+            ["title"] = title,
+            ["due_in_days"] = _store.OffsetFromToday(date),
+            ["time"] = time,
+            ["active"] = true
+        });
+        await _store.SaveAsync("reminders", doc, ct);
+        return Json(new JsonObject { ["status"] = "created", ["id"] = id });
+    }
 
     [KernelFunction]
     [SideEffect(ApprovalTiers.Auto)]
     [Description("Deletes a reminder by id.")]
-    public Task<string> Delete(
+    public async Task<string> Delete(
         [Description("Reminder id, e.g. \"rem-001\".")] string id,
         CancellationToken ct = default)
-        => throw new NotImplementedException("TODO(M1): remove by id, persist");
+    {
+        var doc = await _store.LoadResolvedAsync("reminders", ct);
+        var kept = doc["reminders"]!.AsArray()
+            .Where(n => !string.Equals(n!["id"]!.GetValue<string>(), id, StringComparison.OrdinalIgnoreCase))
+            .Select(n => n!.DeepClone())
+            .ToArray();
+        doc["reminders"] = new JsonArray(kept);
+        await _store.SaveAsync("reminders", doc, ct);
+        return Json(new JsonObject { ["status"] = "deleted", ["id"] = id });
+    }
+
+    private static string Json(JsonNode? node)
+        => (node ?? new JsonObject()).ToJsonString(ContractJson.Options);
 }

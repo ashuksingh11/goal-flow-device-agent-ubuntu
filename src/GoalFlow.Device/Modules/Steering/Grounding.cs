@@ -1,4 +1,5 @@
 using GoalFlow.Device.Contracts;
+using System.Text.Json.Nodes;
 using Microsoft.SemanticKernel;
 
 namespace GoalFlow.Device.Modules.Steering;
@@ -26,11 +27,46 @@ public sealed class Grounding
     /// soft constraints as preferences, and the domain + scope + context.
     /// </summary>
     public Task<GroundingContext> AssembleAsync(Dispatch dispatch, Kernel kernel, CancellationToken ct = default)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+    {
+        var today = _clock.Today.ToString("yyyy-MM-dd");
+        var window = dispatch.TimeWindow ?? new TimeWindow
+        {
+            Start = today,
+            End = _clock.Today.AddDays(6).ToString("yyyy-MM-dd")
+        };
+
+        var digest = string.Join("\n", [
+            $"domain: {dispatch.Domain}",
+            $"objective: {dispatch.Objective}",
+            $"time_window: {window.Start}..{window.End}",
+            "Use read-only tools to ground inventory, calendar, recipes, reminders, and shopping list before finalizing."
+        ]);
+
+        return Task.FromResult(new GroundingContext
+        {
+            Today = today,
+            Window = window,
+            HardConstraintsJson = dispatch.Constraints.Hard.ToJsonString(ContractJson.Options),
+            SoftConstraintsJson = dispatch.Constraints.Soft?.ToJsonString(ContractJson.Options),
+            WorldDigest = digest
+        });
+    }
 
     /// <summary>Renders the context into the planner's system-prompt section.</summary>
     public string RenderPrompt(GroundingContext context)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => $$"""
+        You are the GoalFlow on-device Semantic Kernel agent.
+        Today from the generic device clock is {{context.Today}}.
+        Plan only inside the time window {{context.Window.Start}} to {{context.Window.End}}.
+        Hard constraints, verbatim safety policy: {{context.HardConstraintsJson}}
+        Soft preferences: {{context.SoftConstraintsJson ?? "{}"}}
+
+        Grounding digest:
+        {{context.WorldDigest}}
+
+        You must use available read-only tools for factual grounding. During planning, side-effecting actions are not tools.
+        Return only the requested JSON object in the final answer.
+        """;
 }
 
 /// <summary>The assembled ground truth handed to the planner.</summary>

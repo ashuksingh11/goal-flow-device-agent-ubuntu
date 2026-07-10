@@ -22,11 +22,17 @@ public sealed class MockWorldStore
 {
     private readonly string _dataDir;
     private readonly IClock _clock;
+    private readonly Dictionary<string, string> _seed = [];
 
     public MockWorldStore(string dataDir, IClock clock)
     {
         _dataDir = dataDir;
         _clock = clock;
+        Directory.CreateDirectory(_dataDir);
+        foreach (var file in Directory.EnumerateFiles(_dataDir, "*.json"))
+        {
+            _seed[Path.GetFileName(file)] = File.ReadAllText(file);
+        }
     }
 
     /// <summary>The clock all offset resolution uses (exposed for plugins).</summary>
@@ -38,18 +44,81 @@ public sealed class MockWorldStore
     /// field computed as <c>clock.Today + offset</c> (e.g. expires_in_days: 2
     /// → expires_on: "&lt;today+2&gt;").
     /// </summary>
-    public Task<JsonObject> LoadResolvedAsync(string name, CancellationToken ct = default)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+    public async Task<JsonObject> LoadResolvedAsync(string name, CancellationToken ct = default)
+    {
+        var json = await File.ReadAllTextAsync(PathFor(name), ct);
+        var root = JsonNode.Parse(json)?.AsObject()
+            ?? throw new InvalidOperationException($"data/{name}.json is not a JSON object.");
+        ResolveNode(root);
+        return root;
+    }
 
     /// <summary>Persists a mutated document back to <c>data/{name}.json</c> (offsets preserved).</summary>
     public Task SaveAsync(string name, JsonObject document, CancellationToken ct = default)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+        => File.WriteAllTextAsync(PathFor(name), document.ToJsonString(new() { WriteIndented = true }), ct);
 
     /// <summary>Restores every data file from its pristine seed (control: reset).</summary>
-    public Task ResetAsync(CancellationToken ct = default)
-        => throw new NotImplementedException("v2-M0 design skeleton");
+    public async Task ResetAsync(CancellationToken ct = default)
+    {
+        foreach (var (file, contents) in _seed)
+        {
+            await File.WriteAllTextAsync(Path.Combine(_dataDir, file), contents, ct);
+        }
+    }
 
     /// <summary>Resolves one offset to an ISO date string against the generic clock.</summary>
     public string ResolveOffset(int dayOffset)
         => _clock.Today.AddDays(dayOffset).ToString("yyyy-MM-dd");
+
+    public int OffsetFromToday(string isoDate)
+        => DateOnly.Parse(isoDate).DayNumber - _clock.Today.DayNumber;
+
+    private string PathFor(string name)
+    {
+        var fileName = name.EndsWith(".json", StringComparison.OrdinalIgnoreCase) ? name : $"{name}.json";
+        return Path.Combine(_dataDir, fileName);
+    }
+
+    private void ResolveNode(JsonNode? node)
+    {
+        if (node is JsonObject obj)
+        {
+            var additions = new List<(string Key, JsonNode? Value)>();
+            foreach (var (key, value) in obj.ToArray())
+            {
+                ResolveNode(value);
+                if (value is null || value.GetValueKind() == System.Text.Json.JsonValueKind.Null)
+                {
+                    continue;
+                }
+
+                if (key.EndsWith("_in_days", StringComparison.Ordinal) && value is JsonValue)
+                {
+                    var baseName = key[..^"_in_days".Length];
+                    additions.Add(($"{baseName}_on", ResolveOffset(value.GetValue<int>())));
+                }
+                else if (key == "day_offset" && value is JsonValue)
+                {
+                    additions.Add(("date", ResolveOffset(value.GetValue<int>())));
+                }
+                else if (key.EndsWith("_offset", StringComparison.Ordinal) && value is JsonValue)
+                {
+                    var baseName = key[..^"_offset".Length];
+                    additions.Add(($"{baseName}_date", ResolveOffset(value.GetValue<int>())));
+                }
+            }
+
+            foreach (var (key, value) in additions)
+            {
+                obj[key] = value;
+            }
+        }
+        else if (node is JsonArray arr)
+        {
+            foreach (var child in arr)
+            {
+                ResolveNode(child);
+            }
+        }
+    }
 }
