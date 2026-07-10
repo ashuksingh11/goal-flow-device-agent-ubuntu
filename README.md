@@ -1,86 +1,109 @@
-# GoalFlow Device Agent (Ubuntu / .NET 8)
+# GoalFlow Device Agent (Ubuntu / .NET 8) — v2
 
-The **on-device agent** for the GoalFlow POC — a two-tier goal-based agent
-orchestration demo (Samsung Tizen Family Hub). The cloud agent owns the
-conversation and memory and decomposes a user goal into a **Task Contract**;
-this device agent is the **sole authority on local state** and the **only
-component that touches actuators**. It runs a harness pipeline
-(sense → decide → gate → act → sustain) over a mocked local world.
+The **on-device agent** for GoalFlow — the **executor tier of a general
+goal agent** for the Samsung Family Hub. The cloud agent owns the conversation
+and memory and decomposes a fuzzy user goal into a generic **Task Contract**
+(the `dispatch` frame); this device agent is the sole authority on local state
+and the only component that touches actuators.
 
-Ethos: *"fake the world; make the mechanism real."*
+Ethos: *"fake the world; make the mechanism real."* The world is mock JSON;
+the agent mechanics — SK auto function-calling, a deterministic safety filter,
+tiered approvals, a sustain loop — are real.
+
+**v2 core idea: the device IS a Semantic Kernel agent.** There is no
+hand-rolled pipeline and no rules/scripted planner. Device capabilities are SK
+**plugins** whose methods are `[KernelFunction]`s the LLM *calls* via **auto
+function-calling** (`FunctionChoiceBehavior.Auto`); safety is a deterministic
+SK **`IFunctionInvocationFilter`** that vets every pending call against the
+contract's `constraints.hard` before the plugin method runs.
 
 Key invariants:
 
-- The UI and the device **never** talk directly — everything routes through
-  the cloud. The cloud is the WebSocket hub; the device opens **one** outbound
-  WebSocket to it (`System.Net.WebSockets.ClientWebSocket`, works on both
-  Linux dev boxes and Tizen).
-- **Two distinct gates, two classes.** The **safety gate** is deterministic
-  code that blocks on hard-constraint violations. The **approval gate** is the
-  user, reached via the cloud. The planner never runs the safety check —
-  *"LLM plans, code checks."*
-- Side-effects leave the device as **proposals**, never actions. Nothing
-  executes until an approval comes back.
-- Anything Tizen-specific (device APIs, local storage, wall-clock) sits behind
-  **injectable interfaces** so the Tizen port is an adapter swap. The device
-  never reads the wall-clock directly — always the virtual `IClock`.
-- The planner is **swappable** (`IPlanner`): `RulesPlanner` (default,
-  deterministic, demo-safe) or `LlmPlanner` (Semantic Kernel + OpenRouter),
-  with a `ScriptedPlanner` canned fallback.
-
-## Milestones
-
-**M1 (current target) — command line, no transport.** The device agent is
-developed and tested via the CLI, fully decoupled from transport:
-
-```bash
-dotnet run --project src/GoalFlow.Device -- --contract data/sample-contract.json
-```
-
-reads a Task Contract JSON (a `dispatch` message) and prints a `plan_ready`
-JSON to stdout. A canned plan is fine for M1. Compare against
-`data/golden-plan_ready.json`.
-
-**Later — WebSocket shell.** `Transport/WsClient.cs` is a thin wrapper snapped
-on top: it deserializes incoming `dispatch` frames → calls the same pipeline →
-serializes `plan_ready` back. The pipeline itself never changes.
-
-**M4 — sustain.** `Scheduler` (virtual-clock timers) and `ChangeWatcher`
-(materiality-filtered world-change re-planning) come alive.
+- **LLM-only planning.** Every plan comes from one SK agent run against
+  OpenRouter. No `RulesPlanner`, no `ScriptedPlanner`, no fallbacks — the
+  harness modules *steer and guard* the LLM instead of replacing it.
+- **Two gates, two mechanisms.** The **safety gate** is the `SafetyFilter`
+  (deterministic code in the kernel's invocation pipeline — *"LLM plans, code
+  checks"*). The **approval gate** is the user: side-effecting calls are
+  frozen into **tiered proposals** (`auto` / `light` / `firm`) and nothing
+  irreversible executes before an `approval` frame comes back.
+- **General agent, not a meal app.** Two domains ship — `meal_plan` and
+  `guest_dinner` — running through the *same* kernel host, steering modules,
+  and protocol. Domains differ only in which capability plugins the planner
+  leans on; adding a domain = registering plugins.
+- **Generic clock.** Nothing hardcodes a date. `IClock` is the real system
+  clock by default, or a `SimulatedClock` driven by `--date` / `control`
+  frames (`set_date`, `advance_day`). Mock data stores day *offsets* resolved
+  against the clock at read time, so the seed world is always "this week".
+- **Tizen-lean.** The only NuGet dependencies are `Microsoft.SemanticKernel`
+  and `Microsoft.Extensions.Logging`/`.DependencyInjection`; everything else
+  is BCL (`System.Text.Json`, `System.Net.WebSockets`). The process must port
+  to Tizen.NET as-is.
+- **The UI and the device never talk directly** — the cloud is the WebSocket
+  hub; the device opens one outbound `ClientWebSocket` and streams
+  `agent_event` frames (phase / thinking / tool_call / tool_result /
+  plan_progress) so the UI can watch it think.
 
 ## Build & run
 
-Requires the .NET 8 SDK.
+Requires the .NET 8 SDK and OpenRouter credentials (planning is LLM-only, so
+`OPENROUTER_API_KEY` is always required — see Environment below).
 
 ```bash
 dotnet build GoalFlow.Device.sln
-dotnet run --project src/GoalFlow.Device -- --contract data/sample-contract.json
+
+# One-shot plan from a natural-language goal (local dispatch is synthesized):
+dotnet run -- --goal "help us eat healthier this week" [--domain meal_plan]
+
+# One-shot plan from a Task Contract file (plan_ready JSON on stdout):
+dotnet run -- --contract data/sample-contract.json
+dotnet run -- --contract data/sample-contract-guest.json
+
+# ... optionally apply (and replay) an approval afterwards:
+dotnet run -- --contract data/sample-contract.json --approval data/sample-approval.json
+
+# Live session: connect the outbound WebSocket to a running cloud hub:
+dotnet run -- --connect ws://localhost:8787/ws
+
+# Headless sustain demos (plan, then advance days; adaptation on the material day).
+# Both run on a temp copy of data/ so the seed world is never dirtied:
+dotnet run -- --simulate-week    # meal_plan: 5 weekday ticks
+dotnet run -- --simulate-guest   # guest_dinner: 2 ticks to the RSVP/late-arrival trigger
+
+# Extras: [--date 2026-07-14] start a SimulatedClock there; [--data ./data]; [--verbose]
 ```
+
+`plan_ready` / `status` / `proposal` frames print to **stdout**; logs and
+offline `agent_event` frames go to **stderr**.
 
 ## Environment
 
-Only needed when the `LlmPlanner` is selected (the default `RulesPlanner`
-needs no network or keys). Copy `.env.example` and fill in:
+Loaded from `.env` in the working directory (plain `KEY=VALUE`) or the process
+environment:
 
-| Variable              | Meaning                                   | Default                        |
-| --------------------- | ----------------------------------------- | ------------------------------ |
-| `OPENROUTER_API_KEY`  | OpenRouter API key                        | — (required for LlmPlanner)    |
-| `OPENROUTER_BASE_URL` | OpenAI-compatible base URL                | `https://openrouter.ai/api/v1` |
-| `OPENROUTER_MODEL`    | Model id                                  | `anthropic/claude-sonnet-5`    |
+| Variable              | Meaning                        | Default                        |
+| --------------------- | ------------------------------ | ------------------------------ |
+| `OPENROUTER_API_KEY`  | OpenRouter API key             | — (**required**)               |
+| `OPENROUTER_BASE_URL` | OpenAI-compatible base URL     | `https://openrouter.ai/api/v1` |
+| `OPENROUTER_MODEL`    | Model id                       | `openai/gpt-oss-120b`          |
+| `LOG_LEVEL`           | Overrides console log level    | `Information` (`Debug` with `--verbose`) |
 
 ## Layout
 
 ```
 src/GoalFlow.Device/
-  Contracts/    C# mirror of CONTRACT v0 (canonical CONTRACT.md lives in the cloud repo)
-  Harnesses/    one file per harness: interface + skeleton class (incl. IClock, IPlanner)
-    Adapters/   product API adapters (inventory, calendar, recipes, shopping list, reminders)
-  Transport/    WsClient — thin WS shell (later milestone)
-  Pipeline.cs   orchestrator: sense → decide → gate → act
-  WorldState.cs the normalized world model produced by Grounding
-data/           seed mock world + sample contract + golden plan_ready fixture
-docs/           ARCHITECTURE.md, HARNESSES.md, diagrams.md
+  Contracts/              C# mirror of every CONTRACT v2 message (snake_case JSON)
+  Agent/GoalAgent.cs      the SK kernel host: build kernel, plan, actuate, adapt
+  Modules/
+    Capabilities/         SK plugins — the LLM's tools ([KernelFunction] + [SideEffect] tiers)
+    Steering/             deterministic harness modules (safety, approvals, grounding,
+                          clock, monitor/adapt, trace, capability registry)
+  Transport/WsClient.cs   one outbound BCL ClientWebSocket to the cloud hub
+  Program.cs              CLI entry + DI composition root
+data/                     mock world (day-offset dates; see data/README.md) + sample contracts
+docs/                     ARCHITECTURE.md (kernel/filter/stream design), HARNESSES.md (module catalog)
 ```
 
-Status: **design skeleton** — interfaces are fully specified; class bodies are
-`NotImplementedException` stubs. Implementation happens in a later phase.
+See `CODE_GUIDE.md` for the code walkthrough, `docs/ARCHITECTURE.md` for the
+invoke/filter/stream flow, and `docs/HARNESSES.md` for the mapping of the 11
+harness modules to real SK/framework primitives.

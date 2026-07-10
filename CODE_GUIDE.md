@@ -1,105 +1,240 @@
-# Code Guide — goal-flow-device-agent-ubuntu
+# Code Guide — goal-flow-device-agent-ubuntu (v2)
 
-The **on-device agent** is the core IP of GoalFlow: a .NET 8 + Semantic Kernel process that receives
-a Task Contract, runs a **harness pipeline** (sense → decide → gate → act → sustain) to produce and
-execute a plan, and is the *sole authority on local state*. It's built Linux-first for fast dev; the
-Tizen port swaps only the adapter implementations. See
-`../goal-flow-agents/docs/SYSTEM_OVERVIEW.md` for the whole system.
+The on-device agent is a .NET 8 process where **the device IS a Semantic
+Kernel agent**: device capabilities are SK **plugins** the LLM calls via auto
+function-calling, and every harness module is either one of those plugins
+("capability") or deterministic code that shapes/guards the run ("steering").
+Planning is **LLM-only** — there is no rules or scripted planner anywhere in
+v2. Built Linux-first; the Tizen port swaps plugin internals, never the agent.
 
-> **Note:** `README.md` describes M1 scope; this guide reflects the finished M1–M4 build.
+Companion docs: `docs/ARCHITECTURE.md` (kernel/filter/stream design),
+`docs/HARNESSES.md` (the 11 harness modules → real primitives),
+`../goal-flow-agents/docs/V2_DESIGN_PROPOSAL.md` (the framing).
 
 ## File map
 
 ```
-GoalFlow.Device.sln
-data/                              # mock world (seed JSON) + fixtures
+GoalFlow.Device.sln / GoalFlow.Device.csproj   # sln builds src/; root csproj lets `dotnet run` work from the repo root
+data/                                # mock world — ALL dates are day offsets (data/README.md)
   inventory.json calendar.json recipes.json shopping_list.json reminders.json
-  sample-contract.json golden-plan_ready.json sample-approval.json
+  guests.json appliances.json
+  sample-contract.json               # meal_plan dispatch (${today+N} tokens)
+  sample-contract-guest.json         # guest_dinner dispatch
+  sample-approval.json
 src/GoalFlow.Device/
-  Program.cs                       # CLI entry + DI wiring (BuildPipeline)         ← start here
-  Pipeline.cs                      # orchestrator: RunAsync / OnApprovalAsync / AdvanceDayAsync / OnControlAsync
-  WorldState.cs                    # the normalized state Grounding produces
-  Contracts/                       # C# mirror of CONTRACT.md (Dispatch, PlanReady, Proposal, Approval, Status, Control, …)
-  Harnesses/
-    IClock.cs / VirtualClock       # virtual clock (NEVER wall-clock)
-    Grounding.cs                   # assembles WorldState from adapters
-    IPlanner.cs                    # + RulesPlanner / LlmPlanner / ScriptedPlanner
-    SafetyGate.cs                  # deterministic hard-constraint check (separate from planner)
-    ApprovalBroker.cs              # proposal lifecycle: pending → approved → executed
-    EffectExecutor.cs              # performs approved effects idempotently
-    Scheduler.cs / ChangeWatcher.cs# sustain loop + materiality policy
-    Trace.cs                       # structured log (stderr; feeds presenter feed)
-    Adapters/                      # Mock{Inventory,Calendar,Recipe,ShoppingList,Reminder}Api
-  Transport/WsClient.cs            # outbound WebSocket client (thin transport shell)
-docs/ARCHITECTURE.md, docs/HARNESSES.md, docs/diagrams.md
+  Program.cs                         # CLI + DI composition root                ← start here
+  Agent/GoalAgent.cs                 # SK kernel host: BuildKernel / RunAsync / ApplyApprovalAsync / HandleControlAsync
+  Contracts/                         # C# mirror of CONTRACT v2 (Dispatch, PlanReady, Proposal, Approval, Status, Control, AgentEvent, Capabilities, …)
+  Modules/
+    Capabilities/                    # SK plugins — the LLM's tools
+      MockWorldStore.cs              # shared data/ access; resolves day offsets against IClock at read time
+      InventoryPlugin.cs CalendarPlugin.cs RecipePlugin.cs ShoppingListPlugin.cs
+      ReminderPlugin.cs GuestsPlugin.cs ApplianceControlPlugin.cs
+      FamilyProfilesPlugin.cs BudgetPlugin.cs NotifyPlugin.cs
+    Steering/                        # deterministic harness modules (no LLM inside)
+      SafetyFilter.cs                # SK IFunctionInvocationFilter — the safety gate
+      ApprovalCoordinator.cs         # tiered proposal ledger (pending → approved → executed)
+      Grounding.cs                   # planner context assembler (clock, constraints verbatim, digest)
+      Clock.cs                       # IClock + SystemClock + SimulatedClock (generic clock)
+      MonitorAdapt.cs                # sustain loop: WorldChange + MaterialityPolicy + adaptation proposals
+      Trace.cs                       # agent_event streaming + structured logging (one sink, two audiences)
+      CapabilityRegistry.cs          # [SideEffect] attribute + capabilities-message discovery
+  Transport/WsClient.cs              # one outbound BCL ClientWebSocket to the cloud hub
 ```
 
-## Entry point & modes (`Program.cs`)
+## Entry point (`Program.cs`)
 
-`Program.cs` parses CLI options, loads `.env`, builds a `VirtualClock` (anchor `2026-07-12`), wires
-the pipeline via `BuildPipeline(...)`, and runs one of these modes:
+Parses CLI options, loads `.env`, then builds the composition root with
+`Microsoft.Extensions.DependencyInjection`: the `IClock` (real `SystemClock`
+by default; `SimulatedClock` when `--date` or a simulation mode is used),
+`MockWorldStore`, all ten capability plugins as singletons, and the steering
+modules (`SafetyFilter`, `ApprovalCoordinator`, `Grounding`,
+`MaterialityPolicy`, `MonitorAdapt`, `CapabilityRegistry`).
+`GoalAgent.BuildKernel` then assembles the SK kernel from that provider.
 
 | Command | What it does |
 |---|---|
-| `dotnet run -- --contract data/sample-contract.json` | Read a Task Contract, run the pipeline, print `plan_ready` JSON to **stdout** (logs to stderr). |
-| `… --planner rules\|llm\|scripted` | Choose the planner (default `rules`). |
-| `… --simulate-approval data/sample-approval.json [--replay-simulated-approval]` | Feed an approval after planning (the `--replay` flag proves idempotency: second approval adds nothing). |
-| `dotnet run -- --connect` | Run the outbound **WebSocket** loop (`WS_URL`, default `ws://localhost:8000/ws`): handle `dispatch`/`approval`/`control`, emit `plan_ready`/`status`/`proposal`. This is the demo mode. |
-| `dotnet run -- --simulate-week` | Headless M4: advance the virtual clock Mon→Fri, print each sustain `status` and Wednesday's adaptation `proposal`, then reset. Uses a temp data copy (never dirties `data/`). |
+| `--goal "…" [--domain meal_plan]` | Synthesizes a local `Dispatch` around the goal text and plans it. |
+| `--contract <file> [--approval <file>]` | Runs a dispatch file → `plan_ready` on stdout; optionally applies an approval, then **replays it** to prove idempotency. `${today+N}` tokens resolve against the clock at load. |
+| `--connect <ws url>` | Live cloud session: `hello` → `hello_ack` → `capabilities`, then routes inbound `dispatch`/`approval`/`control` to `GoalAgent` (each frame handled on a background task so planning never starves WS keepalives). |
+| `--simulate-week` / `--simulate-guest` | Plan the meal / guest contract, then issue `advance_day` controls (5 / 2 ticks), printing `status` frames and — on the material day — the adaptation `proposal` plus an approve+replay round-trip. Runs on a temp copy of `data/`. |
+| `--date <ISO>` / `--data <dir>` / `--verbose` | Simulated clock start; mock-world dir; debug logging. |
 
-## The pipeline (`Pipeline.cs`)
+## The plan flow (`Agent/GoalAgent.cs → RunAsync`)
 
-`BuildPipeline` (in `Program.cs`) injects every harness into the `Pipeline`. The main methods:
+One dispatch becomes one `plan_ready`, with `agent_event` frames streamed the
+whole way (via `Trace`; over the WebSocket when connected, stderr otherwise):
 
-- **`RunAsync(dispatch)`** — the plan path:
-  `Grounding` builds a `WorldState` → the selected `IPlanner` produces a candidate plan →
-  **`SafetyGate.Check`** validates it against `constraints.hard` (deterministic code) →
-  `ApprovalBroker` freezes side-effects as pending proposals → returns `plan_ready` (with `impact`).
-- **`OnApprovalAsync(approval)`** — on approved proposals, `EffectExecutor` performs the side-effect
-  idempotently (dedupe on `correlation_id:proposal_id`) against `shopping_list.json`/`reminders.json`,
-  and emits `status` (`executing` → `done`) with the executed results.
-- **`AdvanceDayAsync(goalId)`** — one sustain tick: `Scheduler` advances the clock a day, reconciles
-  inventory, checks that day's calendar, and asks `ChangeWatcher` whether anything is **material**.
-  Returns a `status` (monitoring) and, if material, an adaptation `proposal`.
-- **`OnControlAsync(control)`** — handles `advance_day` (→ `AdvanceDayAsync`) and `reset` (restore
-  seed data + clock).
+1. **`phase: grounding`** — `SafetyFilter.SetPolicy(constraints.hard)` arms
+   the gate; `Grounding.AssembleAsync` resolves *today* and the contract's
+   time window against the generic clock and renders the system prompt
+   (hard constraints **verbatim** — the model sees the same truth the filter
+   enforces). Then a **streaming** chat call runs with
+   `FunctionChoiceBehavior.Auto` scoped to a **read-only** function subset
+   (`ReadOnlyPlanningFunctions`: Inventory/Calendar/Recipes/ShoppingList/
+   Reminders/Guests/Appliance reads). The LLM grounds itself by *calling*
+   those `[KernelFunction]`s; every call passes through the `SafetyFilter`,
+   which also emits the `tool_call`/`tool_result` events. Model text streams
+   as `thinking` events.
+2. **`phase: planning`** — the **two-phase compose**: a second, **no-tools**
+   chat call with `ResponseFormat = "json_object"` asks for the final plan as
+   one JSON object (`plan[]`, `proposals[]`, `impact[]`, `explanation`).
+   Side effects are deliberately *not* exposed as tools during planning — the
+   model must *propose* mutations as `{module, function, args, tier}` entries
+   naming real side-effecting functions. Robustness: up to 2 compose attempts
+   with a parser-error retry prompt; if the provider rejects/ignores
+   `response_format`, it falls back to a strict-JSON prompt; code-fence
+   stripping + brace-matched extraction before `JsonSerializer`.
+3. **`phase: checking`** — each proposal is normalized (tier overridden from
+   the function's `[SideEffect]` attribute via
+   `CapabilityRegistry.GetSideEffectTier`; `requires_approval = true`; id
+   assigned if missing) and registered in the `ApprovalCoordinator` ledger.
+   Plan items stream as `plan_progress` events. The `SafetyFilter`'s verdict
+   (`gate: passed|blocked` + recorded violations) becomes `payload.safety`.
+4. **`phase: awaiting_approval`** — the `plan_ready` frame is returned, and
+   the goal is remembered as an `ActiveGoalContext` (dispatch + plan + a
+   world snapshot from `MonitorAdapt.CaptureSnapshotAsync`) for the sustain
+   loop.
 
-## The two-gate rule (why the code is shaped this way)
+**Actuation** (`ApplyApprovalAsync`): an `approval` frame's decisions flip
+ledger entries; each cleared proposal's frozen `{module}.{function}(args)` is
+invoked **through the kernel** (`_kernel.InvokeAsync` — the SafetyFilter still
+applies), then `MarkExecuted` makes replays no-ops. Returns a `status` frame
+listing executed effects.
 
-`SafetyGate` and the planners are **separate classes**. The planner (rules or LLM) is fallible; the
-safety gate is deterministic code that reads *only* `constraints.hard` and the recipe facts in
-`recipes.json` (e.g. `contains_pork`, allergen flags), and **blocks** on violation
-(`gate: "blocked"`, with `hard_violations`). The LLM never runs the safety check. This is the
-"LLM plans, code checks" guarantee — verify it: set a hard constraint that a seeded recipe violates
-and the gate blocks the plan.
+## The two-gate rule — "LLM plans, code checks"
 
-## The adaptation beat (`ChangeWatcher.cs`)
+The planner and the safety check are different *mechanisms*, not just
+different classes:
 
-Materiality policy: *a calendar event overlapping a planned dish's prep window makes that day
-material.* On the demo week only **Wednesday** (Aarav's football 18:00) is material → the watcher
-emits an adaptation proposal ("prep Wed's dish before the evening crunch"). Quiet days return
-`material: false`. This is the "4 quiet days, 1 smart Wednesday" judgment moment.
+- The **LLM** decides what to do — which tools to call, what to cook, what to
+  propose. It is fallible by assumption.
+- The **`SafetyFilter`** (`Modules/Steering/SafetyFilter.cs`) is an SK
+  `IFunctionInvocationFilter` sitting in the kernel's invocation pipeline, so
+  *every* function call — grounding reads and approved actuations alike —
+  passes through `OnFunctionInvocationAsync` first. It checks the pending
+  call against `constraints.hard` (its ONLY input): allergen/dietary/medical
+  ingredient screens (with group expansion, e.g. dairy → milk/paneer/cheese),
+  `budget_cap` on `ShoppingList.PlaceOrder`, `quiet_hours` on scheduled
+  Appliance/Notify actions; it also screens `Recipes` *results* so blocked
+  ingredients never reach the model as candidates. On violation it does not
+  call `next` — the plugin never runs, `context.Result` becomes a structured
+  refusal (so the model sees why and re-plans), and the violation lands in
+  the `plan_ready` safety verdict.
+- The **approval gate** is the user: `[SideEffect]`-tagged functions surface
+  as tiered proposals (`auto` = cheap/reversible, `light` = batched into the
+  plan approval, `firm` = spends money / irreversible — never executes before
+  an explicit decision). `ApprovalCoordinator` owns the ledger and the
+  idempotency.
 
-## Portability (toward Tizen)
+Verify it: put an allergen a seeded recipe contains into `constraints.hard`
+and watch the filter block with `safety.gate: "blocked"` + the recorded
+`violations`.
 
-Everything platform-specific sits behind interfaces (`IClock`, the adapter interfaces, storage). The
-Tizen port replaces the `Mock*Api` adapters and the clock/storage implementations with real Tizen
-device APIs — the harness logic in `Pipeline.cs` and the gates stay unchanged. Never call
-`DateTime.Now`; always read `IClock`.
+## The sustain / adaptation loop (`Modules/Steering/MonitorAdapt.cs`)
+
+After a plan is out, `control: advance_day` (or `set_date`) frames drive
+`GoalAgent.HandleControlAsync`:
+
+1. The `SimulatedClock` steps; `control: reset` restores the pristine mock
+   seeds instead.
+2. `MonitorAdapt.ObserveAsync` diffs the active goal's world snapshot against
+   the new *today* — per domain: **meal_plan** looks for a calendar event
+   (the football night) overlapping a planned dinner's prep window;
+   **guest_dinner** looks for guest `pending_updates` activating today (an
+   RSVP allergy added, a late arrival).
+3. `MaterialityPolicy` — deterministic code, not the LLM — decides whether
+   each `WorldChange` is material (does it invalidate plan items?). Quiet
+   days return `material: false` status frames; each material change fires
+   once (deduped via `EmittedMaterialChanges`).
+4. On a material change, `ProposeAdaptationAsync` registers a scoped,
+   `adapt`-tier proposal in the same ledger (e.g. a night-before prep
+   reminder, or nut-free backup shopping items) — it rides the same approval
+   → actuation path as plan proposals.
+
+`--simulate-week` and `--simulate-guest` are exactly this loop, headless.
+
+## Capability vs steering — the harnesses as real primitives
+
+The "11 harness modules" of the v2 design are not conventions; each is a real
+type here or a real SK feature (full table in `docs/HARNESSES.md`):
+
+- **Capability modules** = SK plugins in `Modules/Capabilities/`, registered
+  in `GoalAgent.BuildKernel` under their advertised names (`Inventory`,
+  `Calendar`, `Recipes`, `ShoppingList`, `Reminders`, `Guests`, `Appliance`,
+  `FamilyProfiles`, `Budget`, `Notify`). Registration IS the action space.
+  Side-effecting methods carry `[SideEffect(tier)]`; all world access goes
+  through `MockWorldStore` (writes persist to `data/*.json`).
+- **Steering modules** = the deterministic classes in `Modules/Steering/`:
+  Planner host (`GoalAgent` + SK auto function-calling), Safety
+  (`IFunctionInvocationFilter`), Approval (ledger), Grounding, Scheduler
+  (`IClock`), MonitorAdapt (+ `MaterialityPolicy`), Trace, and
+  `CapabilityRegistry` — which builds the `capabilities` advertisement by
+  *discovery* (walking `kernel.Plugins` metadata + `[SideEffect]` reflection),
+  sent right after `hello_ack` in `--connect` mode.
+
+**Domain generality in one line:** `guest_dinner` adds the `Guests` plugin
+and reuses Calendar, Recipes, ShoppingList, Reminders, Appliance — same
+kernel host, same steering modules, same protocol, different toolbox subset.
+
+## The generic clock (`Modules/Steering/Clock.cs`)
+
+Nothing reads the wall clock or hardcodes a date. `IClock` (`Now`, `Today`)
+has two implementations: `SystemClock` (real date; the default) and
+`SimulatedClock` (starts at real today or `--date`; driven by `set_date` /
+`advance_day` controls). Mock data stores **day offsets**
+(`expires_in_days`, `day_offset`, `due_in_days`, `${today+N}` contract
+tokens) that `MockWorldStore` resolves against `IClock.Today` at read time —
+the seed world is always "this week" no matter when or under what clock it
+runs. Never call `DateTime.Now`; inject `IClock`.
+
+## Tizen-lean dependency rule (hard)
+
+This process ports to Tizen.NET on the Family Hub. The ONLY NuGet packages
+allowed (enforced and documented in both csproj files):
+`Microsoft.SemanticKernel`, `Microsoft.Extensions.Logging` (+ `.Console`),
+`Microsoft.Extensions.DependencyInjection`. Everything else is BCL —
+`System.Text.Json`, `System.Net.WebSockets.ClientWebSocket`. Adding any other
+package breaks the port.
+
+## Extending it
+
+**Add a capability plugin** (new device function):
+
+1. Create `Modules/Capabilities/FooPlugin.cs`: public methods tagged
+   `[KernelFunction]` + `[Description]` (descriptions are the LLM's tool
+   docs); mutating methods get `[SideEffect(ApprovalTiers.…)]`; read/write
+   the world via `MockWorldStore`.
+2. Register it: DI singleton in `Program.cs`, `builder.Plugins.AddFromObject`
+   in `GoalAgent.BuildKernel`, and its type in
+   `CapabilityRegistry.PluginType`.
+3. If the planner should use it for grounding, add its read functions to
+   `GoalAgent.ReadOnlyPlanningFunctions` (and mention them in the grounding
+   instruction); side-effecting functions become valid proposal targets.
+
+The `capabilities` advertisement, the planner's action space, and the UI's
+module view all update from the registration — no hand-maintained lists.
+
+**Add a domain:** write a dispatch with the new `domain` + `scope`/`context`,
+add whatever plugins the domain needs (above), and — if it should adapt over
+time — teach `MonitorAdapt.ObserveAsync` its change signatures and
+`MaterialityPolicy` when they matter. The kernel host, safety filter,
+approval ledger, clock, trace, and protocol need no changes.
+
+**Real actuators (Tizen):** keep every plugin's `[KernelFunction]` signature
+and replace its `MockWorldStore` internals with real Tizen/SmartThings calls.
+The agent, filters, and contracts don't change.
 
 ## Run & verify
 
 ```bash
-dotnet build
-dotnet run -- --contract data/sample-contract.json --planner rules   # plan_ready with safety passed + impact
-dotnet run -- --simulate-week                                          # the whole adaptation week, headless
-WS_URL=ws://localhost:8000/ws dotnet run --no-build -- --connect       # attach to a running cloud
+dotnet build GoalFlow.Device.sln
+dotnet run -- --contract data/sample-contract.json          # plan_ready: plan + tiered proposals + safety verdict
+dotnet run -- --contract data/sample-contract.json --approval data/sample-approval.json   # execute + idempotent replay
+dotnet run -- --simulate-week                               # meal sustain: quiet days + the material day
+dotnet run -- --simulate-guest                              # guest sustain: RSVP/late-arrival adaptation
+dotnet run -- --connect ws://localhost:8787/ws              # attach to a running cloud hub
 ```
 
-## Extending it
-
-- **Real actuators:** implement `EffectExecutor` / the adapters against real device APIs.
-- **New harness:** add an interface + implementation under `Harnesses/`, inject it in
-  `BuildPipeline`, and call it from the relevant `Pipeline` method.
-- **Smarter planning:** improve `RulesPlanner`, or tune the `LlmPlanner` prompt — the `SafetyGate`
-  guarantee holds regardless of which planner runs.
+Requires `OPENROUTER_API_KEY` (see README — planning is LLM-only). Frames on
+stdout; logs and offline `agent_event`s on stderr.
