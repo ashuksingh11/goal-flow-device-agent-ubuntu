@@ -41,12 +41,13 @@ services.AddLogging(logging => logging
     .AddProvider(new ProgramHelpers.StderrLoggerProvider())
     .SetMinimumLevel(ProgramHelpers.ParseLogLevel() ?? (options.Verbose ? LogLevel.Debug : LogLevel.Information)));
 
-// Scheduler/Clock: real today by default; simulated only when asked for.
+// Scheduler/Clock: ALWAYS a SimulatedClock anchored at real today (or --date),
+// so the demo's Advance day / Set date controls work — a SystemClock can't be
+// advanced, which silently broke advance_day in live --connect mode. It still
+// starts at today, so plan dates stay relative to today.
 services.AddSingleton<IClock>(_ => options.Date is { } start
     ? new SimulatedClock(DateOnly.Parse(start))
-    : options.SimulateWeek || options.SimulateGuest
-        ? new SimulatedClock()
-    : new SystemClock());
+    : new SimulatedClock());
 
 // Mock world + capability plugins (meal domain + shared).
 services.AddSingleton(sp => new MockWorldStore(options.DataDir, sp.GetRequiredService<IClock>()));
