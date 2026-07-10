@@ -214,13 +214,26 @@ internal sealed record CliOptions
                 return args[++i];
             }
 
+            // Optional value: consume the next arg only if it isn't another flag.
+            string? NextOptional()
+            {
+                if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal)) return null;
+                return args[++i];
+            }
+
             options = args[i] switch
             {
                 "--goal" => options with { Goal = Next() },
                 "--domain" => options with { Domain = Next() },
                 "--contract" => options with { ContractPath = Next() },
                 "--approval" => options with { ApprovalPath = Next() },
-                "--connect" => options with { ConnectUrl = Next() },
+                // URL is optional: --connect <url>, else $WS_URL, else the local default.
+                "--connect" => options with
+                {
+                    ConnectUrl = NextOptional()
+                        ?? Environment.GetEnvironmentVariable("WS_URL")
+                        ?? "ws://localhost:8000/ws",
+                },
                 "--date" => options with { Date = Next() },
                 "--data" => options with { DataDir = Next() },
                 "--verbose" => options with { Verbose = true },

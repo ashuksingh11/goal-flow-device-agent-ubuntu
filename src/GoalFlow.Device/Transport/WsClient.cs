@@ -41,7 +41,35 @@ public sealed class WsClient : IAsyncDisposable
     public Task ConnectAsync(CapabilitiesMessage capabilities, CancellationToken ct = default)
     {
         _capabilities = capabilities;
-        return ConnectOnceAsync(ct);
+        return ConnectWithRetryAsync(ct);
+    }
+
+    /// <summary>Connects, retrying with exponential backoff (1s→10s) until it
+    /// succeeds or is cancelled — so the device can start before the cloud, and
+    /// survive the cloud restarting.</summary>
+    private async Task ConnectWithRetryAsync(CancellationToken ct)
+    {
+        var delay = TimeSpan.FromSeconds(1);
+        var max = TimeSpan.FromSeconds(10);
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await ConnectOnceAsync(ct);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("ws_connect_failed {Endpoint}: {Message}; retrying in {Seconds}s",
+                    _endpoint, ex.Message, delay.TotalSeconds);
+                await Task.Delay(delay, ct);
+                delay = TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, max.Ticks));
+            }
+        }
     }
 
     /// <summary>
@@ -83,9 +111,11 @@ public sealed class WsClient : IAsyncDisposable
         var buffer = new byte[16 * 1024];
         while (!ct.IsCancellationRequested)
         {
+          try
+          {
             if (_socket is null || _socket.State != WebSocketState.Open)
             {
-                await ConnectOnceAsync(ct);
+                await ConnectWithRetryAsync(ct);
             }
 
             using var ms = new MemoryStream();
@@ -121,6 +151,21 @@ public sealed class WsClient : IAsyncDisposable
             {
                 await FrameReceived.Invoke(type, raw);
             }
+          }
+          catch (OperationCanceledException)
+          {
+              break;
+          }
+          catch (Exception ex)
+          {
+              // Any transport error (cloud down / restarted / dropped) → drop the
+              // socket and let the next iteration reconnect with backoff. Never crash.
+              _logger.LogWarning("ws_receive_error: {Message}; reconnecting", ex.Message);
+              _socket?.Dispose();
+              _socket = null;
+              try { await Task.Delay(TimeSpan.FromSeconds(1), ct); }
+              catch (OperationCanceledException) { break; }
+          }
         }
     }
 
