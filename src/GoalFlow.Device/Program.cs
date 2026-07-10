@@ -27,6 +27,11 @@ using System.Text.RegularExpressions;
 
 var options = CliOptions.Parse(args);
 DotEnv.Load(Path.Combine(Directory.GetCurrentDirectory(), ".env"));
+var tempDataDir = options.SimulateWeek || options.SimulateGuest ? ProgramHelpers.CopyDataToTemp(options.DataDir) : null;
+if (tempDataDir is not null)
+{
+    options = options with { DataDir = tempDataDir };
+}
 
 var services = new ServiceCollection();
 
@@ -39,6 +44,8 @@ services.AddLogging(logging => logging
 // Scheduler/Clock: real today by default; simulated only when asked for.
 services.AddSingleton<IClock>(_ => options.Date is { } start
     ? new SimulatedClock(DateOnly.Parse(start))
+    : options.SimulateWeek || options.SimulateGuest
+        ? new SimulatedClock()
     : new SystemClock());
 
 // Mock world + capability plugins (meal domain + shared).
@@ -140,6 +147,12 @@ if (options.ConnectUrl is { } url)
 }
 else
 {
+    if (options.SimulateWeek || options.SimulateGuest)
+    {
+        await ProgramHelpers.RunSustainSimulationAsync(options, agent, provider.GetRequiredService<IClock>());
+        return;
+    }
+
     var dispatch = options.ContractPath is { } path
         ? ProgramHelpers.LoadDispatch(path, provider.GetRequiredService<IClock>())
         : ProgramHelpers.BuildLocalDispatch(options.Goal ?? throw new ArgumentException("Pass --contract, --goal, or --connect."), options.Domain, provider.GetRequiredService<IClock>());
@@ -184,6 +197,12 @@ internal sealed record CliOptions
     /// <summary>--verbose — debug-level logging.</summary>
     public bool Verbose { get; init; }
 
+    /// <summary>--simulate-week — plan the meal contract, then advance weekdays and print sustain frames.</summary>
+    public bool SimulateWeek { get; init; }
+
+    /// <summary>--simulate-guest — plan the guest contract, then advance to the guest adaptation trigger.</summary>
+    public bool SimulateGuest { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -205,6 +224,8 @@ internal sealed record CliOptions
                 "--date" => options with { Date = Next() },
                 "--data" => options with { DataDir = Next() },
                 "--verbose" => options with { Verbose = true },
+                "--simulate-week" => options with { SimulateWeek = true, Domain = "meal_plan" },
+                "--simulate-guest" => options with { SimulateGuest = true, Domain = "guest_dinner" },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -238,6 +259,55 @@ internal static class DotEnv
 
 internal static class ProgramHelpers
 {
+public static async Task RunSustainSimulationAsync(CliOptions options, GoalAgent agent, IClock clock)
+{
+    var contractPath = options.ContractPath ?? Path.Combine(options.DataDir, options.SimulateGuest ? "sample-contract-guest.json" : "sample-contract.json");
+    var dispatch = LoadDispatch(contractPath, clock);
+    var plan = await agent.RunAsync(dispatch);
+    Console.Out.WriteLine(ContractJson.Serialize(plan));
+
+    var days = options.SimulateGuest ? 2 : 5;
+    for (var i = 0; i < days; i++)
+    {
+        var (status, proposal) = await agent.HandleControlAsync(new Control
+        {
+            GoalId = dispatch.GoalId,
+            Command = ControlCommands.AdvanceDay
+        });
+        Console.Out.WriteLine(ContractJson.Serialize(status));
+        if (proposal is null)
+        {
+            continue;
+        }
+
+        Console.Out.WriteLine(ContractJson.Serialize(proposal));
+        var approval = new Approval
+        {
+            GoalId = dispatch.GoalId,
+            CorrelationId = dispatch.CorrelationId,
+            Payload = new ApprovalPayload
+            {
+                Decisions = [new ApprovalDecision { ProposalId = proposal.Payload.ProposalId, Approved = true }]
+            }
+        };
+        Console.Out.WriteLine(ContractJson.Serialize(await agent.ApplyApprovalAsync(approval)));
+        Console.Out.WriteLine(ContractJson.Serialize(await agent.ApplyApprovalAsync(approval)));
+    }
+}
+
+public static string CopyDataToTemp(string dataDir)
+{
+    var source = Path.GetFullPath(dataDir);
+    var target = Path.Combine(Path.GetTempPath(), $"goalflow-device-data-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(target);
+    foreach (var file in Directory.EnumerateFiles(source, "*.json"))
+    {
+        File.Copy(file, Path.Combine(target, Path.GetFileName(file)));
+    }
+
+    return target;
+}
+
 public static Dispatch LoadDispatch(string path, IClock clock)
 {
     var node = JsonNode.Parse(File.ReadAllText(path))?.AsObject()

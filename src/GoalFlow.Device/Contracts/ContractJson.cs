@@ -93,4 +93,7 @@ public static class ApprovalTiers
 
     /// <summary>Costly/irreversible; requires explicit consent (e.g. place a grocery order).</summary>
     public const string Firm = "firm";
+
+    /// <summary>Material sustain-loop adaptation; always presented for explicit adapt approval.</summary>
+    public const string Adapt = "adapt";
 }

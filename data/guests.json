@@ -28,7 +28,7 @@
       "rsvp": "attending",
       "dietary_constraints": {
         "dietary": [],
-        "allergies": ["nuts"],
+        "allergies": [],
         "avoid": []
       }
     },
@@ -71,6 +71,16 @@
         "allergies": [],
         "avoid": []
       }
+    }
+  ],
+  "pending_updates": [
+    {
+      "id": "guest-upd-001",
+      "kind": "guest.rsvp_allergy_added",
+      "activation_day_offset": 1,
+      "guest_id": "gst-002",
+      "guest_name": "Leo",
+      "description": "Leo updated the RSVP to add a nut allergy"
     }
   ]
 }

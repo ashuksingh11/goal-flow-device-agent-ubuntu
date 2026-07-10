@@ -46,6 +46,7 @@ public sealed class GoalAgent
     private readonly MonitorAdapt _monitor;
     private readonly IClock _clock;
     private readonly ILogger<GoalAgent> _logger;
+    private readonly Dictionary<string, ActiveGoalContext> _activeGoals = new(StringComparer.Ordinal);
 
     public GoalAgent(
         Kernel kernel,
@@ -277,6 +278,12 @@ public sealed class GoalAgent
         };
 
         await _trace.PhaseAsync("awaiting_approval");
+        _activeGoals[dispatch.GoalId] = new ActiveGoalContext
+        {
+            Dispatch = dispatch,
+            Plan = modelPlan.Plan,
+            WorldSnapshot = await _monitor.CaptureSnapshotAsync(ct)
+        };
         _logger.LogInformation("plan_ready items={ItemCount} proposals={ProposalCount} safety={Safety}", ready.Payload.Plan.Count, ready.Payload.Proposals.Count, ready.Payload.Safety.Gate);
         return ready;
     }
@@ -400,6 +407,12 @@ public sealed class GoalAgent
 
     private async Task<(Status Status, Proposal? Adaptation)> HandleControlCoreAsync(Control control, CancellationToken ct)
     {
+        var correlationId = _activeGoals.TryGetValue(control.GoalId, out var activeForScope)
+            ? activeForScope.Dispatch.CorrelationId
+            : null;
+        using var scope = _trace.BeginGoalScope(control.GoalId, correlationId);
+        await _trace.PhaseAsync("monitoring");
+
         if (_clock is SimulatedClock sim)
         {
             if (control.Command == ControlCommands.SetDate && control.Payload?.Date is { } date)
@@ -416,21 +429,78 @@ public sealed class GoalAgent
         {
             var store = _kernel.Services.GetRequiredService<MockWorldStore>();
             await store.ResetAsync(ct);
+            _activeGoals.Remove(control.GoalId);
         }
 
-        var status = new Status
+        if (!_activeGoals.TryGetValue(control.GoalId, out var active))
+        {
+            var noGoalStatus = new Status
+            {
+                GoalId = control.GoalId,
+                CorrelationId = correlationId,
+                TaskStatus = TaskStatuses.Monitoring,
+                Payload = new StatusPayload
+                {
+                    Day = _clock.Today.DayOfWeek.ToString()[..3],
+                    SimDate = _clock.Today.ToString("yyyy-MM-dd"),
+                    Material = false,
+                    Note = $"control {control.Command} applied; no active goal is being monitored"
+                }
+            };
+            await _trace.ThinkingAsync(noGoalStatus.Payload.Note);
+            return (noGoalStatus, null);
+        }
+
+        var changes = await _monitor.ObserveAsync(active, ct);
+        var material = changes.FirstOrDefault(c => c.Material && active.EmittedMaterialChanges.Add(c.Key));
+        if (material is not null)
+        {
+            await _trace.ThinkingAsync($"material change detected: {material.Description}");
+            await _trace.PhaseAsync("adapting");
+            var proposal = await _monitor.ProposeAdaptationAsync(control.GoalId, material, ct);
+            if (proposal is not null)
+            {
+                proposal = proposal with { CorrelationId = active.Dispatch.CorrelationId };
+            }
+
+            var status = BuildMonitoringStatus(control.GoalId, active.Dispatch.CorrelationId, true, $"material: {material.Description}");
+            return (status, proposal);
+        }
+
+        var quietNote = changes.Any(c => c.Material)
+            ? "on track; material change already surfaced for approval."
+            : "on track; no material world changes affect the active plan.";
+        await _trace.ThinkingAsync(quietNote);
+        var quietStatus = new Status
         {
             GoalId = control.GoalId,
+            CorrelationId = active.Dispatch.CorrelationId,
             TaskStatus = TaskStatuses.Monitoring,
             Payload = new StatusPayload
             {
+                Day = _clock.Today.DayOfWeek.ToString()[..3],
                 SimDate = _clock.Today.ToString("yyyy-MM-dd"),
                 Material = false,
-                Note = $"control {control.Command} applied"
+                Note = quietNote
             }
         };
-        return (status, null);
+        return (quietStatus, null);
     }
+
+    private Status BuildMonitoringStatus(string goalId, string? correlationId, bool material, string note)
+        => new()
+        {
+            GoalId = goalId,
+            CorrelationId = correlationId,
+            TaskStatus = TaskStatuses.Monitoring,
+            Payload = new StatusPayload
+            {
+                Day = _clock.Today.DayOfWeek.ToString()[..3],
+                SimDate = _clock.Today.ToString("yyyy-MM-dd"),
+                Material = material,
+                Note = note
+            }
+        };
 
     private IReadOnlyList<KernelFunction> ReadOnlyPlanningFunctions()
     {
