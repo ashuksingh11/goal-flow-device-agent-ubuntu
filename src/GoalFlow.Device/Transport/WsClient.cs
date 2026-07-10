@@ -140,8 +140,14 @@ public sealed class WsClient : IAsyncDisposable
                 continue;
             }
 
+            // Dedupe only replay-prone frames. approval/control are USER COMMANDS
+            // that legitimately repeat with the same goal correlation_id but carry
+            // distinct content (approving different proposals, advancing days) — the
+            // app layer (ApprovalCoordinator) handles their idempotency. Deduping
+            // them here silently dropped every approval after the first.
+            var dedupeable = type is not (MessageTypes.Approval or MessageTypes.Control);
             var correlation = TryGetCorrelation(raw);
-            if (correlation is not null && !_seenCorrelations.Add($"{type}:{correlation}"))
+            if (dedupeable && correlation is not null && !_seenCorrelations.Add($"{type}:{correlation}"))
             {
                 _logger.LogInformation("ws_duplicate_ignored type={Type} correlation_id={CorrelationId}", type, correlation);
                 continue;

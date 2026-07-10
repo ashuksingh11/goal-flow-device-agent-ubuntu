@@ -176,6 +176,9 @@ public sealed class GoalAgent
         - For guest_dinner, include a menu that honors guest dietary constraints, a prep timeline whose plan item "when" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders.
         - For guest_dinner appliance prep, prefer concrete proposals when grounded appliances support them: Appliance.PreheatOven before an oven-warmed dish, Appliance.RunProgram for dishwasher cleanup before quiet_hours, and Appliance.Defrost only when a frozen item needs thawing.
         - Do not propose ingredients or recipes that violate hard constraints.
+        - Propose AT MOST 5 side-effecting actions. NEVER emit duplicate proposals. Consolidate a
+          recurring action (e.g. a nightly dishwasher run) into ONE proposal, not one per night. Keep
+          the plan tight — fewer, higher-value proposals.
         - Use ISO dates inside the contract time_window. Never use a hardcoded anchor date.
         - The response must start with { and end with }. Do not output whitespace, Markdown, code fences, or prose outside the JSON object.
 
@@ -256,7 +259,16 @@ public sealed class GoalAgent
         var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
 
         await _trace.PhaseAsync("checking");
-        var proposals = modelPlan.Proposals.Select(NormalizeProposal).Select(_approvals.Register).ToArray();
+        // Collapse duplicate proposals the model sometimes emits (e.g. the same
+        // "run dishwasher" action repeated per night) — dedupe by module+function+args
+        // so the UI shows one, and re-assign sequential proposal ids after collapsing.
+        var proposals = modelPlan.Proposals
+            .Select(NormalizeProposal)
+            .GroupBy(p => $"{p.Module}|{p.Function}|{p.Args?.ToJsonString() ?? string.Empty}")
+            .Select(g => g.First())
+            .Select((p, i) => p with { ProposalId = $"p{i + 1}" })
+            .Select(_approvals.Register)
+            .ToArray();
         foreach (var item in modelPlan.Plan)
         {
             await _trace.PlanProgressAsync(item);
