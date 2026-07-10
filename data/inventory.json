@@ -1,5 +1,5 @@
 {
-  "as_of": "2026-07-12",
+  "comment": "GENERIC CLOCK RULE: no absolute dates in mock data. expires_in_days is a day offset from 'today' (IClock.Today — real date, or simulated via control set_date/advance_day). MockWorldStore resolves offsets to ISO dates at read time. null = non-perishable.",
   "items": [
     {
       "id": "inv-001",
@@ -7,7 +7,7 @@
       "quantity": 300,
       "unit": "g",
       "category": "vegetable",
-      "expires_on": "2026-07-14"
+      "expires_in_days": 2
     },
     {
       "id": "inv-002",
@@ -15,7 +15,7 @@
       "quantity": 500,
       "unit": "g",
       "category": "dairy",
-      "expires_on": "2026-07-15"
+      "expires_in_days": 3
     },
     {
       "id": "inv-003",
@@ -23,7 +23,7 @@
       "quantity": 6,
       "unit": "pcs",
       "category": "vegetable",
-      "expires_on": "2026-07-22"
+      "expires_in_days": 10
     },
     {
       "id": "inv-004",
@@ -31,7 +31,7 @@
       "quantity": 250,
       "unit": "g",
       "category": "dairy",
-      "expires_on": "2026-07-17"
+      "expires_in_days": 5
     },
     {
       "id": "inv-005",
@@ -39,7 +39,7 @@
       "quantity": 2,
       "unit": "kg",
       "category": "grain",
-      "expires_on": null
+      "expires_in_days": null
     },
     {
       "id": "inv-006",
@@ -47,7 +47,7 @@
       "quantity": 500,
       "unit": "g",
       "category": "legume",
-      "expires_on": null
+      "expires_in_days": null
     },
     {
       "id": "inv-007",
@@ -55,7 +55,7 @@
       "quantity": 8,
       "unit": "pcs",
       "category": "grain",
-      "expires_on": "2026-07-18"
+      "expires_in_days": 6
     },
     {
       "id": "inv-008",
@@ -63,7 +63,7 @@
       "quantity": 4,
       "unit": "pcs",
       "category": "vegetable",
-      "expires_on": "2026-07-30"
+      "expires_in_days": 18
     },
     {
       "id": "inv-009",
@@ -71,7 +71,7 @@
       "quantity": 5,
       "unit": "pcs",
       "category": "vegetable",
-      "expires_on": "2026-07-16"
+      "expires_in_days": 4
     }
   ]
 }

@@ -1,4 +1,4 @@
 {
-  "as_of": "2026-07-12",
+  "comment": "Shopping list has no dates. Empty at seed; ShoppingListPlugin.Add persists here.",
   "items": []
 }

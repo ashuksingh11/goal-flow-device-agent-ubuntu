@@ -1,6 +1,6 @@
 {
   "type": "approval",
-  "goal_id": "meal-2026-w29",
+  "goal_id": "meal-week-demo",
   "correlation_id": "disp-001",
   "payload": {
     "decisions": [

@@ -1,4 +1,4 @@
 {
-  "as_of": "2026-07-12",
+  "comment": "Reminders store due_in_days offsets from 'today' (see inventory.json for the generic-clock rule). Empty at seed.",
   "reminders": []
 }

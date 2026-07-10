@@ -1,28 +1,32 @@
-using System.Text.Json;
-using System.Text.Json.Serialization;
-
 namespace GoalFlow.Device.Contracts;
 
 /// <summary>
-/// Cloud -> device operator control message for virtual-clock demos.
+/// Demo/ops control, ui → cloud → device (<c>type: "control"</c>).
+/// Drives the GENERIC clock: <c>set_date</c> pins the SimulatedClock to an ISO
+/// date, <c>advance_day</c> steps it forward, <c>reset</c> restores the mock
+/// world + real clock. The device NEVER hardcodes a date.
 /// </summary>
 public sealed record Control
 {
-    [JsonPropertyName("type")]
     public string Type { get; init; } = MessageTypes.Control;
 
-    [JsonPropertyName("goal_id")]
     public required string GoalId { get; init; }
 
-    [JsonPropertyName("command")]
+    /// <summary>One of <see cref="ControlCommands"/>.</summary>
     public required string Command { get; init; }
 
-    [JsonPropertyName("payload")]
-    public JsonElement Payload { get; init; }
+    public ControlPayload? Payload { get; init; }
+}
+
+public sealed record ControlPayload
+{
+    /// <summary>ISO date for <see cref="ControlCommands.SetDate"/>.</summary>
+    public string? Date { get; init; }
 }
 
 public static class ControlCommands
 {
     public const string AdvanceDay = "advance_day";
     public const string Reset = "reset";
+    public const string SetDate = "set_date";
 }

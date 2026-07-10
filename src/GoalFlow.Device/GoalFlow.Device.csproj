@@ -6,17 +6,24 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>GoalFlow.Device</RootNamespace>
-    <!-- Design-phase skeleton: bodies throw NotImplementedException. -->
+    <!-- v2-M0 design skeleton: bodies throw NotImplementedException. -->
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
 
+  <!--
+    TIZEN-LEAN DEPENDENCY RULE (hard constraint; this project ports to Tizen.NET):
+    the ONLY allowed NuGet dependencies are
+      * Microsoft.SemanticKernel               (kernel, plugins, filters, OpenAI-compatible connector)
+      * Microsoft.Extensions.Logging(+Console) (structured logging)
+      * Microsoft.Extensions.DependencyInjection
+    plus the BCL — System.Text.Json and System.Net.WebSockets ship in-box on net8.0.
+    NO other/native/desktop packages. Adding anything else breaks the Tizen port.
+  -->
   <ItemGroup>
-    <!-- Versions intentionally loose (floating) during the design phase.
-         DI and System.Text.Json float to whatever Semantic Kernel's
-         transitive graph requires (avoids NU1605 downgrade errors). -->
     <PackageReference Include="Microsoft.SemanticKernel" Version="1.*" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="*" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="*" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="*" />
-    <PackageReference Include="System.Text.Json" Version="*" />
   </ItemGroup>
 
 </Project>

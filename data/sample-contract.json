@@ -1,31 +1,36 @@
 {
   "type": "dispatch",
-  "goal_id": "meal-2026-w29",
+  "goal_id": "meal-week-demo",
   "correlation_id": "disp-001",
+  "domain": "meal_plan",
   "objective": "healthier family dinners, less food waste",
-  "scope": {
-    "meal": "dinner",
-    "days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
-  },
-  "time_window": {
-    "start": "2026-07-13",
-    "end": "2026-07-17"
-  },
+  "success_criteria": [
+    "a dinner planned for each weekday in the window",
+    "expiring inventory used before it spoils",
+    "grocery spend within the budget cap"
+  ],
   "constraints": {
     "hard": {
       "allergens": [],
       "dietary": ["no_pork"],
-      "medical": []
+      "medical": [],
+      "budget_cap": 60.0
     },
     "soft": {
       "dislikes": ["mushrooms"],
       "prefer": ["more_vegetables", "more_protein"]
     }
   },
-  "optimization": ["reduce_processed", "reduce_waste"],
-  "autonomy": "propose_all",
-  "context_hints": {
-    "notes": "son has sports Wednesday"
+  "scope": {
+    "meal": "dinner",
+    "days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
   },
-  "reply_to": "kb/device/meal-2026-w29"
+  "time_window": {
+    "start": "${today+1}",
+    "end": "${today+5}"
+  },
+  "autonomy": "tiered",
+  "context": {
+    "notes": "son has sports Wednesday"
+  }
 }

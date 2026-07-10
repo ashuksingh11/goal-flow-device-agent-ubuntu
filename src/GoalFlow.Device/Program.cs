@@ -1,322 +1,124 @@
-using GoalFlow.Device;
+using GoalFlow.Device.Agent;
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Harnesses;
-using GoalFlow.Device.Harnesses.Adapters;
+using GoalFlow.Device.Modules.Capabilities;
+using GoalFlow.Device.Modules.Steering;
 using GoalFlow.Device.Transport;
-using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
-// GoalFlow device agent — Milestone 1 command-line entry (DESIGN STUB).
+// GoalFlow device agent — v2 command-line entry (v2-M0 DESIGN SKELETON).
 //
 // Usage:
-//   dotnet run -- --contract path/to/contract.json [--planner rules|llm|scripted] [--data ./data]
+//   dotnet run -- --goal "help us eat healthier this week" [--domain meal_plan]
+//   dotnet run -- --contract data/sample-contract.json
+//   dotnet run -- --connect ws://localhost:8787/ws
+//   ... plus:  [--data ./data] [--date 2026-07-14]
 //
-// Contract mode prints only the resulting `plan_ready` JSON to stdout.
-// Trace/log output goes to stderr so harnesses can script against stdout.
+// GENERIC CLOCK: with no --date the agent runs on the REAL system clock
+// (SystemClock). --date <ISO> (or a control set_date frame) starts a
+// SimulatedClock there; control advance_day steps it. There is NO hardcoded
+// anchor date anywhere — mock data stores day offsets resolved against the
+// clock at read time.
+//
+// LLM-ONLY: planning always goes through the SK kernel + OpenRouter. No
+// rules/scripted planner exists in v2.
 
 var options = CliOptions.Parse(args);
-LoadDotEnv(Path.Combine(Directory.GetCurrentDirectory(), ".env"));
-var clockAnchor = DateTimeOffset.Parse("2026-07-12T09:00:00+00:00");
-var clock = new VirtualClock(clockAnchor);
-var trace = new InMemoryTrace();
-var runDataDir = options.DataDir;
-string? tempDataDir = null;
-if (options.SimulateWeek)
-{
-    tempDataDir = Path.Combine(Path.GetTempPath(), $"goalflow-m4-{Guid.NewGuid():N}");
-    CopyDirectory(options.DataDir, tempDataDir);
-    runDataDir = tempDataDir;
-}
+DotEnv.Load(Path.Combine(Directory.GetCurrentDirectory(), ".env"));
 
-var seedStore = new DataSeedStore(runDataDir);
-var pipeline = BuildPipeline(options with { DataDir = runDataDir }, clock, trace, clockAnchor, seedStore.Restore);
+var services = new ServiceCollection();
 
-if (options.SimulateWeek)
-{
-    try
+// Structured logging: console, leveled; goal/correlation ids attach via Trace scopes.
+services.AddLogging(logging => logging
+    .AddSimpleConsole(o =>
     {
-        var simulateContractJson = await File.ReadAllTextAsync(options.ContractPath ?? Path.Combine(runDataDir, "sample-contract.json"));
-        var simulateDispatch = JsonSerializer.Deserialize<Dispatch>(simulateContractJson, ContractJson.Options)
-            ?? throw new InvalidOperationException("Unable to deserialize simulate-week contract.");
-        await pipeline.RunAsync(simulateDispatch);
-        for (var i = 0; i < 5; i++)
-        {
-            var result = await pipeline.AdvanceDayAsync(simulateDispatch.GoalId);
-            Console.WriteLine(JsonSerializer.Serialize(result.Status, ContractJson.Options));
-            if (result.Proposal is not null)
-            {
-                Console.WriteLine(JsonSerializer.Serialize(result.Proposal, ContractJson.Options));
-            }
-        }
+        o.SingleLine = true;
+        o.TimestampFormat = "HH:mm:ss.fff ";
+    })
+    .SetMinimumLevel(options.Verbose ? LogLevel.Debug : LogLevel.Information));
 
-        var reset = new Control { GoalId = simulateDispatch.GoalId, Command = ControlCommands.Reset };
-        foreach (var message in await pipeline.OnControlAsync(reset))
-        {
-            Console.WriteLine(JsonSerializer.Serialize(message, ContractJson.Options));
-        }
-    }
-    finally
-    {
-        if (tempDataDir is not null && Directory.Exists(tempDataDir))
-        {
-            Directory.Delete(tempDataDir, recursive: true);
-        }
-    }
+// Scheduler/Clock: real today by default; simulated only when asked for.
+services.AddSingleton<IClock>(_ => options.Date is { } start
+    ? new SimulatedClock(DateOnly.Parse(start))
+    : new SystemClock());
 
-    return;
-}
+// Mock world + capability plugins (meal domain + shared).
+services.AddSingleton(sp => new MockWorldStore(options.DataDir, sp.GetRequiredService<IClock>()));
+services.AddSingleton<InventoryPlugin>();
+services.AddSingleton<CalendarPlugin>();
+services.AddSingleton<RecipePlugin>();
+services.AddSingleton<ShoppingListPlugin>();
+services.AddSingleton<ReminderPlugin>();
+services.AddSingleton<ApplianceControlPlugin>();
+services.AddSingleton<FamilyProfilesPlugin>();
+services.AddSingleton<BudgetPlugin>();
+services.AddSingleton<NotifyPlugin>();
 
-if (options.Connect)
-{
-    var wsUrl = Environment.GetEnvironmentVariable("WS_URL") ?? "ws://localhost:8000/ws";
-    using var cts = new CancellationTokenSource();
-    Console.CancelKeyPress += (_, eventArgs) =>
-    {
-        eventArgs.Cancel = true;
-        cts.Cancel();
-    };
+// Steering modules.
+services.AddSingleton<SafetyFilter>();
+services.AddSingleton<ApprovalCoordinator>();
+services.AddSingleton<Grounding>();
+services.AddSingleton<MaterialityPolicy>();
+services.AddSingleton<MonitorAdapt>();
+services.AddSingleton<CapabilityRegistry>();
 
-    await using var client = new WsClient(new Uri(wsUrl), pipeline, trace);
-    await client.RunAsync(cts.Token);
-    return;
-}
+await using var provider = services.BuildServiceProvider();
 
-var contractJson = await File.ReadAllTextAsync(options.ContractPath!);
-var dispatch = JsonSerializer.Deserialize<Dispatch>(contractJson, ContractJson.Options)
-    ?? throw new InvalidOperationException($"Unable to deserialize dispatch contract '{options.ContractPath}'.");
+// TODO(M1): wire the composition root end-to-end:
+//   var settings = new AgentSettings
+//   {
+//       ApiKey  = Environment.GetEnvironmentVariable("OPENROUTER_API_KEY") ?? throw ...,
+//       BaseUrl = Environment.GetEnvironmentVariable("OPENROUTER_BASE_URL") ?? default,
+//       ModelId = Environment.GetEnvironmentVariable("OPENROUTER_MODEL") ?? "openai/gpt-oss-120b",
+//   };
+//   var kernel = GoalAgent.BuildKernel(settings, provider);
+//   Func<AgentEvent, Task> emit = ...;      // WsClient.SendAsync in --connect mode,
+//                                           // stderr JSON lines in offline modes
+//   var trace = new Trace(loggerFactory.CreateLogger<Trace>(), emit);
+//   var agent = new GoalAgent(kernel, trace, grounding, safety, approvals, monitor, clock, logger);
+//
+//   if (options.ConnectUrl is { } url)      // --connect: full duplex loop
+//       -> WsClient.ConnectAsync(CapabilityRegistry.BuildCapabilitiesMessage(kernel))
+//          + RunReceiveLoopAsync routing dispatch/approval/control -> agent.
+//   else if (options.ContractPath is { } path)   // --contract: one-shot file mode
+//       -> deserialize Dispatch (resolving ${today+N} tokens against the clock),
+//          agent.RunAsync, print plan_ready JSON to stdout (events to stderr).
+//   else if (options.Goal is { } goal)      // --goal: local dispatch synthesized
+//       -> build a minimal Dispatch { Domain = options.Domain, Objective = goal, ... }
+//          over the clock's real dates, then run as above.
+throw new NotImplementedException("v2-M0 design skeleton: composition root wiring lands in M1.");
 
-var planReady = await pipeline.RunAsync(dispatch);
-if (options.SimulateApprovalPath is not null)
-{
-    var approvalJson = await File.ReadAllTextAsync(options.SimulateApprovalPath);
-    var approval = JsonSerializer.Deserialize<Approval>(approvalJson, ContractJson.Options)
-        ?? throw new InvalidOperationException($"Unable to deserialize approval '{options.SimulateApprovalPath}'.");
-    foreach (var status in await pipeline.OnApprovalAsync(approval))
-    {
-        Console.WriteLine(JsonSerializer.Serialize(status, ContractJson.Options));
-    }
-
-    if (options.ReplaySimulatedApproval)
-    {
-        foreach (var status in await pipeline.OnApprovalAsync(approval))
-        {
-            Console.WriteLine(JsonSerializer.Serialize(status, ContractJson.Options));
-        }
-    }
-
-    return;
-}
-
-Console.WriteLine(JsonSerializer.Serialize(planReady, ContractJson.Options));
-
-static Pipeline BuildPipeline(CliOptions options, IClock clock, ITrace trace, DateTimeOffset clockAnchor, Action? resetData)
-{
-    var fixturePath = Path.Combine(options.DataDir, "golden-plan_ready.json");
-    var rulesPlanner = new RulesPlanner(trace, clock);
-    var scriptedPlanner = new ScriptedPlanner(fixturePath);
-    IPlanner planner = options.Planner switch
-    {
-        "rules" => rulesPlanner,
-        "scripted" => scriptedPlanner,
-        "llm" => new LlmPlanner(
-            new LlmPlannerOptions
-            {
-                ApiKey = Environment.GetEnvironmentVariable("OPENROUTER_API_KEY"),
-                BaseUrl = Environment.GetEnvironmentVariable("OPENROUTER_BASE_URL") ?? "https://openrouter.ai/api/v1",
-                Model = Environment.GetEnvironmentVariable("OPENROUTER_MODEL") ?? "anthropic/claude-sonnet-5",
-            },
-            rulesPlanner,
-            trace,
-            clock),
-        _ => throw new ArgumentException($"Unknown planner '{options.Planner}'. Use rules, llm, or scripted."),
-    };
-
-    var shoppingList = new MockShoppingListApi(Path.Combine(options.DataDir, "shopping_list.json"));
-    var reminders = new MockReminderApi(Path.Combine(options.DataDir, "reminders.json"));
-    var grounding = new Grounding(
-        new MockInventoryApi(Path.Combine(options.DataDir, "inventory.json")),
-        new MockCalendarApi(Path.Combine(options.DataDir, "calendar.json")),
-        new MockRecipeApi(Path.Combine(options.DataDir, "recipes.json")),
-        shoppingList,
-        reminders,
-        clock,
-        trace);
-
-    return new Pipeline(
-        planner,
-        grounding,
-        new SafetyGate(trace, clock),
-        new ApprovalBroker(clock, trace),
-        new EffectExecutor(shoppingList, reminders, clock, trace),
-        new Scheduler(clock, trace),
-        new ChangeWatcher(clock, trace),
-        clock,
-        trace,
-        clockAnchor,
-        resetData);
-}
-
-static void CopyDirectory(string sourceDir, string targetDir)
-{
-    Directory.CreateDirectory(targetDir);
-    foreach (var file in Directory.EnumerateFiles(sourceDir))
-    {
-        File.Copy(file, Path.Combine(targetDir, Path.GetFileName(file)), overwrite: true);
-    }
-}
-
-static void LoadDotEnv(string path)
-{
-    if (!File.Exists(path))
-    {
-        return;
-    }
-
-    foreach (var rawLine in File.ReadAllLines(path))
-    {
-        var line = rawLine.Trim();
-        if (line.Length == 0 || line.StartsWith('#'))
-        {
-            continue;
-        }
-
-        var equals = line.IndexOf('=');
-        if (equals <= 0)
-        {
-            continue;
-        }
-
-        var key = line[..equals].Trim();
-        var value = line[(equals + 1)..].Trim().Trim('"');
-        if (Environment.GetEnvironmentVariable(key) is null)
-        {
-            Environment.SetEnvironmentVariable(key, value);
-        }
-    }
-}
-
-internal sealed class DataSeedStore
-{
-    private readonly string _dataDir;
-    private readonly Dictionary<string, byte[]> _seed = new(StringComparer.Ordinal);
-
-    public DataSeedStore(string dataDir)
-    {
-        _dataDir = dataDir;
-        foreach (var file in Directory.EnumerateFiles(dataDir, "*.json"))
-        {
-            _seed[Path.GetFileName(file)] = File.ReadAllBytes(file);
-        }
-    }
-
-    public void Restore()
-    {
-        Directory.CreateDirectory(_dataDir);
-        foreach (var file in Directory.EnumerateFiles(_dataDir, "*.json"))
-        {
-            var name = Path.GetFileName(file);
-            if (!_seed.ContainsKey(name))
-            {
-                File.Delete(file);
-            }
-        }
-
-        foreach (var (name, bytes) in _seed)
-        {
-            File.WriteAllBytes(Path.Combine(_dataDir, name), bytes);
-        }
-    }
-}
-
-/// <summary>Parsed command-line options for the M1 entry point.</summary>
+/// <summary>Parsed command-line options for the v2 entry point.</summary>
 internal sealed record CliOptions
 {
-    /// <summary>--contract: path to a dispatch/Task Contract JSON.</summary>
+    /// <summary>--goal "..." — natural-language goal, dispatched locally.</summary>
+    public string? Goal { get; init; }
+
+    /// <summary>--domain — use-case name for --goal mode (default meal_plan).</summary>
+    public string Domain { get; init; } = "meal_plan";
+
+    /// <summary>--contract &lt;file&gt; — run a dispatch frame from disk.</summary>
     public string? ContractPath { get; init; }
 
-    /// <summary>--connect: run the outbound WebSocket transport loop.</summary>
-    public bool Connect { get; init; }
+    /// <summary>--connect &lt;ws url&gt; — live cloud session.</summary>
+    public string? ConnectUrl { get; init; }
 
-    /// <summary>--planner (optional): rules, llm, or scripted. Default: rules.</summary>
-    public string Planner { get; init; } = "rules";
+    /// <summary>--date &lt;ISO&gt; — start a SimulatedClock here. Null = real today (SystemClock).</summary>
+    public string? Date { get; init; }
 
-    /// <summary>--data (optional): mock-world directory. Default: ./data.</summary>
+    /// <summary>--data &lt;dir&gt; — mock world directory (default ./data).</summary>
     public string DataDir { get; init; } = "data";
 
-    /// <summary>--simulate-approval: path to approval JSON to feed after planning.</summary>
-    public string? SimulateApprovalPath { get; init; }
-
-    /// <summary>--replay-simulated-approval: feed the same approval twice for idempotency verification.</summary>
-    public bool ReplaySimulatedApproval { get; init; }
-
-    /// <summary>--simulate-week: headless M4 virtual-clock sustain demo.</summary>
-    public bool SimulateWeek { get; init; }
+    /// <summary>--verbose — debug-level logging.</summary>
+    public bool Verbose { get; init; }
 
     public static CliOptions Parse(string[] args)
-    {
-        // Minimal deliberate parser — no external dependency.
-        string? contract = null;
-        var connect = false;
-        var planner = "rules";
-        var dataDir = "data";
-        string? simulateApproval = null;
-        var replaySimulatedApproval = false;
-        var simulateWeek = false;
-        for (var i = 0; i < args.Length; i++)
-        {
-            switch (args[i])
-            {
-                case "--contract":
-                    contract = RequireValue(args, ref i, "--contract");
-                    break;
-                case "--connect":
-                    connect = true;
-                    break;
-                case "--planner":
-                    planner = RequireValue(args, ref i, "--planner");
-                    break;
-                case "--data":
-                    dataDir = RequireValue(args, ref i, "--data");
-                    break;
-                case "--simulate-approval":
-                    simulateApproval = RequireValue(args, ref i, "--simulate-approval");
-                    break;
-                case "--replay-simulated-approval":
-                    replaySimulatedApproval = true;
-                    break;
-                case "--simulate-week":
-                    simulateWeek = true;
-                    break;
-            }
-        }
+        => throw new NotImplementedException("v2-M0 design skeleton");
+}
 
-        if (!connect && !simulateWeek && contract is null)
-        {
-            Console.Error.WriteLine("usage: dotnet run -- --contract <file.json> [--planner rules|llm|scripted] [--data <dir>] [--simulate-approval <approval.json>]");
-            Console.Error.WriteLine("   or: dotnet run -- --connect [--planner rules|llm|scripted] [--data <dir>]  (WS_URL defaults to ws://localhost:8000/ws)");
-            Console.Error.WriteLine("   or: dotnet run -- --simulate-week [--data <dir>]");
-            Environment.Exit(2);
-        }
-
-        return new CliOptions
-        {
-            ContractPath = contract,
-            Connect = connect,
-            Planner = planner,
-            DataDir = dataDir,
-            SimulateApprovalPath = simulateApproval,
-            ReplaySimulatedApproval = replaySimulatedApproval,
-            SimulateWeek = simulateWeek,
-        };
-    }
-
-    private static string RequireValue(string[] args, ref int index, string option)
-    {
-        if (index + 1 >= args.Length)
-        {
-            throw new ArgumentException($"{option} requires a value.");
-        }
-
-        index++;
-        return args[index];
-    }
+/// <summary>Minimal KEY=VALUE .env loader (BCL only; missing file is fine).</summary>
+internal static class DotEnv
+{
+    public static void Load(string path)
+        => throw new NotImplementedException("v2-M0 design skeleton");
 }

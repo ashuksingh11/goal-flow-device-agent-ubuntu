@@ -1,4 +1,5 @@
 {
+  "comment": "Recipes are date-free. 'contains' lists allergen/dietary groups the SafetyFilter screens against constraints.hard.",
   "recipes": [
     {
       "id": "rcp-001",
@@ -6,12 +7,7 @@
       "ingredients": ["spinach", "toor dal", "rice", "onions", "tomatoes"],
       "tags": ["vegetarian", "more_vegetables", "more_protein", "uses_inventory"],
       "contains": [],
-      "contains_pork": false,
-      "contains_dairy": false,
-      "contains_gluten": false,
-      "contains_peanut": false,
-      "prep_minutes": 35,
-      "prep_time_minutes": 35
+      "prep_minutes": 35
     },
     {
       "id": "rcp-002",
@@ -19,12 +15,7 @@
       "ingredients": ["paneer", "tortilla wraps", "bell peppers", "onions", "yogurt"],
       "tags": ["vegetarian", "more_protein", "more_vegetables"],
       "contains": ["dairy", "gluten"],
-      "contains_pork": false,
-      "contains_dairy": true,
-      "contains_gluten": true,
-      "contains_peanut": false,
-      "prep_minutes": 25,
-      "prep_time_minutes": 25
+      "prep_minutes": 25
     },
     {
       "id": "rcp-003",
@@ -32,25 +23,15 @@
       "ingredients": ["lentils", "carrots", "onions", "tomatoes", "bread"],
       "tags": ["vegetarian", "more_protein", "light"],
       "contains": ["gluten"],
-      "contains_pork": false,
-      "contains_dairy": false,
-      "contains_gluten": true,
-      "contains_peanut": false,
-      "prep_minutes": 30,
-      "prep_time_minutes": 30
+      "prep_minutes": 30
     },
     {
       "id": "rcp-004",
       "name": "chickpea salad bowl",
       "ingredients": ["chickpeas", "carrots", "tomatoes", "onions", "yogurt"],
-      "tags": ["vegetarian", "more_protein", "more_vegetables", "quick", "quick_prep", "light"],
+      "tags": ["vegetarian", "more_protein", "more_vegetables", "quick_prep", "light"],
       "contains": ["dairy"],
-      "contains_pork": false,
-      "contains_dairy": true,
-      "contains_gluten": false,
-      "contains_peanut": false,
-      "prep_minutes": 15,
-      "prep_time_minutes": 15
+      "prep_minutes": 15
     },
     {
       "id": "rcp-005",
@@ -58,12 +39,7 @@
       "ingredients": ["pasta", "carrots", "bell peppers", "tomatoes", "yogurt"],
       "tags": ["vegetarian", "more_vegetables", "kid_friendly"],
       "contains": ["dairy", "gluten"],
-      "contains_pork": false,
-      "contains_dairy": true,
-      "contains_gluten": true,
-      "contains_peanut": false,
-      "prep_minutes": 30,
-      "prep_time_minutes": 30
+      "prep_minutes": 30
     }
   ]
 }

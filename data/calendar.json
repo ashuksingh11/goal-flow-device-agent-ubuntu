@@ -1,10 +1,10 @@
 {
-  "as_of": "2026-07-12",
+  "comment": "GENERIC CLOCK RULE: day_offset is days from 'today' (IClock.Today), resolved to an ISO date by MockWorldStore at read time. No absolute dates in mock data.",
   "events": [
     {
       "id": "cal-001",
       "title": "Aarav football practice",
-      "date": "2026-07-15",
+      "day_offset": 3,
       "start": "18:00",
       "end": "19:30",
       "attendee": "Aarav"
@@ -12,7 +12,7 @@
     {
       "id": "cal-002",
       "title": "Parent-teacher call",
-      "date": "2026-07-16",
+      "day_offset": 4,
       "start": "17:00",
       "end": "17:30",
       "attendee": "Priya"

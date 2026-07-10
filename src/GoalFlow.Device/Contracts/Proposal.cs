@@ -1,36 +1,40 @@
-using System.Text.Json.Serialization;
-
 namespace GoalFlow.Device.Contracts;
 
 /// <summary>
-/// Device → cloud (<c>type: "proposal"</c>): a mid-flight adaptation. Sent
-/// when the ChangeWatcher deems a world change material and the re-planned
-/// loop produces a new side-effect. <c>task_status</c> is "adapting".
-/// <code>
-/// { "type":"proposal","goal_id":"meal-2026-w29","correlation_id":"evt-014",
-///   "task_status":"adapting",
-///   "payload":{ "proposal_id":"p7","action":"add_prep_task",
-///     "detail":"marinate Wed's chicken on Tue night",
-///     "trigger":"calendar: son football Wed 18:00 — prep window shrinks",
-///     "requires_approval":true } }
-/// </code>
+/// Generic ADAPTATION proposal, device → cloud → ui (<c>type: "proposal"</c>).
+/// Emitted by Monitor &amp; Adapt when a MATERIAL world change makes part of the
+/// approved plan wrong (an ingredient expired, a guest RSVP'd an allergy, ...).
+/// Distinct from <see cref="ProposalItem"/>, which rides inside plan_ready.
 /// </summary>
 public sealed record Proposal
 {
-    [JsonPropertyName("type")]
     public string Type { get; init; } = MessageTypes.Proposal;
 
-    [JsonPropertyName("goal_id")]
     public required string GoalId { get; init; }
 
-    /// <summary>Dedupe key; the approval message echoes it back, e.g. "evt-014".</summary>
-    [JsonPropertyName("correlation_id")]
-    public required string CorrelationId { get; init; }
+    public string? CorrelationId { get; init; }
 
-    /// <summary>See <see cref="TaskStatuses"/>; normally "adapting".</summary>
-    [JsonPropertyName("task_status")]
-    public required string TaskStatus { get; init; }
+    public string TaskStatus { get; init; } = TaskStatuses.Adapting;
 
-    [JsonPropertyName("payload")]
-    public required ProposalItem Payload { get; init; }
+    public required AdaptationPayload Payload { get; init; }
+}
+
+public sealed record AdaptationPayload
+{
+    /// <summary>E.g. "a1" — the id the subsequent approval decision references.</summary>
+    public required string ProposalId { get; init; }
+
+    /// <summary>Short action label, e.g. "swap Thursday dinner".</summary>
+    public required string Action { get; init; }
+
+    /// <summary>What changes, in full.</summary>
+    public string? Detail { get; init; }
+
+    /// <summary>The material world change that triggered this, e.g. "spinach expired".</summary>
+    public required string Trigger { get; init; }
+
+    /// <summary>See <see cref="ApprovalTiers"/>.</summary>
+    public required string Tier { get; init; }
+
+    public bool RequiresApproval { get; init; } = true;
 }

@@ -1,64 +1,96 @@
-using System.Text.Json;
 using System.Text.Encodings.Web;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace GoalFlow.Device.Contracts;
 
 /// <summary>
-/// Shared JSON serialization defaults for CONTRACT v0 messages.
-/// All property names are pinned with <see cref="JsonPropertyNameAttribute"/>
-/// (snake_case), so no naming policy is applied here.
-/// The canonical CONTRACT.md lives in the cloud repo; this namespace is the
-/// C# mirror and must track it exactly.
+/// Shared System.Text.Json defaults for CONTRACT v2 messages.
+/// All wire names are snake_case via <see cref="JsonNamingPolicy.SnakeCaseLower"/>;
+/// C# properties stay PascalCase. The canonical CONTRACT v2 lives in the cloud
+/// repo; this namespace is the C# mirror and must track it exactly.
 /// </summary>
 public static class ContractJson
 {
-    /// <summary>Options used for every contract message read/written by the device.</summary>
+    /// <summary>Options used for every contract message the device reads or writes.</summary>
     public static readonly JsonSerializerOptions Options = new()
     {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        DictionaryKeyPolicy = null, // free-form objects (scope/context/args) keep caller keys verbatim
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        WriteIndented = true,
+        WriteIndented = false, // wire frames are compact; pretty-print at the edges if needed
     };
+
+    /// <summary>Serialize a contract message to a wire frame.</summary>
+    public static string Serialize<T>(T message) => JsonSerializer.Serialize(message, Options);
+
+    /// <summary>Deserialize a wire frame; throws if the payload does not match.</summary>
+    public static T Deserialize<T>(string json) =>
+        JsonSerializer.Deserialize<T>(json, Options)
+        ?? throw new JsonException($"Frame deserialized to null for {typeof(T).Name}.");
+
+    /// <summary>Peek the <c>type</c> discriminator of an incoming frame.</summary>
+    public static string? PeekType(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        return doc.RootElement.TryGetProperty("type", out var t) ? t.GetString() : null;
+    }
 }
 
 /// <summary>
-/// The <c>type</c> discriminator values. All messages are JSON; <c>type</c>
-/// discriminates. Every task message carries <c>goal_id</c>; device↔cloud
-/// messages carry <c>correlation_id</c> (dedupe key; correlates
-/// approval → proposal).
+/// The <c>type</c> discriminator values. Every frame is JSON with <c>type</c>;
+/// task messages carry <c>goal_id</c>; device↔cloud messages carry
+/// <c>correlation_id</c> (dedupe / correlation key).
 /// </summary>
 public static class MessageTypes
 {
     public const string Hello = "hello";
     public const string HelloAck = "hello_ack";
+    public const string Capabilities = "capabilities";
+    public const string UserGoal = "user_goal";
     public const string Dispatch = "dispatch";
+    public const string AgentEvent = "agent_event";
     public const string PlanReady = "plan_ready";
-    public const string Proposal = "proposal";
+    public const string PresentPlan = "present_plan";
     public const string Approval = "approval";
+    public const string Proposal = "proposal";
     public const string Status = "status";
     public const string Control = "control";
 }
 
 /// <summary>
 /// Task-status lifecycle:
-/// created → planning → awaiting_approval → executing → adapting → done.
-/// Modeled as string constants (not an enum) so the wire format stays exact.
+/// created → interpreting → grounding → planning → checking →
+/// awaiting_approval → executing → monitoring → adapting → done.
+/// String constants (not an enum) so the wire format stays exact.
 /// </summary>
 public static class TaskStatuses
 {
     public const string Created = "created";
+    public const string Interpreting = "interpreting";
+    public const string Grounding = "grounding";
     public const string Planning = "planning";
-    public const string Monitoring = "monitoring";
+    public const string Checking = "checking";
     public const string AwaitingApproval = "awaiting_approval";
     public const string Executing = "executing";
+    public const string Monitoring = "monitoring";
     public const string Adapting = "adapting";
     public const string Done = "done";
 }
 
-/// <summary>Autonomy modes carried on the Task Contract.</summary>
-public static class AutonomyModes
+/// <summary>
+/// Approval tiers for side-effecting actions (reversibility × cost × risk).
+/// Nothing <see cref="Firm"/> executes until an <c>approval</c> arrives.
+/// </summary>
+public static class ApprovalTiers
 {
-    /// <summary>Every side-effect is frozen into a proposal and requires approval.</summary>
-    public const string ProposeAll = "propose_all";
+    /// <summary>Reversible and cheap — the device may just do it (e.g. set a reminder).</summary>
+    public const string Auto = "auto";
+
+    /// <summary>Low-stakes; batched into the plan approval (e.g. add to shopping list).</summary>
+    public const string Light = "light";
+
+    /// <summary>Costly/irreversible; requires explicit consent (e.g. place a grocery order).</summary>
+    public const string Firm = "firm";
 }

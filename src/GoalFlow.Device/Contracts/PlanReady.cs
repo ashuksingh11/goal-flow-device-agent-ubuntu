@@ -1,99 +1,112 @@
-using System.Text.Json.Serialization;
+using System.Text.Json.Nodes;
 
 namespace GoalFlow.Device.Contracts;
 
 /// <summary>
-/// Device → cloud (<c>type: "plan_ready"</c>): the candidate plan produced by
-/// the pipeline, after the safety gate, with all side-effects frozen as
-/// proposals. <c>task_status</c> is "awaiting_approval".
+/// The generic plan + tiered proposals, device → cloud (<c>type: "plan_ready"</c>).
+/// The cloud relays it to the UI as <c>present_plan</c> (adding
+/// <c>payload.knew</c>, the personalization summary — cloud-side only).
 /// </summary>
 public sealed record PlanReady
 {
-    [JsonPropertyName("type")]
     public string Type { get; init; } = MessageTypes.PlanReady;
 
-    [JsonPropertyName("goal_id")]
     public required string GoalId { get; init; }
 
-    /// <summary>Echoes the dispatch correlation id, e.g. "disp-001".</summary>
-    [JsonPropertyName("correlation_id")]
-    public required string CorrelationId { get; init; }
+    public string? CorrelationId { get; init; }
 
-    /// <summary>See <see cref="TaskStatuses"/>; normally "awaiting_approval".</summary>
-    [JsonPropertyName("task_status")]
+    /// <summary>Normally <see cref="TaskStatuses.AwaitingApproval"/>.</summary>
     public required string TaskStatus { get; init; }
 
-    [JsonPropertyName("payload")]
     public required PlanReadyPayload Payload { get; init; }
 }
 
-/// <summary>Payload of <see cref="PlanReady"/>.</summary>
 public sealed record PlanReadyPayload
 {
-    /// <summary>The per-day plan items.</summary>
-    [JsonPropertyName("plan")]
+    /// <summary>The domain-agnostic plan the LLM produced.</summary>
     public required IReadOnlyList<PlanItem> Plan { get; init; }
 
-    /// <summary>Frozen side-effects awaiting approval.</summary>
-    [JsonPropertyName("proposals")]
+    /// <summary>Every side-effecting action, frozen into tiered proposals.</summary>
     public required IReadOnlyList<ProposalItem> Proposals { get; init; }
 
-    /// <summary>Deterministic safety-gate verdict for this plan.</summary>
-    [JsonPropertyName("safety")]
-    public required SafetyResult Safety { get; init; }
+    /// <summary>Verdict of the deterministic Safety filter over the whole run.</summary>
+    public required SafetyVerdict Safety { get; init; }
 
-    /// <summary>Device-computed impact metrics for the proposed plan.</summary>
-    [JsonPropertyName("impact")]
-    public ImpactMetrics? Impact { get; init; }
+    /// <summary>Headline outcomes for the UI, e.g. {"label":"waste","value":"-2 items"}.</summary>
+    public IReadOnlyList<ImpactItem> Impact { get; init; } = [];
+
+    /// <summary>One-paragraph natural-language rationale for the plan.</summary>
+    public string? Explanation { get; init; }
 }
 
-/// <summary>Deterministic plan impact metrics computed on-device.</summary>
-public sealed record ImpactMetrics
-{
-    [JsonPropertyName("items_used_before_expiry")]
-    public required int ItemsUsedBeforeExpiry { get; init; }
-
-    [JsonPropertyName("pork_meals")]
-    public required int PorkMeals { get; init; }
-
-    [JsonPropertyName("veg_forward_dinners")]
-    public required int VegForwardDinners { get; init; }
-
-    [JsonPropertyName("grocery_items")]
-    public required int GroceryItems { get; init; }
-}
-
-/// <summary>One planned dinner, e.g. { "day":"Mon", "dish":"spinach dal rice bowl", "why":[...] }.</summary>
+/// <summary>One generic plan step (a dinner, a prep task, an errand, ...).</summary>
 public sealed record PlanItem
 {
-    [JsonPropertyName("day")]
-    public required string Day { get; init; }
+    /// <summary>Stable id within the plan, e.g. "s1".</summary>
+    public required string Id { get; init; }
 
-    [JsonPropertyName("dish")]
-    public required string Dish { get; init; }
+    public required string Title { get; init; }
 
-    /// <summary>Machine-readable rationale tags, e.g. ["more_vegetables","uses_inventory"].</summary>
-    [JsonPropertyName("why")]
+    public string? Detail { get; init; }
+
+    /// <summary>Optional ISO timestamp/date — RELATIVE to real today via the clock.</summary>
+    public string? When { get; init; }
+
+    /// <summary>Per-decision rationale chips, e.g. ["uses_expiring_spinach"].</summary>
     public IReadOnlyList<string> Why { get; init; } = [];
+
+    public IReadOnlyList<string> Tags { get; init; } = [];
 }
 
 /// <summary>
-/// Safety-gate outcome. Produced ONLY by the deterministic
-/// <c>ISafetyGate</c> code path — never by the planner.
+/// A proposed side-effecting tool call. The LLM's pending call is frozen here
+/// (module + function + args) with a tier; the ApprovalCoordinator holds it
+/// until the matching <c>approval</c> decision arrives.
 /// </summary>
-public sealed record SafetyResult
+public sealed record ProposalItem
 {
-    /// <summary>"passed" or "blocked".</summary>
-    [JsonPropertyName("gate")]
+    public required string ProposalId { get; init; }
+
+    /// <summary>Human-readable action label, e.g. "add 5 items to the shopping list".</summary>
+    public required string Action { get; init; }
+
+    /// <summary>Capability module (SK plugin) name, e.g. "ShoppingList".</summary>
+    public required string Module { get; init; }
+
+    /// <summary>[KernelFunction] name, e.g. "Add".</summary>
+    public required string Function { get; init; }
+
+    /// <summary>The exact arguments the function will be invoked with on approval.</summary>
+    public JsonObject? Args { get; init; }
+
+    /// <summary>See <see cref="ApprovalTiers"/>.</summary>
+    public required string Tier { get; init; }
+
+    public string? Reason { get; init; }
+
+    public bool RequiresApproval { get; init; } = true;
+}
+
+/// <summary>Outcome of the Safety filter's deterministic hard-constraint checks.</summary>
+public sealed record SafetyVerdict
+{
+    /// <summary>"passed" or "blocked" (see <see cref="SafetyGates"/>).</summary>
     public required string Gate { get; init; }
 
-    /// <summary>Which hard constraints were violated; empty when passed.</summary>
-    [JsonPropertyName("hard_violations")]
-    public IReadOnlyList<string> HardViolations { get; init; } = [];
+    /// <summary>Human-readable violations when blocked; empty when passed.</summary>
+    public IReadOnlyList<string> Violations { get; init; } = [];
+}
 
-    /// <summary><c>gate</c> value when no hard constraint is violated.</summary>
-    public const string GatePassed = "passed";
+public static class SafetyGates
+{
+    public const string Passed = "passed";
+    public const string Blocked = "blocked";
+}
 
-    /// <summary><c>gate</c> value when the plan is blocked.</summary>
-    public const string GateBlocked = "blocked";
+/// <summary>A headline impact metric shown on the plan card.</summary>
+public sealed record ImpactItem
+{
+    public required string Label { get; init; }
+
+    public required string Value { get; init; }
 }

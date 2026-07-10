@@ -1,5 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- Repo-root convenience wrapper: compiles the same sources as
+       src/GoalFlow.Device/GoalFlow.Device.csproj so `dotnet run` works from
+       the repo root. Keep the dependency list IDENTICAL to that project. -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
@@ -15,10 +18,12 @@
              Exclude="src/GoalFlow.Device/bin/**/*.cs;src/GoalFlow.Device/obj/**/*.cs" />
   </ItemGroup>
 
+  <!-- TIZEN-LEAN: Semantic Kernel + Microsoft.Extensions.{Logging,DI} + BCL ONLY. -->
   <ItemGroup>
     <PackageReference Include="Microsoft.SemanticKernel" Version="1.*" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="*" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="*" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="*" />
-    <PackageReference Include="System.Text.Json" Version="*" />
   </ItemGroup>
 
 </Project>

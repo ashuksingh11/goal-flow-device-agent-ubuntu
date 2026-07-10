@@ -1,118 +1,193 @@
-# Device Agent Architecture
+# Device Agent Architecture (v2 — Semantic Kernel)
 
 The GoalFlow device agent is the on-device half of a two-tier goal-agent
-system. The cloud agent owns the conversation and memory, decomposes the user
-goal into a **Task Contract** (the `dispatch` message of CONTRACT v0 — the
-canonical CONTRACT.md lives in the cloud repo; `src/GoalFlow.Device/Contracts/`
-is its exact C# mirror), and relays messages. The device agent:
+system for the Samsung Family Hub. The cloud agent owns the conversation and
+memory, decomposes the fuzzy user goal into the **generic Task Contract**
+(the `dispatch` message of CONTRACT v2 — canonical in the cloud repo;
+`src/GoalFlow.Device/Contracts/` is its exact C# mirror), and relays every
+message (UI and device never talk directly).
 
-- is the **sole authority on local state** — nothing else reads or mutates
-  the local world;
-- is the **only component that touches actuators** (shopping list,
-  reminders);
-- runs the **harness pipeline** described below.
+**v2 core idea: the device IS a Semantic Kernel agent.** Device capabilities
+are SK **plugins** whose methods are `[KernelFunction]`s the LLM *calls* via
+**auto function-calling** (`FunctionChoiceBehavior.Auto`). Safety is an SK
+**`IFunctionInvocationFilter`** that inspects every pending call against
+`constraints.hard` and blocks violations deterministically — **"LLM plans,
+code checks."** As the kernel works, the device **streams `agent_event`
+frames** (phase / thinking / tool_call / tool_result / plan_progress) that
+drive the live UI. Planning is **LLM-only**: there is no rules or scripted
+planner in v2.
 
-The UI and the device never talk directly. The cloud is the WebSocket hub;
-the device opens one outbound `ClientWebSocket` to it. Ethos of the POC:
-*"fake the world; make the mechanism real"* — the product APIs are mock JSON,
-but the pipeline, gates, contracts, and correlation/idempotency machinery are
-the real IP.
+The agent is **general**: `meal_plan` is one domain, `guest_dinner` another.
+The protocol, the steering modules, and the kernel host are domain-agnostic;
+domains differ only in which capability plugins the planner leans on and what
+rides in the free-form `scope`/`context` objects.
 
-## The harness pipeline
+## Layout
 
-Order: **sense → decide → gate → act → sustain**, with Trace cross-cutting.
-`Pipeline.cs` is the orchestrator; each harness is one interface + one class
-in `Harnesses/`.
+```
+src/GoalFlow.Device/
+  Contracts/              C# mirror of every CONTRACT v2 message (snake_case JSON)
+  Agent/GoalAgent.cs      the SK kernel host: build kernel, plan, actuate, adapt
+  Modules/
+    Capabilities/         SK plugins — the LLM's tools ([KernelFunction]s)
+    Steering/             harness modules that shape/guard the run (no LLM inside)
+  Transport/WsClient.cs   one outbound BCL ClientWebSocket to the cloud hub
+  Program.cs              CLI entry: --goal | --contract | --connect [--date]
+data/                     mock world; ALL dates stored as offsets from today
+```
 
-| Phase | Harnesses |
-| --- | --- |
-| orchestrate | TaskManager (goal_id, status lifecycle) |
-| sense | PreCheck → CapabilityManager → Grounding (over the product API adapters) |
-| decide | Planner (swappable IPlanner) |
-| gate | SafetyGate (code, blocks) then ApprovalBroker (user via cloud, waits) |
-| act | EffectExecutor (idempotent, dedupe on correlation_id) |
-| sustain | Scheduler + ChangeWatcher (M4) |
-| cross-cutting | Trace, IClock |
+## The Kernel (Agent/GoalAgent.cs)
 
-Lifecycle driven by TaskManager:
-`created → planning → awaiting_approval → executing → adapting → done`.
+`GoalAgent.BuildKernel` assembles the device's brainstem:
 
-Grounding is the world-state assembler: it normalizes the adapters' outputs
-(inventory, calendar, recipes, shopping list, reminders) into one coherent
-`WorldState`, including derived views such as `ExpiringSoon` (the
-reduce_waste signal). The planner and gates only ever see `WorldState` —
-never raw adapter payloads.
+1. **Chat model** — OpenRouter via SK's OpenAI-compatible connector:
+   `AddOpenAIChatCompletion(modelId: OPENROUTER_MODEL /* default
+   openai/gpt-oss-120b */, endpoint: OPENROUTER_BASE_URL, apiKey:
+   OPENROUTER_API_KEY)`. Config comes from `.env`; never hardcoded.
+2. **Capability plugins** — registered under their advertised module names:
+   `Inventory`, `Calendar`, `Recipes`, `ShoppingList`, `Reminders`,
+   `Appliance`, `FamilyProfiles`, `Budget`, `Notify`. Registration IS the
+   action space: the planner can only call what the Hub can actually do.
+3. **The SafetyFilter** — added as an `IFunctionInvocationFilter` service, so
+   it sits in the kernel's invocation pipeline for *every* function call.
 
-## The two-gate separation
+`GoalAgent.RunAsync(dispatch)` is one streaming chat invocation with
+`FunctionChoiceBehavior.Auto()`: the model reads the grounded context, decides
+which `[KernelFunction]`s to call, the kernel invokes them (through the
+filter), results feed back into the model, and the loop continues until the
+model emits its structured plan. Throughout, `Trace` narrates each step as an
+`agent_event` frame.
 
-This is the load-bearing design decision, kept as **two separate classes**:
+## Invoke / filter / stream flow
 
-1. **Safety gate (`ISafetyGate` / `SafetyGate`)** — deterministic CODE. Its
-   only inputs are the candidate plan, `constraints.hard` from the contract,
-   and recipe facts from the world state. It checks allergens / dietary /
-   medical rules, and on violation it **blocks** and reports
-   `hard_violations`. No LLM, no network, no repair — block, don't fix.
-2. **Approval gate (`IApprovalBroker` / `ApprovalBroker`)** — the human,
-   reached through the cloud. It freezes side-effects as **proposals**,
-   tracks pending/approved/rejected/expired, and **waits** for `approval`
-   messages, correlating each decision by `correlation_id`.
+```mermaid
+sequenceDiagram
+    participant Cloud
+    participant WsClient
+    participant GoalAgent as GoalAgent (SK Kernel)
+    participant LLM as OpenRouter LLM
+    participant Filter as SafetyFilter (IFunctionInvocationFilter)
+    participant Plugin as Capability plugin ([KernelFunction])
+    participant Trace
 
-The planner never runs the safety check. Even the LlmPlanner's output is
-untrusted and passes through the same code gate. Slogan: **"LLM plans, code
-checks."** Corollary invariant: the device sends side-effects only as
-proposals and executes nothing until an approval returns; execution then
-happens exactly once (EffectExecutor dedupes on correlation_id + proposal_id).
+    Cloud->>WsClient: dispatch (Task Contract)
+    WsClient->>GoalAgent: RunAsync(dispatch)
+    GoalAgent->>Trace: phase: grounding
+    Trace-->>Cloud: agent_event (streamed)
+    Note over GoalAgent: Grounding assembles world context;<br/>SafetyFilter.SetPolicy(constraints.hard)
+    GoalAgent->>Trace: phase: planning
+    GoalAgent->>LLM: chat + tool schemas (FunctionChoiceBehavior.Auto)
+    loop auto function-calling
+        LLM-->>GoalAgent: function call {module, function, args}
+        GoalAgent->>Trace: tool_call event
+        Trace-->>Cloud: agent_event
+        GoalAgent->>Filter: OnFunctionInvocationAsync(context)
+        alt violates constraints.hard
+            Filter-->>GoalAgent: BLOCKED (result = refusal; plugin never runs)
+            Note over Filter: violation recorded for the<br/>plan_ready safety verdict
+        else allowed
+            Filter->>Plugin: next(context) — method executes
+            Plugin-->>GoalAgent: result
+        end
+        GoalAgent->>Trace: tool_result event
+        Trace-->>Cloud: agent_event
+        GoalAgent->>LLM: tool result appended
+    end
+    LLM-->>GoalAgent: final structured plan
+    GoalAgent->>Trace: phase: checking
+    Note over GoalAgent: side-effecting calls frozen into<br/>tiered proposals (ApprovalCoordinator)
+    GoalAgent->>WsClient: plan_ready (plan + proposals + safety verdict)
+    WsClient->>Cloud: plan_ready → present_plan → UI
+    Cloud->>WsClient: approval (decisions)
+    WsClient->>GoalAgent: ApplyApprovalAsync
+    Note over GoalAgent: Actuator invokes approved proposals<br/>through the kernel (filter still applies), idempotently
+    GoalAgent->>WsClient: status (executed ids)
+```
 
-## Swappable planner
+## The Safety filter — "LLM plans, code checks"
 
-`IPlanner` has three implementations, selected via DI/config (`--planner`):
+`Modules/Steering/SafetyFilter.cs` implements SK's
+`IFunctionInvocationFilter`. Before *any* plugin method runs, the kernel calls
+`OnFunctionInvocationAsync(context, next)`; the filter inspects
+`context.Function` (plugin + function name) and `context.Arguments` against
+the **armed policy** — the dispatch's `constraints.hard` object, its ONLY
+input. Allowed → `next(context)` executes the function. Violation → `next` is
+never called: the plugin method does not run, `context.Result` is set to a
+structured refusal (so the model sees why and can re-plan), and the violation
+is recorded into the `plan_ready` safety verdict (`gate: blocked`).
 
-- **RulesPlanner** (default) — deterministic heuristics: consume
-  expiring-soon inventory first, honor soft preferences/dislikes, pick quick
-  recipes on busy calendar evenings, diff ingredients vs inventory into one
-  shopping-list proposal. Demo-safe: no network, no keys.
-- **LlmPlanner** — Microsoft Semantic Kernel over OpenRouter
-  (OpenAI-compatible; `OPENROUTER_BASE_URL`, default model
-  `anthropic/claude-sonnet-5` via `OPENROUTER_MODEL`). Falls back on any
-  failure.
-- **ScriptedPlanner** — canned fixture replay (M1 smoke runs, offline demos).
+The filter is deterministic code, fully separate from the LLM. It understands
+the hard-constraint vocabulary — `allergens`/`dietary`/`medical` (ingredient
+screens), `budget_cap` (blocks `ShoppingList.PlaceOrder` over the cap),
+`quiet_hours` (blocks scheduled appliance/announce actions) — and ignores
+keys it does not know rather than guessing.
 
-All three return the same `CandidatePlan` and are gated identically.
+## Approval tiers (HITL)
 
-## Portability: injectable interfaces + virtual clock
+Side-effecting `[KernelFunction]`s are tagged `[SideEffect(tier)]`
+(`Modules/Steering/CapabilityRegistry.cs`). Tiers encode
+reversibility × cost × risk:
 
-Everything Tizen-specific sits behind injectable interfaces so the Tizen port
-(goal-flow-device-agent-tizen) is an adapter swap, not a rewrite:
+- **auto** — reversible/cheap, may execute immediately (create a reminder);
+- **light** — batched into the plan approval (add to shopping list);
+- **firm** — spends money / irreversible; NEVER executes before an explicit
+  `approval` decision (place the grocery order).
 
-- **Product/device APIs** — `IInventoryApi`, `ICalendarApi`, `IRecipeApi`,
-  `IShoppingListApi`, `IReminderApi`. Ubuntu uses `Mock*` classes over
-  `data/*.json`; Tizen swaps in Family Hub adapters.
-- **Local storage** — the mock adapters own file I/O; a Tizen adapter uses
-  platform storage behind the same interfaces.
-- **Clock** — the `IClock` discipline: device code never calls
-  `DateTime.Now`/wall-clock timers. Everything (Grounding timestamps,
-  Scheduler waits, proposal expiry) reads the virtual clock, so demos can
-  time-travel and tests are deterministic. `VirtualClock` anchors at
-  2026-07-12 to match the seed data.
+`ApprovalCoordinator` owns the ledger: pending → approved → executed (or
+rejected), idempotent execution via `MarkExecuted`.
 
-All harnesses are constructor-injected (`Microsoft.Extensions.DependencyInjection`);
-`Program.cs` documents the intended composition root.
+## The generic clock
 
-## Transport vs pipeline (M1 vs later)
+`Modules/Steering/Clock.cs`: `IClock` (`Now`, `Today`) with two
+implementations — `SystemClock` (real date; the default) and `SimulatedClock`
+(starts at real today or `--date`; driven by `control` frames: `set_date`,
+`advance_day`). **Nothing hardcodes a date.** Mock data stores day *offsets*
+(`expires_in_days`, `day_offset`) that `MockWorldStore` resolves against
+`IClock.Today` at read time, so the seed world is always "this week"
+(see `data/README.md`).
 
-The pipeline is transport-agnostic. Milestone 1 drives it from the command
-line (`dotnet run -- --contract data/sample-contract.json` prints a
-`plan_ready` JSON; compare with `data/golden-plan_ready.json`). The
-WebSocket shell (`Transport/WsClient.cs`) is a later thin wrapper:
-deserialize `dispatch` → `Pipeline.RunAsync` → serialize `plan_ready`;
-deserialize `approval` → `Pipeline.OnApprovalAsync` → serialize `status`.
-It reconnects on drop and relies on correlation_id dedupe for at-least-once
-delivery. Switching from Linux demo fallback to the real Family Hub is a
-one-line endpoint swap.
+## Capability registry & the capabilities message
 
-## Named extension points (deliberately not designed yet)
+`CapabilityRegistry` builds the `capabilities` advertisement by *discovery*:
+it walks `kernel.Plugins` (function names + `Description` attributes from
+`KernelFunctionMetadata`, `side_effecting`/`tier` from `[SideEffect]`) and
+appends the fixed steering-module descriptors. Sent right after `hello_ack`.
+Adding a new domain = registering new plugins; advertisement, planner action
+space, and UI module view all update automatically.
 
-- Budget / quiet-hours harness (a third policy gate slot after SafetyGate).
-- Graceful-degradation harness (behavior when adapters or the LLM are down
-  beyond the current planner fallback chain).
-- Medical rule table in SafetyGate (slot exists; POC data keeps it empty).
+## agent_event streaming & structured logging
+
+`Modules/Steering/Trace.cs` is the single narration sink with two audiences:
+
+- **`agent_event` frames** streamed over the WebSocket (monotonic `seq` per
+  goal): `phase`, `thinking` (streamed model text), `tool_call`,
+  `tool_result`, `plan_progress` — the "watch it think" UI feed;
+- **structured logs** via `Microsoft.Extensions.Logging` (console sink):
+  leveled, single-line, timestamped, with goal_id/correlation_id scopes —
+  the debugging feed.
+
+Every emit does both, so the presenter view and the log tail always agree.
+
+## Transport
+
+`Transport/WsClient.cs` — one outbound BCL `ClientWebSocket` to the cloud hub
+(no transport packages). `hello(role: device)` → `hello_ack` →
+`capabilities`, then full-duplex: inbound `dispatch`/`approval`/`control`
+routed to `GoalAgent`; outbound `plan_ready`/`proposal`/`status` plus the
+high-rate `agent_event` stream (writes serialized on a semaphore). Dedupe on
+`correlation_id`; reconnect with backoff.
+
+## Tizen-lean dependency rule (hard)
+
+This process must port to Tizen.NET on the Family Hub. The ONLY NuGet
+dependencies allowed:
+
+| Package | Why |
+|---|---|
+| `Microsoft.SemanticKernel` | kernel, plugins, filters, OpenAI-compatible connector |
+| `Microsoft.Extensions.Logging` (+ `.Console`) | structured logging |
+| `Microsoft.Extensions.DependencyInjection` | composition root |
+
+Everything else is BCL — `System.Text.Json` and `System.Net.WebSockets` ship
+in-box on net8.0. **No other, native, or desktop packages.** The csproj
+enforces and documents this; adding anything else breaks the port.
