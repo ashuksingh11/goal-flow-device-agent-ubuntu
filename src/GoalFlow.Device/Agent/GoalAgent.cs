@@ -434,16 +434,38 @@ public sealed class GoalAgent
         history.AddSystemMessage(AdaptSystemPrompt);
         history.AddUserMessage(BuildAdaptInstruction(active.Plan, change));
 
-        var raw = await GetAdaptContentAsync(chat, history, ct);
-        if (!string.IsNullOrWhiteSpace(raw))
+        PlanPatch? patch = null;
+        string? lastError = null;
+
+        for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
         {
-            await _trace.ThinkingAsync(raw);
+            var raw = await GetAdaptContentAsync(chat, history, ct);
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                await _trace.ThinkingAsync(raw);
+                history.AddAssistantMessage(raw);
+            }
+
+            if (TryParsePlanPatch(raw, out var parsedPatch, out var error) && (parsedPatch.Upsert.Count > 0 || parsedPatch.Remove.Count > 0))
+            {
+                patch = parsedPatch;
+                break;
+            }
+
+            lastError = string.IsNullOrWhiteSpace(error)
+                ? "Patch had no upsert and no remove."
+                : error;
+
+            if (attempt < MaxComposeAttempts)
+            {
+                history.AddUserMessage("Your previous reply was not a complete JSON patch. Reply again with ONLY the minimal JSON patch object, complete and valid.");
+            }
         }
 
-        if (!TryParsePlanPatch(raw, out var patch, out var error) || (patch.Upsert.Count == 0 && patch.Remove.Count == 0))
+        if (patch is null)
         {
-            _logger.LogWarning("adaptation_patch_unusable kind={Kind}: {Error}", change.Kind, error);
-            await _trace.ThinkingAsync($"planner_notice: adaptation produced no usable patch ({error}); leaving plan unchanged.");
+            _logger.LogWarning("adaptation_patch_unusable kind={Kind}: {Error}", change.Kind, lastError);
+            await _trace.ThinkingAsync($"planner_notice: adaptation produced no usable patch ({lastError}); leaving plan unchanged.");
             return null;
         }
 
@@ -499,7 +521,7 @@ public sealed class GoalAgent
         var settings = new OpenAIPromptExecutionSettings
         {
             Temperature = 0.2,
-            MaxTokens = 900,
+            MaxTokens = 2000,
             ResponseFormat = "json_object"
         };
         for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
