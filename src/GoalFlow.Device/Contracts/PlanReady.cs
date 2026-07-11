@@ -110,3 +110,26 @@ public sealed record ImpactItem
 
     public required string Value { get; init; }
 }
+
+/// <summary>
+/// A MINIMAL plan diff produced by the scoped daily-adaptation LLM call — the
+/// tokens-lean alternative to re-emitting the whole week. It rides inside
+/// <see cref="AdaptationPayload"/> as a PREVIEW of the proposed change, and once
+/// approved is applied to the active plan (the result ships back in
+/// <see cref="StatusPayload.UpdatedPlan"/>). Only the affected rows appear here.
+/// </summary>
+public sealed record PlanPatch
+{
+    /// <summary>Rows to insert or replace, matched by <see cref="PlanItem.Id"/>
+    /// (a swapped dinner, a new prep task). Reusing an existing id replaces it.</summary>
+    public IReadOnlyList<PlanItem> Upsert { get; init; } = [];
+
+    /// <summary>Plan-item ids to drop from the plan.</summary>
+    public IReadOnlyList<string> Remove { get; init; } = [];
+
+    /// <summary>Impact badges to add/replace on the plan card, e.g. {"waste":"-2 items"}.</summary>
+    public IReadOnlyList<ImpactItem> ImpactDelta { get; init; } = [];
+
+    /// <summary>One-line rationale, e.g. "Swapped Wed dinner to use the spinach before it expires."</summary>
+    public string? Rationale { get; init; }
+}

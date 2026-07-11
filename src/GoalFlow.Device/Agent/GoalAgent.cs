@@ -48,6 +48,15 @@ public sealed class GoalAgent
     private readonly ILogger<GoalAgent> _logger;
     private readonly Dictionary<string, ActiveGoalContext> _activeGoals = new(StringComparer.Ordinal);
 
+    /// <summary>Plan patches awaiting approval, keyed by proposal id → (goalId, patch).
+    /// Registered when a daily adaptation is proposed; applied in ApplyApproval.</summary>
+    private readonly Dictionary<string, (string GoalId, PlanPatch Patch)> _pendingPatches = new(StringComparer.Ordinal);
+
+    /// <summary>Marker module/function on an adaptation ProposalItem meaning "apply
+    /// the pending plan patch" — intercepted in ApplyApproval, never kernel-invoked.</summary>
+    private const string PlanPatchModule = "Plan";
+    private const string PlanPatchFunction = "ApplyPatch";
+
     public GoalAgent(
         Kernel kernel,
         Trace trace,
@@ -398,6 +407,188 @@ public sealed class GoalAgent
         return response.Content ?? "";
     }
 
+    // ---- Daily adaptation: a scoped, tokens-lean LLM re-plan of the affected slice.
+    // Quiet days cost zero LLM calls (deterministic materiality gate); a material day
+    // is ONE small call (no grounding tool-loop) that returns a minimal plan patch. --
+
+    private const string AdaptSystemPrompt = """
+        You keep an already-approved home plan in sync with the real world.
+        A single world change just happened. Adapt ONLY the affected part of the
+        plan — do not rewrite rows the change doesn't touch. Reply with a MINIMAL
+        JSON patch and nothing else (no prose, no Markdown, no code fence):
+        {
+          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "title": "...", "detail": "...", "when": "YYYY-MM-DD", "why": ["short reason"] } ],
+          "remove": ["<id to drop>"],
+          "impact_delta": [ { "label": "waste", "value": "-2 items" } ],
+          "rationale": "one sentence explaining the change"
+        }
+        Keep it tiny: usually a single upsert. Reuse an existing id to SWAP that row;
+        use a new id only to ADD a step. Honor the steer.
+        """;
+
+    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, ActiveGoalContext active, WorldChange change, CancellationToken ct)
+    {
+        var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
+        var history = new ChatHistory();
+        history.AddSystemMessage(AdaptSystemPrompt);
+        history.AddUserMessage(BuildAdaptInstruction(active.Plan, change));
+
+        var raw = await GetAdaptContentAsync(chat, history, ct);
+        if (!string.IsNullOrWhiteSpace(raw))
+        {
+            await _trace.ThinkingAsync(raw);
+        }
+
+        if (!TryParsePlanPatch(raw, out var patch, out var error) || (patch.Upsert.Count == 0 && patch.Remove.Count == 0))
+        {
+            _logger.LogWarning("adaptation_patch_unusable kind={Kind}: {Error}", change.Kind, error);
+            await _trace.ThinkingAsync($"planner_notice: adaptation produced no usable patch ({error}); leaving plan unchanged.");
+            return null;
+        }
+
+        var proposalId = $"a{_approvals.All().Count(p => p.ProposalId.StartsWith('a')) + 1}";
+        _approvals.Register(new ProposalItem
+        {
+            ProposalId = proposalId,
+            Action = change.RecommendedAction ?? "adapt the plan",
+            Module = PlanPatchModule,
+            Function = PlanPatchFunction,
+            Tier = ApprovalTiers.Adapt,
+            Reason = patch.Rationale,
+            RequiresApproval = true
+        });
+        _pendingPatches[proposalId] = (goalId, patch);
+        _logger.LogInformation("adaptation_proposed {ProposalId} kind={Kind} upsert={Upsert} remove={Remove}", proposalId, change.Kind, patch.Upsert.Count, patch.Remove.Count);
+
+        return new Proposal
+        {
+            GoalId = goalId,
+            TaskStatus = TaskStatuses.Adapting,
+            Payload = new AdaptationPayload
+            {
+                ProposalId = proposalId,
+                Action = change.RecommendedAction ?? "adapt the plan",
+                Detail = patch.Rationale,
+                Trigger = change.Description,
+                Tier = ApprovalTiers.Adapt,
+                RequiresApproval = true,
+                Patch = patch
+            }
+        };
+    }
+
+    private static string BuildAdaptInstruction(IReadOnlyList<PlanItem> plan, WorldChange change)
+    {
+        var planLines = string.Join("\n", plan.Select(p =>
+            $"- {p.Id} | {p.When ?? "n/a"} | {p.Title}{(p.Detail is null ? "" : " — " + p.Detail)}"));
+        var context = change.Context is null ? "" : $"\nDetails: {change.Context.ToJsonString()}";
+        return $"""
+            CURRENT PLAN (id | date | title):
+            {planLines}
+
+            WORLD CHANGE: {change.Description}{context}
+            HOW TO ADAPT: {change.Steer}
+
+            Return the minimal JSON patch for the affected row(s) only.
+            """;
+    }
+
+    private async Task<string> GetAdaptContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
+    {
+        var settings = new OpenAIPromptExecutionSettings
+        {
+            Temperature = 0.2,
+            MaxTokens = 900,
+            ResponseFormat = "json_object"
+        };
+        for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
+        {
+            try
+            {
+                var resp = await chat.GetChatMessageContentAsync(history, settings, _kernel, ct);
+                var content = resp.Content ?? "";
+                if (!string.IsNullOrWhiteSpace(content))
+                {
+                    return content;
+                }
+            }
+            catch (Exception ex) when (IsTransientProviderError(ex, ct))
+            {
+                _logger.LogWarning(ex, "adaptation_compose_transient attempt {Attempt}/{Max}; retrying", attempt, MaxComposeAttempts);
+                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+            }
+        }
+        return "";
+    }
+
+    private static bool TryParsePlanPatch(string? raw, out PlanPatch patch, out string error)
+    {
+        try
+        {
+            var json = ExtractJson(raw);
+            patch = JsonSerializer.Deserialize<PlanPatch>(json, ContractJson.Options) ?? new PlanPatch();
+            error = "";
+            return true;
+        }
+        catch (Exception ex) when (ex is JsonException or NotSupportedException)
+        {
+            patch = new PlanPatch();
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>Applies an approved plan patch to the active goal's plan (in place,
+    /// preserving row order) and returns the executed-effect + updated plan slice.</summary>
+    private (ExecutedEffect Effect, IReadOnlyList<PlanItem>? Updated, IReadOnlyList<string> ChangedIds, IReadOnlyList<ImpactItem> ImpactDelta) ApplyPendingPatch(string proposalId)
+    {
+        _approvals.MarkExecuted(proposalId);
+        if (!_pendingPatches.Remove(proposalId, out var pending) || !_activeGoals.TryGetValue(pending.GoalId, out var active))
+        {
+            return (new ExecutedEffect { ProposalId = proposalId, Action = $"{PlanPatchModule}.{PlanPatchFunction}", Result = "skipped", Detail = "no pending patch or active goal" }, null, [], []);
+        }
+
+        var (newPlan, changed) = ApplyPatch(active.Plan, pending.Patch);
+        active.Plan = newPlan;
+        _logger.LogInformation("adaptation_applied {ProposalId} changed={Changed} plan_items={Count}", proposalId, changed.Count, newPlan.Count);
+        return (
+            new ExecutedEffect { ProposalId = proposalId, Action = $"{PlanPatchModule}.{PlanPatchFunction}", Result = "plan_updated", Detail = pending.Patch.Rationale },
+            newPlan,
+            changed,
+            pending.Patch.ImpactDelta);
+    }
+
+    private static (IReadOnlyList<PlanItem> Plan, IReadOnlyList<string> Changed) ApplyPatch(IReadOnlyList<PlanItem> plan, PlanPatch patch)
+    {
+        var order = plan.Select(p => p.Id).ToList();
+        var byId = plan.ToDictionary(p => p.Id, StringComparer.Ordinal);
+        var changed = new List<string>();
+
+        foreach (var id in patch.Remove)
+        {
+            if (byId.Remove(id))
+            {
+                order.Remove(id);
+                changed.Add(id);
+            }
+        }
+        foreach (var row in patch.Upsert)
+        {
+            if (!byId.ContainsKey(row.Id))
+            {
+                order.Add(row.Id);
+            }
+            byId[row.Id] = row;
+            if (!changed.Contains(row.Id))
+            {
+                changed.Add(row.Id);
+            }
+        }
+
+        var ordered = order.Where(byId.ContainsKey).Select(id => byId[id]).ToArray();
+        return (ordered, changed);
+    }
+
     private async Task<Status> ApplyApprovalCoreAsync(Approval approval, CancellationToken ct)
     {
         using var scope = _trace.BeginGoalScope(approval.GoalId, approval.CorrelationId);
@@ -405,9 +596,28 @@ public sealed class GoalAgent
         await _trace.PhaseAsync("executing");
         var cleared = _approvals.ApplyDecisions(approval);
         var executed = new List<ExecutedEffect>();
+        IReadOnlyList<PlanItem>? updatedPlan = null;
+        IReadOnlyList<string> changedIds = [];
+        IReadOnlyList<ImpactItem> impactDelta = [];
 
         foreach (var proposal in cleared)
         {
+            // A daily adaptation's approval APPLIES its plan patch instead of invoking
+            // a kernel function — the plan itself is the effect. The updated plan ships
+            // back in the status so the UI re-renders in place.
+            if (proposal.Module == PlanPatchModule && proposal.Function == PlanPatchFunction)
+            {
+                var applied = ApplyPendingPatch(proposal.ProposalId);
+                executed.Add(applied.Effect);
+                if (applied.Updated is not null)
+                {
+                    updatedPlan = applied.Updated;
+                    changedIds = applied.ChangedIds;
+                    impactDelta = applied.ImpactDelta;
+                }
+                continue;
+            }
+
             var function = _kernel.Plugins.GetFunction(proposal.Module, proposal.Function);
             var args = ToKernelArguments(proposal.Args);
             _logger.LogInformation("execute_proposal {ProposalId} {Module}.{Function}", proposal.ProposalId, proposal.Module, proposal.Function);
@@ -431,6 +641,9 @@ public sealed class GoalAgent
             {
                 SimDate = _clock.Today.ToString("yyyy-MM-dd"),
                 Executed = executed,
+                UpdatedPlan = updatedPlan,
+                ChangedIds = changedIds,
+                ImpactDelta = impactDelta,
                 Note = executed.Count == 0 ? "No new proposals executed; approval may be a replay or rejection." : $"Executed {executed.Count} proposal(s)."
             }
         };
@@ -488,7 +701,11 @@ public sealed class GoalAgent
         {
             await _trace.ThinkingAsync($"material change detected: {material.Description}");
             await _trace.PhaseAsync("adapting");
-            var proposal = await _monitor.ProposeAdaptationAsync(control.GoalId, material, ct);
+            // Daily-feed changes carry a steer → a SCOPED LLM re-plan produces a plan
+            // patch. Other changes (guest RSVP) keep the deterministic effect proposal.
+            var proposal = material.Steer is not null
+                ? await ProposeDailyAdaptationAsync(control.GoalId, active, material, ct)
+                : await _monitor.ProposeAdaptationAsync(control.GoalId, material, ct);
             if (proposal is not null)
             {
                 proposal = proposal with { CorrelationId = active.Dispatch.CorrelationId };

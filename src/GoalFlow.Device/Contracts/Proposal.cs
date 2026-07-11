@@ -37,4 +37,8 @@ public sealed record AdaptationPayload
     public required string Tier { get; init; }
 
     public bool RequiresApproval { get; init; } = true;
+
+    /// <summary>The scoped LLM re-plan's proposed change to the plan (preview).
+    /// Applied to the active plan on approval; null for non-plan adaptations.</summary>
+    public PlanPatch? Patch { get; init; }
 }

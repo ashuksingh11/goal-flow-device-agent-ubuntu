@@ -95,69 +95,77 @@ public sealed class MonitorAdapt
             ["captured_on"] = _clock.Today.ToString("yyyy-MM-dd"),
             ["calendar"] = await _store.LoadResolvedAsync("calendar", ct),
             ["guests"] = await _store.LoadResolvedAsync("guests", ct),
-            ["recipes"] = await _store.LoadResolvedAsync("recipes", ct)
+            ["recipes"] = await _store.LoadResolvedAsync("recipes", ct),
+            ["daily_events"] = await LoadDailyEventsAsync(ct)
         };
 
         ResolveGuestPendingUpdates(snapshot);
         return snapshot;
     }
 
+    /// <summary>
+    /// Meal-week changes come from the DAILY WORLD-CHANGE FEED (data/daily_events.json):
+    /// one curated, believable real-world change per day (fridge restock, an item
+    /// running out, a calendar clash, an extra guest, an appliance going down). Each
+    /// fires when the clock REACHES OR PASSES its day (deduped once by id). The
+    /// materiality is curated — every feed entry matters — and GoalAgent runs a
+    /// scoped LLM re-plan against the entry's `context`/`steer` to patch the plan.
+    /// </summary>
     private IReadOnlyList<WorldChange> ObserveMealChanges(ActiveGoalContext goal)
     {
         var today = _clock.Today.ToString("yyyy-MM-dd");
-        var calendarEvents = goal.WorldSnapshot["calendar"]?["events"]?.AsArray() ?? [];
+        var feed = goal.WorldSnapshot["daily_events"]?["events"]?.AsArray() ?? [];
         var changes = new List<WorldChange>();
 
-        foreach (var ev in calendarEvents.Select(n => n?.AsObject()).OfType<JsonObject>())
+        foreach (var ev in feed.Select(n => n?.AsObject()).OfType<JsonObject>())
         {
-            var title = ev["title"]?.GetValue<string>() ?? "";
             var evDate = ev["date"]?.GetValue<string>();
-            // Fire when the clock REACHES OR PASSES the football day — not only on the
-            // exact day — so advancing to (or a bit past) it always triggers the
-            // adaptation. Deduped once by the stable Key below.
-            if (!title.Contains("football", StringComparison.OrdinalIgnoreCase) ||
-                evDate is null ||
-                string.CompareOrdinal(today, evDate) < 0)
+            // Reach-or-pass: fire on the first tick on/after the event's day.
+            if (evDate is null || string.CompareOrdinal(today, evDate) < 0)
             {
                 continue;
             }
 
-            // The football night's dinner is the affected slice. Prefer the plan item
-            // dated on the football day (with a prep-window overlap); but the LLM does
-            // not always place a dinner on that EXACT ISO day, so fall back to any
-            // dinner-ish item and finally to a synthetic id. Without this the
-            // MaterialityPolicy saw zero affected items and suppressed the whole
-            // adaptation — so advancing to the football day showed nothing at all.
+            var id = ev["id"]?.GetValue<string>() ?? evDate;
             var affected = goal.Plan
-                .Where(item => (PlanItemDate(item) == evDate || PlanItemDate(item) == today) && PrepWindowOverlaps(item, ev))
+                .Where(item => PlanItemDate(item) == evDate)
                 .Select(item => item.Id)
-                .DefaultIfEmpty(goal.Plan
-                    .Where(item => PlanItemDate(item) == evDate)
-                    .Select(item => item.Id)
-                    .FirstOrDefault() ?? $"football-dinner-{evDate}")
+                .DefaultIfEmpty($"dinner-{evDate}")
                 .ToArray();
 
-            var nightBefore = DateOnly.Parse(evDate).AddDays(-1).ToString("yyyy-MM-dd");
             changes.Add(new WorldChange
             {
-                Key = $"meal:{ev["id"]?.GetValue<string>() ?? title}:football",
-                Kind = "calendar.event_overlap",
-                Description = $"{title} runs {ev["start"]?.GetValue<string>()}-{ev["end"]?.GetValue<string>()} on {evDate}, overlapping the planned dinner prep window.",
+                // STABLE key — the event fires exactly once even though the feed
+                // keeps returning it every day after its date (dedup in GoalAgent).
+                Key = $"daily:{id}",
+                Kind = ev["kind"]?.GetValue<string>() ?? "world.change",
+                Description = ev["summary"]?.GetValue<string>() ?? "A change occurred in the home.",
                 AffectedPlanItems = affected,
-                RecommendedAction = "Prep that dinner the night before, or swap it to a quicker dish.",
-                EffectModule = "Reminders",
-                EffectFunction = "Create",
-                EffectArgs = new JsonObject
-                {
-                    ["title"] = "Prep the football-night dinner the night before",
-                    ["date"] = nightBefore,
-                    ["time"] = "19:00"
-                },
-                EffectAction = "add night-before prep reminder"
+                RecommendedAction = ev["steer"]?.GetValue<string>(),
+                Steer = ev["steer"]?.GetValue<string>(),
+                Context = ev["context"]?.AsObject()?.DeepClone().AsObject()
             });
         }
 
         return changes;
+    }
+
+    private async Task<JsonObject> LoadDailyEventsAsync(CancellationToken ct)
+    {
+        // The feed is optional (guest-dinner demo has no meal feed) — an absent
+        // file yields an empty event list rather than throwing.
+        try
+        {
+            return await _store.LoadResolvedAsync("daily_events", ct);
+        }
+        catch (FileNotFoundException)
+        {
+            return new JsonObject { ["events"] = new JsonArray() };
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return new JsonObject { ["events"] = new JsonArray() };
+        }
     }
 
     private IReadOnlyList<WorldChange> ObserveGuestChanges(ActiveGoalContext goal)
@@ -279,9 +287,16 @@ public sealed class MaterialityPolicy
     public bool IsMaterial(WorldChange change)
         => change.Kind switch
         {
-            "calendar.event_overlap" => change.AffectedPlanItems.Count > 0,
+            // Guest-domain triggers stay gated on actually touching a plan item.
             "guest.rsvp_allergy_added" => change.AffectedPlanItems.Count > 0,
             "guest.arrival_late" => change.AffectedPlanItems.Count > 0,
+            // Daily-feed changes are a CURATED set — every entry is a real-world
+            // change worth re-planning for (the feed is the materiality decision).
+            "calendar.event_overlap" => true,
+            "inventory.restocked" => true,
+            "inventory.shortage" => true,
+            "guest.headcount_added" => true,
+            "appliance.unavailable" => true,
             _ => false
         };
 }
@@ -312,13 +327,23 @@ public sealed record WorldChange
     public JsonObject? EffectArgs { get; init; }
 
     public string? EffectAction { get; init; }
+
+    /// <summary>Structured detail for the scoped LLM re-plan (e.g. the added items,
+    /// the unavailable ingredients, the appliance). Null for non-feed changes.</summary>
+    public JsonObject? Context { get; init; }
+
+    /// <summary>A one-line nudge telling the planner HOW to adapt to this change —
+    /// steers the LLM output without hardcoding the new plan.</summary>
+    public string? Steer { get; init; }
 }
 
 public sealed record ActiveGoalContext
 {
     public required Dispatch Dispatch { get; init; }
 
-    public required IReadOnlyList<PlanItem> Plan { get; init; }
+    /// <summary>The live plan — SETTABLE so an approved daily adaptation can patch
+    /// it in place without recreating the context (which would reset the dedup set).</summary>
+    public required IReadOnlyList<PlanItem> Plan { get; set; }
 
     public required JsonObject WorldSnapshot { get; init; }
 

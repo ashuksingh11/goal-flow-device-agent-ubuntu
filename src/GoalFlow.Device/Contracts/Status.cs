@@ -33,6 +33,17 @@ public sealed record StatusPayload
     /// UI can confirm what happened (e.g. "5 items added to shopping list").</summary>
     public IReadOnlyList<ExecutedEffect> Executed { get; init; } = [];
 
+    /// <summary>After a daily adaptation is approved: the FULL updated plan, so the
+    /// UI replaces the plan card in place. Null when the approval didn't re-plan.</summary>
+    public IReadOnlyList<PlanItem>? UpdatedPlan { get; init; }
+
+    /// <summary>Ids in <see cref="UpdatedPlan"/> that this adaptation changed —
+    /// the UI highlights them so the daily change is visible.</summary>
+    public IReadOnlyList<string> ChangedIds { get; init; } = [];
+
+    /// <summary>Impact badges to add/replace on the plan card after the adaptation.</summary>
+    public IReadOnlyList<ImpactItem> ImpactDelta { get; init; } = [];
+
     public string? Note { get; init; }
 }
 
