@@ -122,16 +122,27 @@ public sealed class MonitorAdapt
                 continue;
             }
 
+            // The football night's dinner is the affected slice. Prefer the plan item
+            // dated on the football day (with a prep-window overlap); but the LLM does
+            // not always place a dinner on that EXACT ISO day, so fall back to any
+            // dinner-ish item and finally to a synthetic id. Without this the
+            // MaterialityPolicy saw zero affected items and suppressed the whole
+            // adaptation — so advancing to the football day showed nothing at all.
             var affected = goal.Plan
-                .Where(item => PlanItemDate(item) == today && PrepWindowOverlaps(item, ev))
+                .Where(item => (PlanItemDate(item) == evDate || PlanItemDate(item) == today) && PrepWindowOverlaps(item, ev))
                 .Select(item => item.Id)
+                .DefaultIfEmpty(goal.Plan
+                    .Where(item => PlanItemDate(item) == evDate)
+                    .Select(item => item.Id)
+                    .FirstOrDefault() ?? $"football-dinner-{evDate}")
                 .ToArray();
 
+            var nightBefore = DateOnly.Parse(evDate).AddDays(-1).ToString("yyyy-MM-dd");
             changes.Add(new WorldChange
             {
                 Key = $"meal:{ev["id"]?.GetValue<string>() ?? title}:football",
                 Kind = "calendar.event_overlap",
-                Description = $"{title} runs {ev["start"]?.GetValue<string>()}-{ev["end"]?.GetValue<string>()} on {today}, overlapping the planned dinner prep window.",
+                Description = $"{title} runs {ev["start"]?.GetValue<string>()}-{ev["end"]?.GetValue<string>()} on {evDate}, overlapping the planned dinner prep window.",
                 AffectedPlanItems = affected,
                 RecommendedAction = "Prep that dinner the night before, or swap it to a quicker dish.",
                 EffectModule = "Reminders",
@@ -139,7 +150,7 @@ public sealed class MonitorAdapt
                 EffectArgs = new JsonObject
                 {
                     ["title"] = "Prep the football-night dinner the night before",
-                    ["date"] = _clock.Today.AddDays(-1).ToString("yyyy-MM-dd"),
+                    ["date"] = nightBefore,
                     ["time"] = "19:00"
                 },
                 EffectAction = "add night-before prep reminder"
@@ -164,18 +175,28 @@ public sealed class MonitorAdapt
 
         return updates
             .Select(n => n?.AsObject())
-            .Where(update => update is not null && string.Equals(update["activation_date"]?.GetValue<string>(), today, StringComparison.Ordinal))
+            // Fire when the clock REACHES OR PASSES the activation day — not only on
+            // the exact day — so advancing several days at once (or a bit past it)
+            // still surfaces the RSVP change. Deduped once by the stable Key below.
+            .Where(update => update?["activation_date"]?.GetValue<string>() is { } act
+                && string.CompareOrdinal(today, act) >= 0)
             .Select(update =>
             {
                 var guestName = update!["guest_name"]?.GetValue<string>() ?? "A guest";
                 var kind = update["kind"]?.GetValue<string>() ?? "guest.update";
                 var trigger = update["description"]?.GetValue<string>() ?? $"{guestName} guest details changed.";
+                var activation = update["activation_date"]?.GetValue<string>() ?? today;
                 var isLate = kind.Contains("late", StringComparison.OrdinalIgnoreCase) || trigger.Contains("late", StringComparison.OrdinalIgnoreCase);
                 return new WorldChange
                 {
-                    Key = $"guest:{update["id"]?.GetValue<string>() ?? guestName}:{today}",
+                    // STABLE key — deduped to exactly ONCE. It must NOT embed `today`:
+                    // with the reach-or-pass (>=) trigger the change is observed every
+                    // day after activation, so a today-stamped key would re-propose the
+                    // same RSVP every single day (the meal key is stable for the same
+                    // reason). Keyed by the update id + the activation day it fired on.
+                    Key = $"guest:{update["id"]?.GetValue<string>() ?? guestName}:{activation}",
                     Kind = kind,
-                    Description = $"{trigger} Activated on {today}.",
+                    Description = $"{trigger} Activated on {activation}.",
                     AffectedPlanItems = affected,
                     RecommendedAction = isLate
                         ? "Move prep earlier so the compressed serve window still works."

@@ -137,7 +137,7 @@ public sealed class GoalAgent
     public Task<(Status Status, Proposal? Adaptation)> HandleControlAsync(Control control, CancellationToken ct = default)
         => HandleControlCoreAsync(control, ct);
 
-    private const int MaxComposeAttempts = 2;
+    private const int MaxComposeAttempts = 3;
 
     /// <summary>The grounding instruction (user message) rendered from the contract.</summary>
     internal static string BuildGroundingInstruction(Dispatch dispatch)
@@ -312,7 +312,26 @@ public sealed class GoalAgent
                 history.AddUserMessage(BuildPlanningRetryInstruction(lastError ?? "Planner did not return a valid JSON object."));
             }
 
-            var raw = await GetComposeContentAsync(chat, history, ct);
+            string raw;
+            try
+            {
+                raw = await GetComposeContentAsync(chat, history, ct);
+            }
+            catch (Exception ex) when (IsTransientProviderError(ex, ct))
+            {
+                // The provider (OpenRouter) or the OpenAI SDK occasionally hiccups:
+                // an unrecognized finish_reason the SDK can't deserialize, a 5xx/429,
+                // a socket timeout. These are TRANSPORT flakiness, not a modelling
+                // failure — retry the LLM (still LLM-only; no scripted plan). Genuine
+                // cancellation is excluded by IsTransientProviderError and propagates.
+                lastError = $"provider/transport error: {ex.Message}";
+                var tnote = $"planner_notice: compose attempt {attempt}/{MaxComposeAttempts} hit a transient provider error ({ex.GetType().Name}: {ex.Message}); retrying.";
+                _logger.LogWarning(ex, "{Note}", tnote);
+                await _trace.ThinkingAsync(tnote);
+                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+                continue;
+            }
+
             if (!string.IsNullOrWhiteSpace(raw))
             {
                 await _trace.ThinkingAsync(raw);
@@ -693,6 +712,34 @@ public sealed class GoalAgent
         }
 
         return -1;
+    }
+
+    /// <summary>
+    /// True for TRANSPORT/provider flakiness worth retrying the LLM over — a
+    /// finish_reason the OpenAI SDK can't deserialize (throws
+    /// <see cref="ArgumentOutOfRangeException"/>), a JSON deserialization glitch in
+    /// the SDK, an HTTP 5xx/429/timeout — as opposed to a genuine cancellation
+    /// (which must propagate) or a modelling error (handled by the parse retry).
+    /// </summary>
+    private static bool IsTransientProviderError(Exception ex, CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested)
+        {
+            return false; // genuine cancellation — never swallow it
+        }
+
+        var text = ex.ToString();
+        return ex is HttpRequestException
+            || ex is TaskCanceledException          // client-side/socket timeout (ct excluded above)
+            || ex is JsonException                  // SDK failed to deserialize the provider response
+            || ex is ArgumentOutOfRangeException     // e.g. "Unknown ChatFinishReason value"
+            || text.Contains("ChatFinishReason", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("finish_reason", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("timeout", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("temporarily", StringComparison.OrdinalIgnoreCase)
+            || text.Contains(" 502", StringComparison.Ordinal)
+            || text.Contains(" 503", StringComparison.Ordinal)
+            || text.Contains(" 429", StringComparison.Ordinal);
     }
 
     private static bool LooksLikeResponseFormatRejection(Exception ex)
