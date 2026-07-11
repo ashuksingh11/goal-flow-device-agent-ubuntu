@@ -1,8 +1,11 @@
 {
-  "comment": "GENERIC CLOCK RULE: day_offset is days from 'today' (IClock.Today), resolved to an ISO 'date' by MockWorldStore at read time. This is the DAILY WORLD-CHANGE FEED for the meal-week demo: one believable real-world change per day so the agent visibly monitors the world and re-plans. MonitorAdapt fires each entry when the clock REACHES OR PASSES its day (deduped once by id); GoalAgent runs a scoped LLM re-plan against `context`+`steer` to produce a minimal plan patch. Anchored at plan time, so events land on plan_day+day_offset.",
+  "comment": "PRESENTER-FIRED EVENT FEED for the meal-week demo. day_offset is retained only to resolve each event to the fixed week's target ISO date at snapshot time; it does not decide when an event fires. The UI receives label/title/order as demo_events and sends trigger_event with an event_id. GoalAgent then runs one scoped LLM re-plan against that event's context+steer, deduped once by id.",
   "events": [
     {
       "id": "day1-restock",
+      "label": "Tue",
+      "title": "Groceries arrive",
+      "order": 1,
       "day_offset": 1,
       "kind": "inventory.restocked",
       "summary": "Fresh groceries arrived: 500 g chicken breast and 200 g spinach were added to the fridge.",
@@ -16,6 +19,9 @@
     },
     {
       "id": "day2-shortage",
+      "label": "Wed",
+      "title": "Paneer spoiled",
+      "order": 2,
       "day_offset": 2,
       "kind": "inventory.shortage",
       "summary": "The paneer spoiled early and the family finished the leftover rice.",
@@ -24,6 +30,9 @@
     },
     {
       "id": "day3-football",
+      "label": "Thu",
+      "title": "Football practice",
+      "order": 3,
       "day_offset": 3,
       "kind": "calendar.event_overlap",
       "summary": "Aarav has football practice 18:00-19:30 tonight, overlapping the usual dinner prep window.",
@@ -32,6 +41,9 @@
     },
     {
       "id": "day4-guest",
+      "label": "Fri",
+      "title": "Grandma joins",
+      "order": 4,
       "day_offset": 4,
       "kind": "guest.headcount_added",
       "summary": "Grandma is joining dinner tonight - one extra guest, and she needs a low-sodium meal.",
@@ -40,11 +52,25 @@
     },
     {
       "id": "day5-oven",
+      "label": "Sat",
+      "title": "Oven unavailable",
+      "order": 5,
       "day_offset": 5,
       "kind": "appliance.unavailable",
       "summary": "The oven kicked off a self-clean cycle and is unavailable this evening.",
       "context": { "appliance": "oven", "reason": "self-clean cycle" },
       "steer": "Swap any oven-baked dish tonight to a stovetop or no-cook option."
+    },
+    {
+      "id": "day6-lighter-sunday",
+      "label": "Sun",
+      "title": "Lighter Sunday",
+      "order": 6,
+      "day_offset": 6,
+      "kind": "meal.lighter_requested",
+      "summary": "The family wants a lighter end-of-week dinner after a heavy week.",
+      "context": { "request": "lighter end-of-week dinner", "preference": "light, under 30 min" },
+      "steer": "Swap Sunday's dinner to a lighter dish that cooks in under 30 minutes using in-stock ingredients."
     }
   ]
 }

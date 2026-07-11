@@ -35,8 +35,25 @@ public sealed record PlanReadyPayload
     /// <summary>Headline outcomes for the UI, e.g. {"label":"waste","value":"-2 items"}.</summary>
     public IReadOnlyList<ImpactItem> Impact { get; init; } = [];
 
+    /// <summary>Presenter-fired demo event chips for the meal-plan week.</summary>
+    public IReadOnlyList<DemoEvent>? DemoEvents { get; init; }
+
     /// <summary>One-paragraph natural-language rationale for the plan.</summary>
     public string? Explanation { get; init; }
+}
+
+/// <summary>Small display catalog entry for a presenter-fired demo event.</summary>
+public sealed record DemoEvent
+{
+    public required string Id { get; init; }
+
+    public required string Label { get; init; }
+
+    public required string Title { get; init; }
+
+    public required string Kind { get; init; }
+
+    public int Order { get; init; }
 }
 
 /// <summary>One generic plan step (a dinner, a prep task, an errand, ...).</summary>

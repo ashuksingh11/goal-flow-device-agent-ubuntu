@@ -126,29 +126,53 @@ public sealed class MonitorAdapt
                 continue;
             }
 
-            var id = ev["id"]?.GetValue<string>() ?? evDate;
-            var affected = goal.Plan
-                .Where(item => PlanItemDate(item) == evDate)
-                .Select(item => item.Id)
-                .DefaultIfEmpty($"dinner-{evDate}")
-                .ToArray();
-
-            changes.Add(new WorldChange
-            {
-                // STABLE key — the event fires exactly once even though the feed
-                // keeps returning it every day after its date (dedup in GoalAgent).
-                Key = $"daily:{id}",
-                Kind = ev["kind"]?.GetValue<string>() ?? "world.change",
-                Description = ev["summary"]?.GetValue<string>() ?? "A change occurred in the home.",
-                AffectedPlanItems = affected,
-                RecommendedAction = ev["steer"]?.GetValue<string>(),
-                Steer = ev["steer"]?.GetValue<string>(),
-                Context = ev["context"]?.AsObject()?.DeepClone().AsObject()
-            });
+            changes.Add(BuildDailyEventChange(goal, ev));
         }
 
         return changes;
     }
+
+    public WorldChange BuildDailyEventChange(ActiveGoalContext goal, JsonObject ev)
+    {
+        var evDate = ev["date"]?.GetValue<string>();
+        var id = ev["id"]?.GetValue<string>() ?? evDate ?? "unknown";
+        var affected = goal.Plan
+            .Where(item => PlanItemDate(item) == evDate)
+            .Select(item => item.Id)
+            .DefaultIfEmpty(evDate is null ? "dinner" : $"dinner-{evDate}")
+            .ToArray();
+
+        var change = new WorldChange
+        {
+            // STABLE key — the event fires exactly once even though the feed
+            // keeps returning it every day after its date (dedup in GoalAgent).
+            Key = $"daily:{id}",
+            Kind = ev["kind"]?.GetValue<string>() ?? "world.change",
+            Description = ev["summary"]?.GetValue<string>() ?? "A change occurred in the home.",
+            AffectedPlanItems = affected,
+            RecommendedAction = ev["steer"]?.GetValue<string>(),
+            Steer = ev["steer"]?.GetValue<string>(),
+            Context = ev["context"]?.AsObject()?.DeepClone().AsObject()
+        };
+
+        return change with { Material = _policy.IsMaterial(change) };
+    }
+
+    public IReadOnlyList<DemoEvent> GetDemoEventsCatalog(JsonObject snapshot)
+        => (snapshot["daily_events"]?["events"]?.AsArray() ?? [])
+            .Select(n => n?.AsObject())
+            .OfType<JsonObject>()
+            .Select(ev => new DemoEvent
+            {
+                Id = ev["id"]?.GetValue<string>() ?? "",
+                Label = ev["label"]?.GetValue<string>() ?? "",
+                Title = ev["title"]?.GetValue<string>() ?? "",
+                Kind = ev["kind"]?.GetValue<string>() ?? "world.change",
+                Order = ev["order"]?.GetValue<int>() ?? int.MaxValue
+            })
+            .Where(ev => ev.Id.Length > 0)
+            .OrderBy(ev => ev.Order)
+            .ToArray();
 
     private async Task<JsonObject> LoadDailyEventsAsync(CancellationToken ct)
     {
@@ -297,6 +321,7 @@ public sealed class MaterialityPolicy
             "inventory.shortage" => true,
             "guest.headcount_added" => true,
             "appliance.unavailable" => true,
+            "meal.lighter_requested" => true,
             _ => false
         };
 }

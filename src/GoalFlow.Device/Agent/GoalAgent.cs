@@ -284,6 +284,11 @@ public sealed class GoalAgent
             await _trace.PlanProgressAsync(item);
         }
 
+        var worldSnapshot = await _monitor.CaptureSnapshotAsync(ct);
+        var demoEvents = dispatch.Domain == "meal_plan"
+            ? _monitor.GetDemoEventsCatalog(worldSnapshot)
+            : null;
+
         var ready = new PlanReady
         {
             GoalId = dispatch.GoalId,
@@ -295,6 +300,7 @@ public sealed class GoalAgent
                 Proposals = proposals,
                 Safety = new SafetyVerdict { Gate = _safety.Gate, Violations = _safety.Violations.ToArray() },
                 Impact = modelPlan.Impact,
+                DemoEvents = demoEvents,
                 Explanation = modelPlan.Explanation
             }
         };
@@ -304,7 +310,7 @@ public sealed class GoalAgent
         {
             Dispatch = dispatch,
             Plan = modelPlan.Plan,
-            WorldSnapshot = await _monitor.CaptureSnapshotAsync(ct)
+            WorldSnapshot = worldSnapshot
         };
         _logger.LogInformation("plan_ready items={ItemCount} proposals={ProposalCount} safety={Safety}", ready.Payload.Plan.Count, ready.Payload.Proposals.Count, ready.Payload.Safety.Gate);
         return ready;
@@ -427,7 +433,7 @@ public sealed class GoalAgent
         use a new id only to ADD a step. Honor the steer.
         """;
 
-    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, ActiveGoalContext active, WorldChange change, CancellationToken ct)
+    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, ActiveGoalContext active, WorldChange change, CancellationToken ct, string? eventId = null)
     {
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
         var history = new ChatHistory();
@@ -493,6 +499,7 @@ public sealed class GoalAgent
                 Action = change.RecommendedAction ?? "adapt the plan",
                 Detail = patch.Rationale,
                 Trigger = change.Description,
+                EventId = eventId,
                 Tier = ApprovalTiers.Adapt,
                 RequiresApproval = true,
                 Patch = patch
@@ -680,6 +687,92 @@ public sealed class GoalAgent
         using var scope = _trace.BeginGoalScope(control.GoalId, correlationId);
         await _trace.PhaseAsync("monitoring");
 
+        if (control.Command == ControlCommands.TriggerEvent)
+        {
+            var eventId = control.Payload?.EventId ?? control.EventId;
+            if (!_activeGoals.TryGetValue(control.GoalId, out var activeGoal))
+            {
+                var noGoalStatus = BuildMonitoringStatus(
+                    control.GoalId,
+                    correlationId,
+                    false,
+                    "control trigger_event applied; no active goal is being monitored",
+                    eventId);
+                await _trace.ThinkingAsync(noGoalStatus.Payload.Note ?? "");
+                return (noGoalStatus, null);
+            }
+
+            if (string.IsNullOrWhiteSpace(eventId))
+            {
+                var missingStatus = BuildMonitoringStatus(
+                    control.GoalId,
+                    activeGoal.Dispatch.CorrelationId,
+                    false,
+                    "trigger_event missing event_id",
+                    eventId);
+                await _trace.ThinkingAsync(missingStatus.Payload.Note ?? "");
+                return (missingStatus, null);
+            }
+
+            var ev = activeGoal.WorldSnapshot["daily_events"]?["events"]?.AsArray()
+                .Select(n => n?.AsObject())
+                .OfType<JsonObject>()
+                .FirstOrDefault(e => string.Equals(e["id"]?.GetValue<string>(), eventId, StringComparison.Ordinal));
+
+            if (ev is null)
+            {
+                var unknownStatus = BuildMonitoringStatus(
+                    control.GoalId,
+                    activeGoal.Dispatch.CorrelationId,
+                    false,
+                    $"unknown event {eventId}",
+                    eventId);
+                await _trace.ThinkingAsync(unknownStatus.Payload.Note ?? "");
+                return (unknownStatus, null);
+            }
+
+            var change = _monitor.BuildDailyEventChange(activeGoal, ev);
+            if (!activeGoal.EmittedMaterialChanges.Add(change.Key))
+            {
+                var replayStatus = BuildMonitoringStatus(
+                    control.GoalId,
+                    activeGoal.Dispatch.CorrelationId,
+                    false,
+                    "event already applied",
+                    eventId);
+                await _trace.ThinkingAsync(replayStatus.Payload.Note ?? "");
+                return (replayStatus, null);
+            }
+
+            if (!change.Material)
+            {
+                var nonMaterialStatus = BuildMonitoringStatus(
+                    control.GoalId,
+                    activeGoal.Dispatch.CorrelationId,
+                    false,
+                    $"event {eventId} is not material",
+                    eventId);
+                await _trace.ThinkingAsync(nonMaterialStatus.Payload.Note ?? "");
+                return (nonMaterialStatus, null);
+            }
+
+            await _trace.ThinkingAsync($"material event triggered: {change.Description}");
+            await _trace.PhaseAsync("adapting");
+            var proposal = await ProposeDailyAdaptationAsync(control.GoalId, activeGoal, change, ct, eventId);
+            if (proposal is not null)
+            {
+                proposal = proposal with { CorrelationId = activeGoal.Dispatch.CorrelationId };
+            }
+
+            var status = BuildMonitoringStatus(
+                control.GoalId,
+                activeGoal.Dispatch.CorrelationId,
+                true,
+                $"material: {change.Description}",
+                eventId);
+            return (status, proposal);
+        }
+
         if (_clock is SimulatedClock sim)
         {
             if (control.Command == ControlCommands.SetDate && control.Payload?.Date is { } date)
@@ -758,7 +851,7 @@ public sealed class GoalAgent
         return (quietStatus, null);
     }
 
-    private Status BuildMonitoringStatus(string goalId, string? correlationId, bool material, string note)
+    private Status BuildMonitoringStatus(string goalId, string? correlationId, bool material, string note, string? eventId = null)
         => new()
         {
             GoalId = goalId,
@@ -768,6 +861,7 @@ public sealed class GoalAgent
             {
                 Day = _clock.Today.DayOfWeek.ToString()[..3],
                 SimDate = _clock.Today.ToString("yyyy-MM-dd"),
+                EventId = eventId,
                 Material = material,
                 Note = note
             }

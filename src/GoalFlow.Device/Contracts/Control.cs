@@ -15,6 +15,9 @@ public sealed record Control
     /// <summary>One of <see cref="ControlCommands"/>.</summary>
     public required string Command { get; init; }
 
+    /// <summary>Optional direct event id echo/fallback; normal wire shape carries this in <see cref="Payload"/>.</summary>
+    public string? EventId { get; init; }
+
     public ControlPayload? Payload { get; init; }
 }
 
@@ -22,6 +25,9 @@ public sealed record ControlPayload
 {
     /// <summary>ISO date for <see cref="ControlCommands.SetDate"/>.</summary>
     public string? Date { get; init; }
+
+    /// <summary>Daily demo event id for <see cref="ControlCommands.TriggerEvent"/>.</summary>
+    public string? EventId { get; init; }
 }
 
 public static class ControlCommands
@@ -29,4 +35,5 @@ public static class ControlCommands
     public const string AdvanceDay = "advance_day";
     public const string Reset = "reset";
     public const string SetDate = "set_date";
+    public const string TriggerEvent = "trigger_event";
 }

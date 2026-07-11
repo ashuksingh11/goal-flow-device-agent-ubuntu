@@ -26,6 +26,9 @@ public sealed record StatusPayload
     /// <summary>Current clock date (ISO) — real today, or the simulated date after set_date/advance_day.</summary>
     public string? SimDate { get; init; }
 
+    /// <summary>Presenter-fired demo event id that produced this status, when applicable.</summary>
+    public string? EventId { get; init; }
+
     /// <summary>Whether the last observed world change was material (triggered adaptation).</summary>
     public bool Material { get; init; }
 

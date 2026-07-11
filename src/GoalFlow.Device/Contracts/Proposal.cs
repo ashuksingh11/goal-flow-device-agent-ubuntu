@@ -33,6 +33,9 @@ public sealed record AdaptationPayload
     /// <summary>The material world change that triggered this, e.g. "spinach expired".</summary>
     public required string Trigger { get; init; }
 
+    /// <summary>Presenter-fired demo event id that produced this proposal, when applicable.</summary>
+    public string? EventId { get; init; }
+
     /// <summary>See <see cref="ApprovalTiers"/>.</summary>
     public required string Tier { get; init; }
 
