@@ -146,6 +146,20 @@ implementations — `SystemClock` (real date; the default) and `SimulatedClock`
 `IClock.Today` at read time, so the seed world is always "this week"
 (see `data/README.md`).
 
+## The event-driven meal demo (`control: trigger_event`)
+
+Alongside the clock-driven sustain loop, `plan_ready.payload.demo_events`
+(built from `data/daily_events.json`) advertises a small catalog of
+presenter-fired events for the `meal_plan` domain (a restock, a spoiled
+ingredient, a calendar clash, a guest, an unavailable appliance, a
+"lighter dinner" request), each tied to a plan item's `day`. Firing one sends
+`control: trigger_event { event_id }`; `GoalAgent.HandleControlCoreAsync`
+handles it *before* any clock stepping (the clock stays frozen for this
+path), looks up the event, checks it hasn't already fired, and — if material —
+runs one scoped LLM re-plan against just that event's `context` + `steer`,
+returning a minimal `PlanPatch` as an adaptation `proposal` through the same
+approval → actuation path as the sustain loop.
+
 ## Capability registry & the capabilities message
 
 `CapabilityRegistry` builds the `capabilities` advertisement by *discovery*:

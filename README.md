@@ -43,6 +43,15 @@ Key invariants:
   hub; the device opens one outbound `ClientWebSocket` and streams
   `agent_event` frames (phase / thinking / tool_call / tool_result /
   plan_progress) so the UI can watch it think.
+- **Event-driven meal demo.** `plan_ready.payload.demo_events` (from
+  `data/daily_events.json`) advertises a small catalog of presenter-fired
+  events as UI chips (restock, a spoiled ingredient, a calendar clash, a
+  guest, an unavailable appliance, a "lighter dinner" request). Firing one
+  sends `control: trigger_event { event_id }`; `GoalAgent.HandleControlCoreAsync`
+  looks up the event, checks materiality, and — if material and not already
+  applied — runs one **scoped** LLM re-plan against just that event's
+  `context` + `steer` (the clock does not move), returning an adaptation
+  `proposal` (a minimal `PlanPatch`) the same way the sustain loop does.
 
 ## Build & run
 

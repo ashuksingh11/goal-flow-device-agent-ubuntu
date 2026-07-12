@@ -18,6 +18,7 @@ GoalFlow.Device.sln / GoalFlow.Device.csproj   # sln builds src/; root csproj le
 data/                                # mock world — ALL dates are day offsets (data/README.md)
   inventory.json calendar.json recipes.json shopping_list.json reminders.json
   guests.json appliances.json
+  daily_events.json                  # presenter-fired event catalog for control: trigger_event
   sample-contract.json               # meal_plan dispatch (${today+N} tokens)
   sample-contract-guest.json         # guest_dinner dispatch
   sample-approval.json
@@ -153,6 +154,28 @@ After a plan is out, `control: advance_day` (or `set_date`) frames drive
    → actuation path as plan proposals.
 
 `--simulate-week` and `--simulate-guest` are exactly this loop, headless.
+
+### The event-driven meal demo (`control: trigger_event`)
+
+A presenter-fired sibling of the clock-driven loop above, scoped to
+`meal_plan`. `PlanReadyPayload.DemoEvents` (built by
+`MonitorAdapt.GetDemoEventsCatalog` from `data/daily_events.json`) ships a
+catalog of 6 events as UI chips — each with a `day` (targets a `PlanItem.Day`),
+`kind`, `summary`, `context`, and `steer`. Firing a chip sends
+`control: trigger_event { event_id }`, handled by
+`GoalAgent.HandleControlCoreAsync` *before* any clock stepping (the clock is
+frozen for this path — `set_date`/`advance_day` handling only runs after the
+`trigger_event` branch returns):
+
+1. Looks up the event by id in the active goal's world snapshot; missing/
+   unknown/already-applied (`EmittedMaterialChanges`) ids short-circuit with a
+   `material: false` status.
+2. `MonitorAdapt.BuildDailyEventChange` turns it into a `WorldChange`;
+   `ProposeDailyAdaptationAsync` runs the same **scoped** LLM re-plan as the
+   sustain loop, but seeded with just that event's `context` + `steer` against
+   the plan item for its `day` — not the whole week.
+3. Returns a `status` (material change note) plus an adaptation `proposal`
+   (a minimal `PlanPatch`) that rides the normal approval → actuation path.
 
 ## Capability vs steering — the harnesses as real primitives
 
