@@ -182,7 +182,7 @@ public sealed class GoalAgent
           Appliance.Defrost args {"item":"...","atTime":"YYYY-MM-DDTHH:mm"}
           Reminders.Create args {"title":"...","date":"YYYY-MM-DD","time":"HH:mm"}
         - Do not invent proposal functions such as Appliance.Preheat, Reminders.Add, or Reminder.Create.
-        - For meal_plan goals, produce exactly ONE dinner plan item per DAY for EVERY date in the contract time_window, inclusive of both start and end dates, with no gaps and no extra days. Set each plan item's "when" to that date in YYYY-MM-DD format, so a 7-day window yields 7 dinner items and a 5-day window yields 5.
+        - For meal_plan goals, produce EXACTLY 7 dinner plan items for a one-week plan — Day 1 through Day 7 — no more and no fewer. Do not tie the count to any dates.
         - For guest_dinner, include a menu that honors guest dietary constraints, a prep timeline whose plan item "when" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders.
         - For guest_dinner appliance prep, prefer concrete proposals when grounded appliances support them: Appliance.PreheatOven before an oven-warmed dish, Appliance.RunProgram for dishwasher cleanup before quiet_hours, and Appliance.Defrost only when a frozen item needs thawing.
         - Do not propose ingredients or recipes that violate hard constraints.
@@ -675,7 +675,7 @@ public sealed class GoalAgent
     }
 
     private static IReadOnlyList<PlanItem> AssignPlanDays(IReadOnlyList<PlanItem> plan)
-        => plan.Select((item, index) => item with { Day = index + 1 }).ToArray();
+        => plan.Take(7).Select((item, index) => item with { Day = index + 1 }).ToArray();
 
     private async Task<Status> ApplyApprovalCoreAsync(Approval approval, CancellationToken ct)
     {
