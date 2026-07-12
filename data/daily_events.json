@@ -6,6 +6,7 @@
       "label": "Tue",
       "title": "Groceries arrive",
       "order": 1,
+      "day": 1,
       "day_offset": 1,
       "kind": "inventory.restocked",
       "summary": "Fresh groceries arrived: 500 g chicken breast and 200 g spinach were added to the fridge.",
@@ -15,62 +16,67 @@
           { "name": "spinach", "quantity": 200, "unit": "g", "expires_in_days": 2 }
         ]
       },
-      "steer": "New stock is on hand. Pull the spinach forward so it is used before it expires, and drop items now in stock from the shopping list."
+      "steer": "Change the Day 1 dinner to use the spinach before it expires, and drop items now in stock from the shopping list."
     },
     {
       "id": "day2-shortage",
       "label": "Wed",
       "title": "Paneer spoiled",
       "order": 2,
+      "day": 2,
       "day_offset": 2,
       "kind": "inventory.shortage",
       "summary": "The paneer spoiled early and the family finished the leftover rice.",
       "context": { "unavailable": ["paneer", "rice"] },
-      "steer": "Swap any dish that relied on paneer or rice to something using in-stock ingredients, and add a sensible replacement to the shopping list."
+      "steer": "Change the Day 2 dinner if it relied on paneer or rice, using in-stock ingredients, and add a sensible replacement to the shopping list."
     },
     {
       "id": "day3-football",
       "label": "Thu",
       "title": "Football practice",
       "order": 3,
+      "day": 3,
       "day_offset": 3,
       "kind": "calendar.event_overlap",
       "summary": "Aarav has football practice 18:00-19:30 tonight, overlapping the usual dinner prep window.",
       "context": { "event": "football practice", "start": "18:00", "end": "19:30" },
-      "steer": "Prep tonight's dinner earlier (or the night before), or swap it to a quicker dish that fits the compressed window."
+      "steer": "Change the Day 3 dinner plan so prep happens earlier, or swap it to a quicker dish that fits the compressed window."
     },
     {
       "id": "day4-guest",
       "label": "Fri",
       "title": "Grandma joins",
       "order": 4,
+      "day": 4,
       "day_offset": 4,
       "kind": "guest.headcount_added",
       "summary": "Grandma is joining dinner tonight - one extra guest, and she needs a low-sodium meal.",
       "context": { "extra_guests": 1, "constraint": "low-sodium" },
-      "steer": "Scale tonight's portions for one more person and keep the dish low-sodium."
+      "steer": "Scale the Day 4 dinner for one more person and keep it low-sodium."
     },
     {
       "id": "day5-oven",
       "label": "Sat",
       "title": "Oven unavailable",
       "order": 5,
+      "day": 5,
       "day_offset": 5,
       "kind": "appliance.unavailable",
       "summary": "The oven kicked off a self-clean cycle and is unavailable this evening.",
       "context": { "appliance": "oven", "reason": "self-clean cycle" },
-      "steer": "Swap any oven-baked dish tonight to a stovetop or no-cook option."
+      "steer": "Swap the Day 5 dinner if it is oven-baked, using a stovetop or no-cook option."
     },
     {
       "id": "day6-lighter-sunday",
       "label": "Sun",
       "title": "Lighter Sunday",
       "order": 6,
+      "day": 6,
       "day_offset": 6,
       "kind": "meal.lighter_requested",
       "summary": "The family wants a lighter end-of-week dinner after a heavy week.",
       "context": { "request": "lighter end-of-week dinner", "preference": "light, under 30 min" },
-      "steer": "Swap Sunday's dinner to a lighter dish that cooks in under 30 minutes using in-stock ingredients."
+      "steer": "Swap the Day 6 dinner to a lighter dish that cooks in under 30 minutes using in-stock ingredients."
     }
   ]
 }

@@ -47,6 +47,8 @@ public sealed record DemoEvent
 {
     public required string Id { get; init; }
 
+    public int Day { get; init; }
+
     public required string Label { get; init; }
 
     public required string Title { get; init; }
@@ -61,6 +63,9 @@ public sealed record PlanItem
 {
     /// <summary>Stable id within the plan, e.g. "s1".</summary>
     public required string Id { get; init; }
+
+    /// <summary>Stable 1-based plan-day index; the source of truth for meal-week ordering.</summary>
+    public int Day { get; init; }
 
     public required string Title { get; init; }
 

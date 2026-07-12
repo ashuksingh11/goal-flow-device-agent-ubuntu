@@ -267,6 +267,7 @@ public sealed class GoalAgent
 
         await _trace.PhaseAsync("planning");
         var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
+        modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan) };
 
         await _trace.PhaseAsync("checking");
         // Collapse duplicate proposals the model sometimes emits (e.g. the same
@@ -424,7 +425,7 @@ public sealed class GoalAgent
         plan — do not rewrite rows the change doesn't touch. Reply with a MINIMAL
         JSON patch and nothing else (no prose, no Markdown, no code fence):
         {
-          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "title": "...", "detail": "...", "when": "YYYY-MM-DD", "why": ["short reason"] } ],
+          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "day": 1, "title": "...", "detail": "...", "when": "YYYY-MM-DD", "why": ["short reason"] } ],
           "remove": ["<id to drop>"],
           "impact_delta": [ { "label": "waste", "value": "-2 items" } ],
           "rationale": "one sentence explaining the change"
@@ -454,7 +455,7 @@ public sealed class GoalAgent
 
             if (TryParsePlanPatch(raw, out var parsedPatch, out var error) && (parsedPatch.Upsert.Count > 0 || parsedPatch.Remove.Count > 0))
             {
-                patch = parsedPatch;
+                patch = NormalizeAdaptationPatch(active.Plan, change, parsedPatch);
                 break;
             }
 
@@ -510,18 +511,66 @@ public sealed class GoalAgent
     private static string BuildAdaptInstruction(IReadOnlyList<PlanItem> plan, WorldChange change)
     {
         var planLines = string.Join("\n", plan.Select(p =>
-            $"- {p.Id} | {p.When ?? "n/a"} | {p.Title}{(p.Detail is null ? "" : " — " + p.Detail)}"));
+            $"- Day {p.Day} | {p.Id} | {p.Title}{(p.Detail is null ? "" : " — " + p.Detail)}"));
         var context = change.Context is null ? "" : $"\nDetails: {change.Context.ToJsonString()}";
+        var targetDay = change.TargetDay?.ToString() ?? "the affected";
+        var targetId = change.TargetItemId ?? change.AffectedPlanItems.FirstOrDefault() ?? "the affected row id";
+        var targetTitle = change.TargetTitle ?? "unknown";
         return $"""
-            CURRENT PLAN (id | date | title):
+            CURRENT PLAN (day | id | title):
             {planLines}
 
             WORLD CHANGE: {change.Description}{context}
             HOW TO ADAPT: {change.Steer}
 
-            Return the minimal JSON patch for the affected row(s) only.
+            The Day {targetDay} dinner is currently '{targetTitle}' (id={targetId}).
+            Change ONLY the Day {targetDay} dinner to honor the world change and steer.
+            Return a patch whose `upsert` REUSES the exact id `{targetId}` so it replaces that row.
+            Do not change, remove, reorder, or retitle any other day.
             """;
     }
+
+    private static PlanPatch NormalizeAdaptationPatch(IReadOnlyList<PlanItem> plan, WorldChange change, PlanPatch patch)
+    {
+        if (change.TargetItemId is null || patch.Upsert.Count == 0)
+        {
+            return patch with { Upsert = AssignPatchDays(plan, patch.Upsert) };
+        }
+
+        var target = plan.FirstOrDefault(item => string.Equals(item.Id, change.TargetItemId, StringComparison.Ordinal));
+        if (target is null)
+        {
+            return patch with { Upsert = AssignPatchDays(plan, patch.Upsert) };
+        }
+
+        var targetDay = target.Day > 0 ? target.Day : change.TargetDay ?? 0;
+        var upsert = patch.Upsert
+            .Take(1)
+            .Select(row => row with
+            {
+                Id = target.Id,
+                Day = targetDay
+            })
+            .ToArray();
+
+        return patch with
+        {
+            Upsert = upsert,
+            Remove = []
+        };
+    }
+
+    private static IReadOnlyList<PlanItem> AssignPatchDays(IReadOnlyList<PlanItem> plan, IReadOnlyList<PlanItem> upsert)
+        => upsert.Select(row =>
+        {
+            var existing = plan.FirstOrDefault(item => string.Equals(item.Id, row.Id, StringComparison.Ordinal));
+            if (row.Day > 0 || existing is null)
+            {
+                return row;
+            }
+
+            return row with { Day = existing.Day };
+        }).ToArray();
 
     private async Task<string> GetAdaptContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
     {
@@ -604,11 +653,17 @@ public sealed class GoalAgent
         }
         foreach (var row in patch.Upsert)
         {
+            var next = row;
             if (!byId.ContainsKey(row.Id))
             {
                 order.Add(row.Id);
+                next = next.Day > 0 ? next : next with { Day = order.Count };
             }
-            byId[row.Id] = row;
+            else if (next.Day <= 0)
+            {
+                next = next with { Day = byId[row.Id].Day };
+            }
+            byId[row.Id] = next;
             if (!changed.Contains(row.Id))
             {
                 changed.Add(row.Id);
@@ -618,6 +673,9 @@ public sealed class GoalAgent
         var ordered = order.Where(byId.ContainsKey).Select(id => byId[id]).ToArray();
         return (ordered, changed);
     }
+
+    private static IReadOnlyList<PlanItem> AssignPlanDays(IReadOnlyList<PlanItem> plan)
+        => plan.Select((item, index) => item with { Day = index + 1 }).ToArray();
 
     private async Task<Status> ApplyApprovalCoreAsync(Approval approval, CancellationToken ct)
     {

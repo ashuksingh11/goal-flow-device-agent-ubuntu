@@ -107,7 +107,7 @@ public sealed class MonitorAdapt
     /// Meal-week changes come from the DAILY WORLD-CHANGE FEED (data/daily_events.json):
     /// one curated, believable real-world change per day (fridge restock, an item
     /// running out, a calendar clash, an extra guest, an appliance going down). Each
-    /// fires when the clock REACHES OR PASSES its day (deduped once by id). The
+    /// targets a deterministic Day N plan item (deduped once by id). The
     /// materiality is curated — every feed entry matters — and GoalAgent runs a
     /// scoped LLM re-plan against the entry's `context`/`steer` to patch the plan.
     /// </summary>
@@ -136,11 +136,21 @@ public sealed class MonitorAdapt
     {
         var evDate = ev["date"]?.GetValue<string>();
         var id = ev["id"]?.GetValue<string>() ?? evDate ?? "unknown";
-        var affected = goal.Plan
-            .Where(item => PlanItemDate(item) == evDate)
-            .Select(item => item.Id)
-            .DefaultIfEmpty(evDate is null ? "dinner" : $"dinner-{evDate}")
-            .ToArray();
+        var requestedDay = ev["day"]?.GetValue<int>() ?? 1;
+        var targetItem = FindTargetPlanItem(goal.Plan, requestedDay);
+        var targetDay = targetItem?.Day > 0
+            ? targetItem.Day
+            : Math.Max(1, Math.Min(requestedDay, goal.Plan.Count));
+        var affected = targetItem is null ? ["dinner"] : new[] { targetItem.Id };
+        var summary = ev["summary"]?.GetValue<string>() ?? "A change occurred in the home.";
+        var context = ev["context"]?.AsObject()?.DeepClone().AsObject();
+        context ??= new JsonObject();
+        context["target_day"] = targetDay;
+        if (targetItem is not null)
+        {
+            context["target_item_id"] = targetItem.Id;
+            context["target_title"] = targetItem.Title;
+        }
 
         var change = new WorldChange
         {
@@ -148,11 +158,14 @@ public sealed class MonitorAdapt
             // keeps returning it every day after its date (dedup in GoalAgent).
             Key = $"daily:{id}",
             Kind = ev["kind"]?.GetValue<string>() ?? "world.change",
-            Description = ev["summary"]?.GetValue<string>() ?? "A change occurred in the home.",
+            Description = $"Day {targetDay} - {summary}",
             AffectedPlanItems = affected,
+            TargetDay = targetDay,
+            TargetItemId = targetItem?.Id,
+            TargetTitle = targetItem?.Title,
             RecommendedAction = ev["steer"]?.GetValue<string>(),
             Steer = ev["steer"]?.GetValue<string>(),
-            Context = ev["context"]?.AsObject()?.DeepClone().AsObject()
+            Context = context
         };
 
         return change with { Material = _policy.IsMaterial(change) };
@@ -165,6 +178,7 @@ public sealed class MonitorAdapt
             .Select(ev => new DemoEvent
             {
                 Id = ev["id"]?.GetValue<string>() ?? "",
+                Day = ev["day"]?.GetValue<int>() ?? ev["order"]?.GetValue<int>() ?? 0,
                 Label = ev["label"]?.GetValue<string>() ?? "",
                 Title = ev["title"]?.GetValue<string>() ?? "",
                 Kind = ev["kind"]?.GetValue<string>() ?? "world.change",
@@ -173,6 +187,16 @@ public sealed class MonitorAdapt
             .Where(ev => ev.Id.Length > 0)
             .OrderBy(ev => ev.Order)
             .ToArray();
+
+    private static PlanItem? FindTargetPlanItem(IReadOnlyList<PlanItem> plan, int requestedDay)
+    {
+        if (plan.Count == 0)
+        {
+            return null;
+        }
+
+        return plan.FirstOrDefault(item => item.Day == requestedDay) ?? plan[^1];
+    }
 
     private async Task<JsonObject> LoadDailyEventsAsync(CancellationToken ct)
     {
@@ -339,6 +363,15 @@ public sealed record WorldChange
 
     /// <summary>Plan-item ids this change touches (the re-plan slice).</summary>
     public IReadOnlyList<string> AffectedPlanItems { get; init; } = [];
+
+    /// <summary>Stable plan-day index targeted by a meal-week event.</summary>
+    public int? TargetDay { get; init; }
+
+    /// <summary>Exact plan item id targeted by a meal-week event.</summary>
+    public string? TargetItemId { get; init; }
+
+    /// <summary>Current title of the targeted plan item when the change was built.</summary>
+    public string? TargetTitle { get; init; }
 
     /// <summary>Filled by the materiality policy.</summary>
     public bool Material { get; init; }
