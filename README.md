@@ -58,26 +58,34 @@ Key invariants:
 Requires the .NET 8 SDK and OpenRouter credentials (planning is LLM-only, so
 `OPENROUTER_API_KEY` is always required — see Environment below).
 
+**Always pass `--project GoalFlow.Device.csproj`** — a bare `dotnet run --no-build`
+from the repo root can execute a stale binary (the root csproj and the sln use
+different output paths). For the **full three-service demo** (cloud + device + UI),
+follow `goal-flow-agents/docs/FINAL_DEMO.md` — the single source of truth for run
+commands; the commands below are for driving the device on its own.
+
 ```bash
-dotnet build GoalFlow.Device.sln
+dotnet build GoalFlow.Device.csproj
 
 # One-shot plan from a natural-language goal (local dispatch is synthesized):
-dotnet run -- --goal "help us eat healthier this week" [--domain meal_plan]
+dotnet run --project GoalFlow.Device.csproj -- --goal "help us eat healthier this week" [--domain meal_plan]
 
 # One-shot plan from a Task Contract file (plan_ready JSON on stdout):
-dotnet run -- --contract data/sample-contract.json
-dotnet run -- --contract data/sample-contract-guest.json
+dotnet run --project GoalFlow.Device.csproj -- --contract data/sample-contract.json
+dotnet run --project GoalFlow.Device.csproj -- --contract data/sample-contract-guest.json
 
 # ... optionally apply (and replay) an approval afterwards:
-dotnet run -- --contract data/sample-contract.json --approval data/sample-approval.json
+dotnet run --project GoalFlow.Device.csproj -- --contract data/sample-contract.json --approval data/sample-approval.json
 
-# Live session: connect the outbound WebSocket to a running cloud hub:
-dotnet run -- --connect ws://localhost:8787/ws
+# Live session: dial a running cloud hub. Bare --connect defaults to
+# ws://localhost:8000/ws; pass a URL (or set $WS_URL) for a remote cloud:
+dotnet run --project GoalFlow.Device.csproj -- --connect
+dotnet run --project GoalFlow.Device.csproj -- --connect ws://<cloud-ip>:8000/ws
 
 # Headless sustain demos (plan, then advance days; adaptation on the material day).
 # Both run on a temp copy of data/ so the seed world is never dirtied:
-dotnet run -- --simulate-week    # meal_plan: 5 weekday ticks
-dotnet run -- --simulate-guest   # guest_dinner: 2 ticks to the RSVP/late-arrival trigger
+dotnet run --project GoalFlow.Device.csproj -- --simulate-week    # meal_plan: 5 weekday ticks
+dotnet run --project GoalFlow.Device.csproj -- --simulate-guest   # guest_dinner: 2 ticks to the RSVP/late-arrival trigger
 
 # Extras: [--date 2026-07-14] start a SimulatedClock there; [--data ./data]; [--verbose]
 ```

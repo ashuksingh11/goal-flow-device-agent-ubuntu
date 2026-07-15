@@ -250,13 +250,14 @@ The agent, filters, and contracts don't change.
 
 ## Run & verify
 
+# Full-stack demo commands live in goal-flow-agents/docs/FINAL_DEMO.md. Driving the device alone:
 ```bash
-dotnet build GoalFlow.Device.sln
-dotnet run -- --contract data/sample-contract.json          # plan_ready: plan + tiered proposals + safety verdict
-dotnet run -- --contract data/sample-contract.json --approval data/sample-approval.json   # execute + idempotent replay
-dotnet run -- --simulate-week                               # meal sustain: quiet days + the material day
-dotnet run -- --simulate-guest                              # guest sustain: RSVP/late-arrival adaptation
-dotnet run -- --connect ws://localhost:8787/ws              # attach to a running cloud hub
+dotnet build GoalFlow.Device.csproj
+dotnet run --project GoalFlow.Device.csproj -- --contract data/sample-contract.json          # plan_ready: plan + tiered proposals + safety verdict
+dotnet run --project GoalFlow.Device.csproj -- --contract data/sample-contract.json --approval data/sample-approval.json   # execute + idempotent replay
+dotnet run --project GoalFlow.Device.csproj -- --simulate-week                               # meal sustain: quiet days + the material day
+dotnet run --project GoalFlow.Device.csproj -- --simulate-guest                              # guest sustain: RSVP/late-arrival adaptation
+dotnet run --project GoalFlow.Device.csproj -- --connect                                     # attach to a cloud hub (defaults to ws://localhost:8000/ws)
 ```
 
 Requires `OPENROUTER_API_KEY` (see README — planning is LLM-only). Frames on
