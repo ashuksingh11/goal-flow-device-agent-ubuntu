@@ -16,10 +16,15 @@ Siblings under `~/ashu/git/`: `goal-flow-cloud-agent` (Python hub, owns the cano
 (frozen port — see its AGENTS.md). This repo's C# `Contracts/*.cs` MIRROR the cloud's
 `CONTRACT.md`.
 
-**Tizen sync status:** `Contracts/Hello.cs` and `Transport/WsClient.cs` are the
-byte-identical shared core with the tizen repo (a plain copy). The multi-session
-`device_id`/`device_name` change (below) landed HERE ONLY — the tizen repo now
-DIVERGES on these two files until it is re-synced.
+**Tizen sync status: IN SYNC** (re-synced 2026-07-16 after the multi-session
+`device_id`/`device_name` change). This repo is the SOURCE OF TRUTH for the portable
+core (`Agent/`, `Contracts/`, `Modules/`, `Transport/`); the tizen repo holds a
+byte-identical copy. Re-sync = plain copy of those four dirs + a `dotnet build`, then
+verify with `diff -rq <dir> ../goal-flow-device-agent-tizen/<dir>` (must be empty).
+NEVER copy the host files — each platform owns its own (`Program.cs` here;
+`Program.cs`/`DeviceHost.cs`/`DeviceConfig.cs`/`DlogLogger.cs`/`AssemblyResolver.cs`/
+`UiChannel.cs` there). A core change that needs host wiring (like `device_id`) must be
+wired separately in each host.
 
 ## Stack & run
 
