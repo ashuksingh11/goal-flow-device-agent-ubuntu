@@ -1,4 +1,88 @@
 {
   "comment": "Shopping list has no dates. Empty at seed; ShoppingListPlugin.Add persists here.",
-  "items": []
+  "items": [
+    {
+      "name": "bell peppers",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "chickpeas",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "lentils",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "bread",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "pasta",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "tofu",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "zucchini",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "garlic",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "ginger",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "black beans",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "cheddar cheese",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "olive oil",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "cumin",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "turmeric",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "coriander",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    },
+    {
+      "name": "paprika",
+      "reason": "ingredients needed for planned recipes",
+      "added_on": "2026-07-12"
+    }
+  ],
+  "ordered": true,
+  "ordered_on": "2026-07-14",
+  "estimated_total": 78.4
 }

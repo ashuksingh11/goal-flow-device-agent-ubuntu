@@ -20,15 +20,19 @@ public sealed class WsClient : IAsyncDisposable
 {
     private readonly Uri _endpoint;
     private readonly ILogger<WsClient> _logger;
+    private readonly string _deviceId;
+    private readonly string _deviceName;
     private ClientWebSocket? _socket;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly HashSet<string> _seenCorrelations = [];
     private CapabilitiesMessage? _capabilities;
 
-    public WsClient(Uri endpoint, ILogger<WsClient> logger)
+    public WsClient(Uri endpoint, ILogger<WsClient> logger, string deviceId = "", string deviceName = "")
     {
         _endpoint = endpoint;
         _logger = logger;
+        _deviceId = deviceId;
+        _deviceName = deviceName;
     }
 
     /// <summary>Raised for each inbound frame, keyed by its <c>type</c> discriminator.</summary>
@@ -102,7 +106,7 @@ public sealed class WsClient : IAsyncDisposable
         _socket = new ClientWebSocket();
         await _socket.ConnectAsync(_endpoint, ct);
         _logger.LogInformation("ws_connected {Endpoint}", _endpoint);
-        await SendAsync(new Hello(), ct);
+        await SendAsync(new Hello { DeviceId = _deviceId, DeviceName = _deviceName }, ct);
         await SendAsync(_capabilities!, ct);
     }
 

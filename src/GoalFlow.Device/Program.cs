@@ -106,7 +106,10 @@ var agent = new GoalAgent(
 
 if (options.ConnectUrl is { } url)
 {
-    await using var ws = new WsClient(new Uri(url), loggerFactory.CreateLogger<WsClient>());
+    var deviceId = ProgramHelpers.ResolveDeviceId(options.DeviceId, options.DataDir);
+    var deviceName = ProgramHelpers.ResolveDeviceName(options.DeviceName, deviceId);
+    loggerFactory.CreateLogger("Connect").LogInformation("device_id={DeviceId} device_name={DeviceName}", deviceId, deviceName);
+    await using var ws = new WsClient(new Uri(url), loggerFactory.CreateLogger<WsClient>(), deviceId, deviceName);
     liveWs = ws;
     var capabilities = provider.GetRequiredService<CapabilityRegistry>().BuildCapabilitiesMessage(kernel);
     var connectLogger = loggerFactory.CreateLogger("Connect");
@@ -195,6 +198,12 @@ internal sealed record CliOptions
     /// <summary>--data &lt;dir&gt; — mock world directory (default ./data).</summary>
     public string DataDir { get; init; } = "data";
 
+    /// <summary>--device-id &lt;id&gt; — pairing key (else $DEVICE_ID, else a persistent self-generated UUID).</summary>
+    public string? DeviceId { get; init; }
+
+    /// <summary>--device-name &lt;name&gt; — human label shown in the UI device picker.</summary>
+    public string? DeviceName { get; init; }
+
     /// <summary>--verbose — debug-level logging.</summary>
     public bool Verbose { get; init; }
 
@@ -237,6 +246,8 @@ internal sealed record CliOptions
                 },
                 "--date" => options with { Date = Next() },
                 "--data" => options with { DataDir = Next() },
+                "--device-id" => options with { DeviceId = Next() },
+                "--device-name" => options with { DeviceName = Next() },
                 "--verbose" => options with { Verbose = true },
                 "--simulate-week" => options with { SimulateWeek = true, Domain = "meal_plan" },
                 "--simulate-guest" => options with { SimulateGuest = true, Domain = "guest_dinner" },
@@ -273,6 +284,56 @@ internal static class DotEnv
 
 internal static class ProgramHelpers
 {
+/// <summary>
+/// Resolve the device_id (the cloud's pairing key): an explicit <c>--device-id</c>
+/// or <c>$DEVICE_ID</c> wins; otherwise a stable UUID persisted in the data dir
+/// (<c>&lt;data&gt;/device_id</c>) — generated once on first run. Plain File I/O,
+/// so the SAME scheme works on Ubuntu and (later) on the Tizen Hub.
+/// </summary>
+public static string ResolveDeviceId(string? cliValue, string dataDir)
+{
+    var configured = cliValue ?? Environment.GetEnvironmentVariable("DEVICE_ID");
+    if (!string.IsNullOrWhiteSpace(configured))
+    {
+        return configured.Trim();
+    }
+
+    var path = Path.Combine(dataDir, "device_id");
+    try
+    {
+        if (File.Exists(path))
+        {
+            var existing = File.ReadAllText(path).Trim();
+            if (existing.Length > 0)
+            {
+                return existing;
+            }
+        }
+        var generated = Guid.NewGuid().ToString("N");
+        Directory.CreateDirectory(dataDir);
+        File.WriteAllText(path, generated);
+        return generated;
+    }
+    catch
+    {
+        // Non-persistent fallback (e.g. read-only data dir): still unique per run.
+        return Guid.NewGuid().ToString("N");
+    }
+}
+
+/// <summary>A human label for the device picker: <c>--device-name</c> / <c>$DEVICE_NAME</c>,
+/// else a short friendly default derived from the id.</summary>
+public static string ResolveDeviceName(string? cliValue, string deviceId)
+{
+    var configured = cliValue ?? Environment.GetEnvironmentVariable("DEVICE_NAME");
+    if (!string.IsNullOrWhiteSpace(configured))
+    {
+        return configured.Trim();
+    }
+    var suffix = deviceId.Length <= 6 ? deviceId : deviceId[..6];
+    return $"GoalFlow Hub {suffix}";
+}
+
 public static async Task RunSustainSimulationAsync(CliOptions options, GoalAgent agent, IClock clock)
 {
     var contractPath = options.ContractPath ?? Path.Combine(options.DataDir, options.SimulateGuest ? "sample-contract-guest.json" : "sample-contract.json");
