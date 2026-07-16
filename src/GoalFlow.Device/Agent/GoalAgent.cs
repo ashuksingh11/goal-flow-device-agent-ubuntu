@@ -250,15 +250,7 @@ public sealed class GoalAgent
         };
 
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
-        var groundingSummary = new StringBuilder();
-        await foreach (var chunk in chat.GetStreamingChatMessageContentsAsync(history, groundingSettings, _kernel, ct))
-        {
-            if (!string.IsNullOrEmpty(chunk.Content))
-            {
-                groundingSummary.Append(chunk.Content);
-                await _trace.ThinkingAsync(chunk.Content);
-            }
-        }
+        var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
 
         if (groundingSummary.Length > 0)
         {
@@ -315,6 +307,61 @@ public sealed class GoalAgent
         };
         _logger.LogInformation("plan_ready items={ItemCount} proposals={ProposalCount} safety={Safety}", ready.Payload.Plan.Count, ready.Payload.Proposals.Count, ready.Payload.Safety.Gate);
         return ready;
+    }
+
+    /// <summary>
+    /// The grounding pass: the model calls the read-only tools and narrates what it found.
+    ///
+    /// Wrapped in the SAME transient-provider retry as compose. Without it a single
+    /// provider/SDK hiccup here (e.g. "Unknown ChatFinishReason value" when OpenRouter
+    /// returns finish_reason=error mid-stream) killed the ENTIRE dispatch — the goal just
+    /// died and the UI sat on "planning". Re-running is safe: this pass only invokes
+    /// READ-ONLY functions.
+    /// </summary>
+    private async Task<StringBuilder> RunGroundingPassAsync(
+        IChatCompletionService chat,
+        ChatHistory history,
+        OpenAIPromptExecutionSettings settings,
+        CancellationToken ct)
+    {
+        var baseline = history.Count;
+
+        for (var attempt = 1; ; attempt++)
+        {
+            if (attempt > 1)
+            {
+                // Roll the history back to the pre-attempt state: a stream that died
+                // mid-flight can leave a dangling tool-call with no result, which the
+                // next request rejects.
+                while (history.Count > baseline)
+                {
+                    history.RemoveAt(history.Count - 1);
+                }
+            }
+
+            var summary = new StringBuilder();
+            try
+            {
+                await foreach (var chunk in chat.GetStreamingChatMessageContentsAsync(history, settings, _kernel, ct))
+                {
+                    if (!string.IsNullOrEmpty(chunk.Content))
+                    {
+                        summary.Append(chunk.Content);
+                        await _trace.ThinkingAsync(chunk.Content);
+                    }
+                }
+                return summary;
+            }
+            // The final attempt's exception propagates (guard excludes it), so a real
+            // failure still surfaces instead of looping.
+            catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
+            {
+                var note = $"planner_notice: grounding attempt {attempt}/{MaxComposeAttempts} hit a transient provider error ({ex.GetType().Name}: {ex.Message}); retrying.";
+                _logger.LogWarning(ex, "{Note}", note);
+                await _trace.ThinkingAsync(note);
+                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+            }
+        }
     }
 
     private async Task<ModelPlan> ComposeModelPlanAsync(IChatCompletionService chat, ChatHistory history, Dispatch dispatch, CancellationToken ct)
