@@ -7,9 +7,7 @@
       "type": "oven",
       "state": "idle",
       "location": "kitchen",
-      "supports": [
-        "preheat"
-      ],
+      "supports": ["preheat"],
       "max_temperature_c": 250
     },
     {
@@ -18,11 +16,7 @@
       "type": "dishwasher",
       "state": "idle",
       "location": "kitchen",
-      "programs": [
-        "eco",
-        "quick",
-        "heavy"
-      ]
+      "programs": ["eco", "quick", "heavy"]
     },
     {
       "id": "fridge",
@@ -30,72 +24,8 @@
       "type": "fridge",
       "state": "online",
       "location": "kitchen",
-      "supports": [
-        "defrost_reminder",
-        "thaw_zone"
-      ]
+      "supports": ["defrost_reminder", "thaw_zone"]
     }
   ],
-  "scheduled_actions": [
-    {
-      "id": "app-001",
-      "type": "run_program",
-      "at_time": "2026-07-12T20:30",
-      "details": {
-        "appliance": "dishwasher",
-        "program": "eco"
-      },
-      "status": "scheduled"
-    },
-    {
-      "id": "app-002",
-      "type": "preheat_oven",
-      "at_time": "2026-07-16T18:00",
-      "details": {
-        "appliance": "oven",
-        "target_c": 200
-      },
-      "status": "scheduled"
-    },
-    {
-      "id": "app-003",
-      "type": "run_program",
-      "at_time": "2026-07-12T20:30",
-      "details": {
-        "appliance": "dishwasher",
-        "program": "eco"
-      },
-      "status": "scheduled"
-    },
-    {
-      "id": "app-004",
-      "type": "run_program",
-      "at_time": "2026-07-16T20:45",
-      "details": {
-        "appliance": "dishwasher",
-        "program": "eco"
-      },
-      "status": "scheduled"
-    },
-    {
-      "id": "app-005",
-      "type": "run_program",
-      "at_time": "2026-07-13T20:30",
-      "details": {
-        "appliance": "dishwasher",
-        "program": "eco"
-      },
-      "status": "scheduled"
-    },
-    {
-      "id": "app-006",
-      "type": "run_program",
-      "at_time": "2026-07-17T20:00",
-      "details": {
-        "appliance": "dishwasher",
-        "program": "eco"
-      },
-      "status": "scheduled"
-    }
-  ]
+  "scheduled_actions": []
 }
