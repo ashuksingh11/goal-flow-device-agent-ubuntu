@@ -27,6 +27,9 @@ using System.Text.RegularExpressions;
 
 var options = CliOptions.Parse(args);
 DotEnv.Load(Path.Combine(Directory.GetCurrentDirectory(), ".env"));
+// A per-instance --data dir (running two agents side by side) is seeded from
+// ./data on first use, so it never dies on a missing calendar.json.
+ProgramHelpers.EnsureDataDir(options.DataDir);
 var tempDataDir = options.SimulateWeek || options.SimulateGuest ? ProgramHelpers.CopyDataToTemp(options.DataDir) : null;
 if (tempDataDir is not null)
 {
@@ -285,6 +288,44 @@ internal static class DotEnv
 internal static class ProgramHelpers
 {
 /// <summary>
+/// Ensure a mock-world dir has its seed JSONs. Running a SECOND agent with its own
+/// <c>--data ./data-b</c> (so two instances don't clobber each other's world) would
+/// otherwise die on a missing <c>calendar.json</c>; seed it from the repo's
+/// <c>./data</c> on first use. Only ever seeds a dir with NO <c>*.json</c> — an
+/// already-populated world is never overwritten. Mirrors the Tizen agent, which
+/// seeds a writable copy out of its read-only bundle.
+/// </summary>
+public static void EnsureDataDir(string dataDir)
+{
+    const string seed = "data";
+    try
+    {
+        if (Path.GetFullPath(dataDir) == Path.GetFullPath(seed))
+        {
+            return; // this IS the seed
+        }
+        if (Directory.Exists(dataDir) && Directory.EnumerateFiles(dataDir, "*.json").Any())
+        {
+            return; // already has a world
+        }
+        if (!Directory.Exists(seed))
+        {
+            return; // nothing to seed from — let the store fail loudly
+        }
+        Directory.CreateDirectory(dataDir);
+        foreach (var file in Directory.EnumerateFiles(seed, "*.json"))
+        {
+            File.Copy(file, Path.Combine(dataDir, Path.GetFileName(file)), overwrite: false);
+        }
+        Console.Error.WriteLine($"seeded mock world: {dataDir} <- {seed}");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"could not seed {dataDir}: {ex.Message}");
+    }
+}
+
+/// <summary>
 /// Resolve the device_id (the cloud's pairing key): an explicit <c>--device-id</c>
 /// or <c>$DEVICE_ID</c> wins; otherwise a stable UUID persisted in the data dir
 /// (<c>&lt;data&gt;/device_id</c>) — generated once on first run. Plain File I/O,
@@ -309,8 +350,14 @@ public static string ResolveDeviceId(string? cliValue, string dataDir)
                 return existing;
             }
         }
+        // Do NOT create the dir here — an empty half-made data dir masks a bad
+        // --data path as a confusing "missing calendar.json" later. EnsureDataDir
+        // owns creating/seeding it.
+        if (!Directory.Exists(dataDir))
+        {
+            return Guid.NewGuid().ToString("N");
+        }
         var generated = Guid.NewGuid().ToString("N");
-        Directory.CreateDirectory(dataDir);
         File.WriteAllText(path, generated);
         return generated;
     }

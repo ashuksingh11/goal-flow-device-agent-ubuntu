@@ -33,3 +33,6 @@ appsettings.local.json
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Per-instance mock-world dirs (multi-agent testing; seeded from ./data)
+data-*/
