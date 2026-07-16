@@ -43,6 +43,12 @@ Key invariants:
   hub; the device opens one outbound `ClientWebSocket` and streams
   `agent_event` frames (phase / thinking / tool_call / tool_result /
   plan_progress) so the UI can watch it think.
+- **Multi-session.** The cloud hub now serves many device agents and many UIs
+  at once, paired by `device_id` (a "home" = 1 device + N UIs). This agent
+  identifies itself in `hello` with `device_id` (`--device-id` / `$DEVICE_ID`,
+  else a persistent self-generated UUID in `<data>/device_id`) and
+  `device_name` (`--device-name` / `$DEVICE_NAME`, else `user@machine` — shown
+  in the UI's device picker when more than one agent is online).
 - **Event-driven meal demo.** `plan_ready.payload.demo_events` (from
   `data/daily_events.json`) advertises a small catalog of presenter-fired
   events as UI chips (restock, a spoiled ingredient, a calendar clash, a
@@ -88,6 +94,12 @@ dotnet run --project GoalFlow.Device.csproj -- --simulate-week    # meal_plan: 5
 dotnet run --project GoalFlow.Device.csproj -- --simulate-guest   # guest_dinner: 2 ticks to the RSVP/late-arrival trigger
 
 # Extras: [--date 2026-07-14] start a SimulatedClock there; [--data ./data]; [--verbose]
+# [--device-id <id>] / [--device-name <name>] override the auto-resolved pairing identity.
+
+# Two agents side by side (multi-session test): each needs its own --data dir so
+# their mock worlds don't clobber each other — a fresh dir auto-seeds from ./data.
+dotnet run --project GoalFlow.Device.csproj -- --connect ws://localhost:8000/ws --data ./data-a
+dotnet run --project GoalFlow.Device.csproj -- --connect ws://localhost:8000/ws --data ./data-b
 ```
 
 `plan_ready` / `status` / `proposal` frames print to **stdout**; logs and
@@ -104,6 +116,8 @@ environment:
 | `OPENROUTER_BASE_URL` | OpenAI-compatible base URL     | `https://openrouter.ai/api/v1` |
 | `OPENROUTER_MODEL`    | Model id                       | `openai/gpt-oss-120b`          |
 | `LOG_LEVEL`           | Overrides console log level    | `Information` (`Debug` with `--verbose`) |
+| `DEVICE_ID`           | Pairing key sent in `hello`    | persistent self-generated UUID in `<data>/device_id` |
+| `DEVICE_NAME`         | Human label in the UI's device picker | `user@machine` |
 
 ## Layout
 
@@ -118,6 +132,7 @@ src/GoalFlow.Device/
   Transport/WsClient.cs   one outbound BCL ClientWebSocket to the cloud hub
   Program.cs              CLI entry + DI composition root
 data/                     mock world (day-offset dates; see data/README.md) + sample contracts
+                          + device_id (persisted self-generated pairing key, first run)
 docs/                     ARCHITECTURE.md (kernel/filter/stream design), HARNESSES.md (module catalog)
 ```
 

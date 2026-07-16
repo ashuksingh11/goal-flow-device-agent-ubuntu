@@ -16,6 +16,11 @@ Siblings under `~/ashu/git/`: `goal-flow-cloud-agent` (Python hub, owns the cano
 (frozen port — see its AGENTS.md). This repo's C# `Contracts/*.cs` MIRROR the cloud's
 `CONTRACT.md`.
 
+**Tizen sync status:** `Contracts/Hello.cs` and `Transport/WsClient.cs` are the
+byte-identical shared core with the tizen repo (a plain copy). The multi-session
+`device_id`/`device_name` change (below) landed HERE ONLY — the tizen repo now
+DIVERGES on these two files until it is re-synced.
+
 ## Stack & run
 
 - .NET 8 + Microsoft Semantic Kernel + OpenRouter. **LLM-only planning** — there is
@@ -30,6 +35,23 @@ Siblings under `~/ashu/git/`: `goal-flow-cloud-agent` (Python hub, owns the cano
   survives cloud restarts), `--simulate-week`, `--simulate-guest` (headless
   adaptation sims — the fastest way to verify planning/adaptation).
 - Env: `OPENROUTER_API_KEY` etc. (same OpenRouter vars as the cloud).
+- **Multi-session identity:** the cloud is now multi-session (many UIs + many
+  device agents, paired by `device_id`; a "home" = 1 device + N UIs). This agent
+  sends `device_id`/`device_name` in `hello`. `device_id` = `--device-id` /
+  `$DEVICE_ID`, else a persistent self-generated UUID stored in `<data>/device_id`
+  (plain File I/O, generated once, reused across restarts — same scheme will run
+  on the Tizen Hub). `device_name` = `--device-name` / `$DEVICE_NAME`, else
+  `user@machine` (must be RECOGNISABLE — the UI shows a picker when several agents
+  are connected). See `ProgramHelpers.ResolveDeviceId` / `ResolveDeviceName` in
+  `Program.cs`.
+- **Running two agents side by side** (multi-session test): each needs its own
+  `--data` dir so their mock worlds don't clobber each other — `EnsureDataDir`
+  auto-seeds a `--data` dir with no `*.json` from `./data` on first use (never
+  overwrites a populated world), so this just works instead of dying on a missing
+  `calendar.json`:
+  `dotnet run --project GoalFlow.Device.csproj -- --connect ws://localhost:8000/ws --data ./data-a`
+  (device_id auto-generates; add `--device-id hub-a` only for a deterministic id).
+  `.gitignore` excludes `data-*/`.
 
 ## Architecture / key files
 
@@ -56,7 +78,14 @@ Siblings under `~/ashu/git/`: `goal-flow-cloud-agent` (Python hub, owns the cano
 - `Contracts/*.cs` — C# mirror of CONTRACT v2. `PlanReady.cs` has `PlanItem.Day`,
   `DemoEvent {Id,Day,Label,Title,Kind,Order}`, `DemoEvents` catalog. `Control.cs` has
   `EventId` + `TriggerEvent` const. `Status.cs` has `EventId`/`UpdatedPlan`/
-  `ChangedIds`/`ImpactDelta`. `Proposal.cs` has `EventId`. JSON serializes snake_case.
+  `ChangedIds`/`ImpactDelta`. `Proposal.cs` has `EventId`. `Hello.cs` has
+  `DeviceId`/`DeviceName` (`HelloAck` has `DeviceId` too) — the pairing identity for
+  multi-session cloud routing. JSON serializes snake_case.
+- `Transport/WsClient.cs` — one outbound BCL `ClientWebSocket`; ctor now takes
+  `deviceId`/`deviceName` and sends them in the `hello` frame.
+- `Program.cs` / `ProgramHelpers` — CLI entry + DI root. `ResolveDeviceId` /
+  `ResolveDeviceName` resolve this agent's pairing identity (see Stack & run above);
+  `EnsureDataDir` seeds a fresh `--data` dir from `./data`.
 - `data/` — seeded world state. `data/daily_events.json` is the **presenter-fired
   event catalog** (6 events: day1 restock, day2 shortage, day3 football, day4 guest,
   day5 oven, day6 "Lighter Sunday") that drives the event-driven meal demo; each has
@@ -64,10 +93,12 @@ Siblings under `~/ashu/git/`: `goal-flow-cloud-agent` (Python hub, owns the cano
 
 ## Contract touchpoints
 
-Receives: `dispatch` (Task Contract), `approval`, `control` (`advance_day`/`reset`/
-`set_date`/`trigger_event`). Sends: `capabilities`, `agent_event` (thinking/tool-call
-stream), `plan_ready` (plan + tiered proposals + `demo_events` + safety), `proposal`
-(adaptations, tier `adapt`), `status` (monitoring + `updated_plan` on adaptation).
+Sends: `hello` (now with `device_id`/`device_name` — see Stack & run), `capabilities`,
+`agent_event` (thinking/tool-call stream), `plan_ready` (plan + tiered proposals +
+`demo_events` + safety), `proposal` (adaptations, tier `adapt`), `status` (monitoring
++ `updated_plan` on adaptation). Receives: `hello_ack` (echoes the bound `device_id`),
+`dispatch` (Task Contract), `approval`, `control` (`advance_day`/`reset`/`set_date`/
+`trigger_event`).
 
 ## Current state
 

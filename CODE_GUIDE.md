@@ -52,14 +52,20 @@ by default; `SimulatedClock` when `--date` or a simulation mode is used),
 modules (`SafetyFilter`, `ApprovalCoordinator`, `Grounding`,
 `MaterialityPolicy`, `MonitorAdapt`, `CapabilityRegistry`).
 `GoalAgent.BuildKernel` then assembles the SK kernel from that provider.
+`ProgramHelpers.EnsureDataDir` runs first and auto-seeds a `--data` dir with
+no `*.json` from `./data` (so a second instance's `--data ./data-b` doesn't
+die on a missing `calendar.json`); in `--connect` mode,
+`ResolveDeviceId`/`ResolveDeviceName` then resolve this run's pairing identity
+(persisted UUID in `<data>/device_id`, or `--device-id`/`--device-name` /
+`$DEVICE_ID`/`$DEVICE_NAME` overrides) before the `WsClient` is constructed.
 
 | Command | What it does |
 |---|---|
 | `--goal "…" [--domain meal_plan]` | Synthesizes a local `Dispatch` around the goal text and plans it. |
 | `--contract <file> [--approval <file>]` | Runs a dispatch file → `plan_ready` on stdout; optionally applies an approval, then **replays it** to prove idempotency. `${today+N}` tokens resolve against the clock at load. |
-| `--connect <ws url>` | Live cloud session: `hello` → `hello_ack` → `capabilities`, then routes inbound `dispatch`/`approval`/`control` to `GoalAgent` (each frame handled on a background task so planning never starves WS keepalives). |
+| `--connect <ws url>` | Live cloud session: `hello` (with `device_id`/`device_name`) → `hello_ack` → `capabilities`, then routes inbound `dispatch`/`approval`/`control` to `GoalAgent` (each frame handled on a background task so planning never starves WS keepalives). |
 | `--simulate-week` / `--simulate-guest` | Plan the meal / guest contract, then issue `advance_day` controls (5 / 2 ticks), printing `status` frames and — on the material day — the adaptation `proposal` plus an approve+replay round-trip. Runs on a temp copy of `data/`. |
-| `--date <ISO>` / `--data <dir>` / `--verbose` | Simulated clock start; mock-world dir; debug logging. |
+| `--date <ISO>` / `--data <dir>` / `--device-id <id>` / `--device-name <name>` / `--verbose` | Simulated clock start; mock-world dir; pairing identity overrides; debug logging. |
 
 ## The plan flow (`Agent/GoalAgent.cs → RunAsync`)
 
