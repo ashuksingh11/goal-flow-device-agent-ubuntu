@@ -370,9 +370,13 @@ public static string ResolveDeviceId(string? cliValue, string dataDir)
 
 /// <summary>
 /// A human label for the UI's device picker: <c>--device-name</c> / <c>$DEVICE_NAME</c>,
-/// else <c>user@machine</c>. The default must be RECOGNISABLE: when two developers
-/// share one cloud, each picks their own agent out of a list, and two opaque UUIDs
-/// ("GoalFlow Hub 439dca") are indistinguishable.
+/// else <c>user@machine (shortid)</c>.
+///
+/// The default must be BOTH recognisable and UNIQUE — a picker of two identical labels
+/// is useless. <c>user@machine</c> alone is not enough: two developers on identical VM
+/// images are both <c>ubuntu@ubuntu</c> (and on a Tizen Hub every unit reports the same
+/// user/host). So the short id — derived from the UNIQUE device_id — is always appended,
+/// which makes the label unique by construction on any platform.
 /// </summary>
 public static string ResolveDeviceName(string? cliValue, string deviceId)
 {
@@ -381,6 +385,15 @@ public static string ResolveDeviceName(string? cliValue, string deviceId)
     {
         return configured.Trim();
     }
+    return $"{HostLabel()} ({ShortDeviceId(deviceId)})";
+}
+
+/// <summary>The first 6 chars of the device_id — enough to disambiguate a picker.</summary>
+public static string ShortDeviceId(string deviceId)
+    => deviceId.Length <= 6 ? deviceId : deviceId[..6];
+
+private static string HostLabel()
+{
     try
     {
         var user = Environment.UserName;
@@ -392,10 +405,9 @@ public static string ResolveDeviceName(string? cliValue, string deviceId)
     }
     catch
     {
-        // fall through to the id-derived default
+        // fall through
     }
-    var suffix = deviceId.Length <= 6 ? deviceId : deviceId[..6];
-    return $"GoalFlow Hub {suffix}";
+    return "GoalFlow Hub";
 }
 
 public static async Task RunSustainSimulationAsync(CliOptions options, GoalAgent agent, IClock clock)

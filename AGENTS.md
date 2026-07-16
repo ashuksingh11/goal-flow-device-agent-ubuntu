@@ -46,7 +46,7 @@ wired separately in each host.
   `$DEVICE_ID`, else a persistent self-generated UUID stored in `<data>/device_id`
   (plain File I/O, generated once, reused across restarts — same scheme will run
   on the Tizen Hub). `device_name` = `--device-name` / `$DEVICE_NAME`, else
-  `user@machine` (must be RECOGNISABLE — the UI shows a picker when several agents
+  `user@machine (<short-id>)` (must be recognisable AND unique — the UI shows a picker when several agents
   are connected). See `ProgramHelpers.ResolveDeviceId` / `ResolveDeviceName` in
   `Program.cs`.
 - **Running two agents side by side** (multi-session test): each needs its own

@@ -47,7 +47,7 @@ Key invariants:
   at once, paired by `device_id` (a "home" = 1 device + N UIs). This agent
   identifies itself in `hello` with `device_id` (`--device-id` / `$DEVICE_ID`,
   else a persistent self-generated UUID in `<data>/device_id`) and
-  `device_name` (`--device-name` / `$DEVICE_NAME`, else `user@machine` — shown
+  `device_name` (`--device-name` / `$DEVICE_NAME`, else `user@machine (<short-id>)` — shown
   in the UI's device picker when more than one agent is online).
 - **Event-driven meal demo.** `plan_ready.payload.demo_events` (from
   `data/daily_events.json`) advertises a small catalog of presenter-fired
@@ -117,7 +117,7 @@ environment:
 | `OPENROUTER_MODEL`    | Model id                       | `openai/gpt-oss-120b`          |
 | `LOG_LEVEL`           | Overrides console log level    | `Information` (`Debug` with `--verbose`) |
 | `DEVICE_ID`           | Pairing key sent in `hello`    | persistent self-generated UUID in `<data>/device_id` |
-| `DEVICE_NAME`         | Human label in the UI's device picker | `user@machine` |
+| `DEVICE_NAME`         | Human label in the UI's device picker | `user@machine (<short-id>)` |
 
 ## Layout
 
