@@ -368,14 +368,31 @@ public static string ResolveDeviceId(string? cliValue, string dataDir)
     }
 }
 
-/// <summary>A human label for the device picker: <c>--device-name</c> / <c>$DEVICE_NAME</c>,
-/// else a short friendly default derived from the id.</summary>
+/// <summary>
+/// A human label for the UI's device picker: <c>--device-name</c> / <c>$DEVICE_NAME</c>,
+/// else <c>user@machine</c>. The default must be RECOGNISABLE: when two developers
+/// share one cloud, each picks their own agent out of a list, and two opaque UUIDs
+/// ("GoalFlow Hub 439dca") are indistinguishable.
+/// </summary>
 public static string ResolveDeviceName(string? cliValue, string deviceId)
 {
     var configured = cliValue ?? Environment.GetEnvironmentVariable("DEVICE_NAME");
     if (!string.IsNullOrWhiteSpace(configured))
     {
         return configured.Trim();
+    }
+    try
+    {
+        var user = Environment.UserName;
+        var machine = Environment.MachineName;
+        if (!string.IsNullOrWhiteSpace(user) && !string.IsNullOrWhiteSpace(machine))
+        {
+            return $"{user}@{machine}";
+        }
+    }
+    catch
+    {
+        // fall through to the id-derived default
     }
     var suffix = deviceId.Length <= 6 ? deviceId : deviceId[..6];
     return $"GoalFlow Hub {suffix}";
