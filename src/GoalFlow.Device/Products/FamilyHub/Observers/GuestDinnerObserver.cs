@@ -27,6 +27,8 @@ public sealed class GuestDinnerObserver : IDomainObserver
 
     public string Domain => "guest_dinner";
 
+    public string Hint => "hosting a dinner for guests — menu, prep timeline, dietary constraints, RSVPs";
+
     public async Task<JsonObject> CaptureAsync(CancellationToken ct = default)
     {
         var guests = await _store.LoadResolvedAsync("guests", ct);

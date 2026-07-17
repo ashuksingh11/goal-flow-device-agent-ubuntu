@@ -35,6 +35,19 @@ public interface IDomainObserver
     string Domain { get; }
 
     /// <summary>
+    /// What this domain MEANS, in a sentence, for the cloud's goal interpreter.
+    ///
+    /// <para>
+    /// Advertised in the capabilities frame so the interpreter can label a goal
+    /// with a domain the device actually routes on. Without it the interpreter
+    /// invents plausible slugs ("away_prep") that no observer answers to, and a
+    /// guest dinner labelled "meal_plan" silently loses its RSVP watching — which
+    /// is exactly what happened when the cloud's keyword hack was removed.
+    /// </para>
+    /// </summary>
+    string Hint { get; }
+
+    /// <summary>
     /// This domain's slice of the world, as named documents merged into the goal's
     /// snapshot. The observer decides what it needs to watch; the harness never
     /// names a document.

@@ -35,6 +35,8 @@ public sealed class MealPlanObserver : IDomainObserver
 
     public string Domain => "meal_plan";
 
+    public string Hint => "planning the week's dinners — healthy eating, using up what is in the fridge";
+
     public async Task<JsonObject> CaptureAsync(CancellationToken ct = default)
         => new()
         {

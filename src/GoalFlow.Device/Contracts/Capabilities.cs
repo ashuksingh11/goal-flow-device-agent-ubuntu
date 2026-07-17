@@ -11,6 +11,30 @@ public sealed record CapabilitiesMessage
     public string Type { get; init; } = MessageTypes.Capabilities;
 
     public required IReadOnlyList<ModuleDescriptor> Modules { get; init; }
+
+    /// <summary>
+    /// The goal shapes this device understands well enough to sustain (v3-M4).
+    ///
+    /// <para>
+    /// The cloud's interpreter labels each goal with a <c>domain</c>, and the
+    /// device ROUTES on that label — its domain observers answer to it by name.
+    /// So the label can't be a free invention: a guest dinner labelled
+    /// "meal_plan" silently loses its RSVP watching. Advertising the domains lets
+    /// the interpreter use one the device actually answers to, and coin a new slug
+    /// only when none fits.
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<DomainDescriptor> Domains { get; init; } = [];
+}
+
+/// <summary>One goal shape this device understands, and what it means.</summary>
+public sealed record DomainDescriptor
+{
+    /// <summary>The dispatch domain value, e.g. "guest_dinner".</summary>
+    public required string Id { get; init; }
+
+    /// <summary>What it means, in a sentence — for the interpreter to match against.</summary>
+    public required string Hint { get; init; }
 }
 
 /// <summary>

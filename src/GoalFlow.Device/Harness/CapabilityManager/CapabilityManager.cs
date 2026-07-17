@@ -27,14 +27,23 @@ public sealed class CapabilityManager
 {
     private readonly Dictionary<string, CapabilityDescriptor> _byName;
     private readonly SafetyPolicy _policy;
+    private readonly IReadOnlyList<IDomainObserver> _observers;
 
     /// <summary>The registered capabilities, IN THE PRODUCT PACK'S ORDER (significant — see the descriptor).</summary>
     public IReadOnlyList<CapabilityDescriptor> Descriptors { get; }
 
-    public CapabilityManager(IReadOnlyList<CapabilityDescriptor> descriptors, SafetyPolicy policy)
+    public CapabilityManager(
+        IReadOnlyList<CapabilityDescriptor> descriptors,
+        SafetyPolicy policy,
+        IEnumerable<IDomainObserver>? observers = null)
     {
         Descriptors = descriptors;
         _policy = policy;
+        // The domains this device advertises ARE the ones it can sustain, so they
+        // are derived from the registered observers rather than hand-listed — the
+        // same rule as the capability catalog: add an observer, and the cloud
+        // learns the domain exists.
+        _observers = observers?.ToArray() ?? [];
         _byName = descriptors.ToDictionary(d => d.Name, StringComparer.Ordinal);
 
         // Fail at STARTUP, not at the moment a prohibited action is proposed.
@@ -92,7 +101,14 @@ public sealed class CapabilityManager
     public CapabilitiesMessage BuildCapabilitiesMessage(Kernel kernel)
     {
         var modules = kernel.Plugins.Select(DescribePlugin).Concat(SteeringModules).ToArray();
-        return new CapabilitiesMessage { Modules = modules };
+        return new CapabilitiesMessage
+        {
+            Modules = modules,
+            Domains = _observers
+                .Select(o => new DomainDescriptor { Id = o.Domain, Hint = o.Hint })
+                .OrderBy(d => d.Id, StringComparer.Ordinal)
+                .ToArray()
+        };
     }
 
     /// <summary>Descriptor for one plugin — unit-testable slice of the walk above.</summary>
