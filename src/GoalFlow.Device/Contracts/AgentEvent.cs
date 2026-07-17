@@ -28,9 +28,32 @@ public sealed record AgentEvent
 }
 
 /// <summary>The <c>event</c> discriminator values.</summary>
+/// <summary>
+/// The <c>phase</c> values an agent_event can carry. The UI renders these as its
+/// progress rail; an unknown one is ignored rather than fatal, so adding a phase
+/// is additive.
+/// </summary>
+public static class Phases
+{
+    /// <summary>
+    /// Another goal holds the single planning slot; this one starts next (v3-M5).
+    /// It exists so a queued goal is VISIBLE — the board shows Waiting — rather
+    /// than a card that sits doing nothing for a minute with no explanation.
+    /// </summary>
+    public const string Queued = "queued";
+
+    public const string Grounding = "grounding";
+    public const string Planning = "planning";
+    public const string Checking = "checking";
+    public const string AwaitingApproval = "awaiting_approval";
+    public const string Executing = "executing";
+    public const string Monitoring = "monitoring";
+    public const string Adapting = "adapting";
+}
+
 public static class AgentEventKinds
 {
-    /// <summary>Payload: { "phase": "grounding" | "planning" | "checking" | "awaiting_approval" }.</summary>
+    /// <summary>Payload: { "phase": … } — see <see cref="Phases"/>.</summary>
     public const string Phase = "phase";
 
     /// <summary>Payload: { "text": "..." } — streamed model reasoning/narration.</summary>

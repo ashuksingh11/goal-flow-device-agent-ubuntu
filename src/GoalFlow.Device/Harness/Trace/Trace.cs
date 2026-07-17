@@ -17,9 +17,30 @@ public sealed class Trace
 {
     private readonly ILogger<Trace> _logger;
     private readonly Func<AgentEvent, Task> _emit;
-    private int _seq;
-    private string? _goalId;
-    private string? _correlationId;
+
+    /// <summary>
+    /// The goal this async flow is narrating, and its own seq counter.
+    ///
+    /// <para>
+    /// PER GOAL, on an AsyncLocal — this used to be three plain fields on a
+    /// singleton, which broke silently as soon as two goals overlapped (and
+    /// Program has always dispatched every frame on its own Task.Run). Starting
+    /// goal B reset seq to 0 and re-pinned the goal id, so goal A's remaining
+    /// events streamed out stamped with B's goal_id and a seq that had gone
+    /// BACKWARDS. The UI dedupes on seq per goal, so it drops anything not
+    /// greater than the last it saw: goal A's plan simply stopped appearing,
+    /// with no error anywhere. Same failure mode as the SafetyFilter clobber,
+    /// same fix.
+    /// </para>
+    /// </summary>
+    private sealed class GoalScope
+    {
+        public required string GoalId { get; init; }
+        public string? CorrelationId { get; init; }
+        public int Seq;
+    }
+
+    private static readonly AsyncLocal<GoalScope?> Current = new();
 
     /// <param name="emit">
     /// Transport hook — <c>WsClient.SendAsync</c> when connected, a stdout/no-op
@@ -31,17 +52,40 @@ public sealed class Trace
         _emit = emit;
     }
 
-    /// <summary>Starts a goal scope: resets seq, pins goal_id/correlation_id on every frame + log line.</summary>
+    /// <summary>
+    /// Starts a goal scope: its OWN seq counter, and goal_id/correlation_id pinned
+    /// on every frame + log line made inside this async flow. Disposing restores
+    /// whatever scope was active before, so nesting is safe.
+    /// </summary>
     public IDisposable BeginGoalScope(string goalId, string? correlationId)
     {
-        _seq = 0;
-        _goalId = goalId;
-        _correlationId = correlationId;
-        return _logger.BeginScope(new Dictionary<string, object?>
+        var previous = Current.Value;
+        Current.Value = new GoalScope { GoalId = goalId, CorrelationId = correlationId };
+        var logScope = _logger.BeginScope(new Dictionary<string, object?>
         {
             ["goal_id"] = goalId,
             ["correlation_id"] = correlationId
         }) ?? NullScope.Instance;
+        return new Restore(logScope, previous);
+    }
+
+    /// <summary>Ends a goal scope and restores the previous one.</summary>
+    private sealed class Restore : IDisposable
+    {
+        private readonly IDisposable _logScope;
+        private readonly GoalScope? _previous;
+
+        public Restore(IDisposable logScope, GoalScope? previous)
+        {
+            _logScope = logScope;
+            _previous = previous;
+        }
+
+        public void Dispose()
+        {
+            Current.Value = _previous;
+            _logScope.Dispose();
+        }
     }
 
     /// <summary>Emits a phase change (grounding | planning | checking | awaiting_approval).</summary>
@@ -81,16 +125,16 @@ public sealed class Trace
 
     private async Task EmitAsync(string kind, JsonObject payload)
     {
-        if (_goalId is null)
-        {
-            throw new InvalidOperationException("Trace scope has not been started.");
-        }
+        var scope = Current.Value
+            ?? throw new InvalidOperationException("Trace scope has not been started.");
 
         var evt = new AgentEvent
         {
-            GoalId = _goalId,
-            CorrelationId = _correlationId,
-            Seq = Interlocked.Increment(ref _seq),
+            GoalId = scope.GoalId,
+            CorrelationId = scope.CorrelationId,
+            // Monotonic PER GOAL — the UI drops any frame whose seq isn't greater
+            // than the last it saw for that goal.
+            Seq = Interlocked.Increment(ref scope.Seq),
             Event = kind,
             Payload = payload
         };

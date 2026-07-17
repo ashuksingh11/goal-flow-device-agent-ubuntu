@@ -154,6 +154,12 @@ if (options.VerifyPrechecks)
     return;
 }
 
+if (options.VerifyTraceIsolation)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyTraceIsolationAsync(loggerFactory);
+    return;
+}
+
 if (options.ConnectUrl is { } url)
 {
     var deviceId = ProgramHelpers.ResolveDeviceId(options.DeviceId, options.DataDir);
@@ -281,6 +287,9 @@ internal sealed record CliOptions
     /// <summary>--verify-prechecks — assert the runtime gates pass, block and defer correctly (M3 gate).</summary>
     public bool VerifyPrechecks { get; init; }
 
+    /// <summary>--verify-trace-isolation — assert concurrent goals don't collide on goal_id/seq (M5 gate).</summary>
+    public bool VerifyTraceIsolation { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -325,6 +334,7 @@ internal sealed record CliOptions
                 "--verify-grades" => options with { VerifyGrades = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
+                "--verify-trace-isolation" => options with { VerifyTraceIsolation = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -358,6 +368,91 @@ internal static class DotEnv
 
 internal static class ProgramHelpers
 {
+/// <summary>
+/// M5 GATE: trace isolation under concurrency.
+///
+/// <para>
+/// Every agent_event carries a goal_id and a seq, and the UI DROPS any frame whose
+/// seq isn't greater than the last it saw for that goal. So a shared counter isn't
+/// cosmetic: goal B starting used to reset seq to 0 and re-pin the goal id, and
+/// goal A's remaining events then streamed under B's id with a seq that had gone
+/// backwards — the UI silently discarded them and A's plan stopped appearing, with
+/// no error anywhere.
+/// </para>
+///
+/// <para>
+/// Two goals narrate concurrently here, interleaved deliberately. The assertion is
+/// what the UI actually requires: every goal's frames carry ITS id, and its seqs
+/// are strictly increasing from 1.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyTraceIsolationAsync(ILoggerFactory loggerFactory)
+{
+    var frames = new System.Collections.Concurrent.ConcurrentBag<AgentEvent>();
+    var trace = new Trace(loggerFactory.CreateLogger<Trace>(), evt =>
+    {
+        frames.Add(evt);
+        return Task.CompletedTask;
+    });
+
+    // A RENDEZVOUS, not a one-way signal: each goal announces it is inside its scope
+    // and then waits for the other. A single TCS is not enough — `await` on an
+    // already-completed task continues SYNCHRONOUSLY, so the first goal would run to
+    // completion before the second even started, and a shared scope would sail
+    // through. (It did: this gate passed against a deliberately shared scope until
+    // the barrier was made two-way.)
+    var arrived = new[] { new TaskCompletionSource(), new TaskCompletionSource() };
+
+    async Task Narrate(int index, string goalId, int count)
+    {
+        using var scope = trace.BeginGoalScope(goalId, $"corr-{goalId}");
+        arrived[index].SetResult();
+        await arrived[1 - index].Task;
+
+        for (var i = 0; i < count; i++)
+        {
+            await trace.PhaseAsync("planning");
+            // Force the two flows to interleave rather than run back to back.
+            await Task.Delay(1);
+            await trace.ThinkingAsync($"{goalId} step {i}");
+        }
+    }
+
+    await Task.WhenAll(
+        Task.Run(() => Narrate(0, "goal-a", 5)),
+        Task.Run(() => Narrate(1, "goal-b", 5)));
+
+    var failures = new List<string>();
+    foreach (var goalId in new[] { "goal-a", "goal-b" })
+    {
+        var mine = frames.Where(f => f.GoalId == goalId).OrderBy(f => f.Seq).ToArray();
+        if (mine.Length != 10)
+        {
+            failures.Add($"{goalId}: emitted 10 frames, {mine.Length} carry its goal_id — the rest went out under another goal's id");
+        }
+
+        var seqs = mine.Select(f => f.Seq).ToArray();
+        if (seqs.Distinct().Count() != seqs.Length)
+        {
+            failures.Add($"{goalId}: duplicate seq — the UI drops the repeats");
+        }
+
+        if (seqs.Length > 0 && (seqs[0] != 1 || !seqs.SequenceEqual(Enumerable.Range(1, seqs.Length))))
+        {
+            failures.Add($"{goalId}: seq must run 1..n per goal, got [{string.Join(",", seqs)}]");
+        }
+
+        if (mine.Any(f => f.CorrelationId != $"corr-{goalId}"))
+        {
+            failures.Add($"{goalId}: a frame carries another goal's correlation_id");
+        }
+    }
+
+    foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
+    Console.Out.WriteLine(failures.Count == 0 ? "gate 11 (trace isolation): PASS" : $"gate 11 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
+}
+
 /// <summary>
 /// M3 GATE: the Pre-check Engine — is the world ready?
 ///
