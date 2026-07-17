@@ -1,9 +1,10 @@
 using System.ComponentModel;
 using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
+using GoalFlow.Device.Harness;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Capabilities;
+namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
 /// CAPABILITY MODULE (guest_dinner domain): hosted event, RSVPs, and guest
@@ -13,9 +14,9 @@ namespace GoalFlow.Device.Modules.Capabilities;
 [Description("Guest dinner event, RSVPs, and dietary constraints.")]
 public sealed class GuestsPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public GuestsPlugin(MockWorldStore store) => _store = store;
+    public GuestsPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Returns the upcoming hosted dinner event with resolved date, headcount, style, and timing.")]

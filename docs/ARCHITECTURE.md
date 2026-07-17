@@ -106,7 +106,7 @@ sequenceDiagram
 
 ## The Safety filter — "LLM plans, code checks"
 
-`Modules/Steering/SafetyFilter.cs` implements SK's
+`Harness/SafetyPolicyEngine/SafetyFilter.cs` implements SK's
 `IFunctionInvocationFilter`. Before *any* plugin method runs, the kernel calls
 `OnFunctionInvocationAsync(context, next)`; the filter inspects
 `context.Function` (plugin + function name) and `context.Arguments` against
@@ -125,7 +125,7 @@ keys it does not know rather than guessing.
 ## Approval tiers (HITL)
 
 Side-effecting `[KernelFunction]`s are tagged `[SideEffect(tier)]`
-(`Modules/Steering/CapabilityRegistry.cs`). Tiers encode
+(`Harness/CapabilityManager/CapabilityManager.cs`). Tiers encode
 reversibility × cost × risk:
 
 - **auto** — reversible/cheap, may execute immediately (create a reminder);
@@ -138,11 +138,11 @@ rejected), idempotent execution via `MarkExecuted`.
 
 ## The generic clock
 
-`Modules/Steering/Clock.cs`: `IClock` (`Now`, `Today`) with two
+`Harness/Clock/Clock.cs`: `IClock` (`Now`, `Today`) with two
 implementations — `SystemClock` (real date; the default) and `SimulatedClock`
 (starts at real today or `--date`; driven by `control` frames: `set_date`,
 `advance_day`). **Nothing hardcodes a date.** Mock data stores day *offsets*
-(`expires_in_days`, `day_offset`) that `MockWorldStore` resolves against
+(`expires_in_days`, `day_offset`) that `MockFamilyHubAdapter` resolves against
 `IClock.Today` at read time, so the seed world is always "this week"
 (see `data/README.md`).
 
@@ -162,7 +162,7 @@ approval → actuation path as the sustain loop.
 
 ## Capability registry & the capabilities message
 
-`CapabilityRegistry` builds the `capabilities` advertisement by *discovery*:
+`CapabilityManager` builds the `capabilities` advertisement by *discovery*:
 it walks `kernel.Plugins` (function names + `Description` attributes from
 `KernelFunctionMetadata`, `side_effecting`/`tier` from `[SideEffect]`) and
 appends the fixed steering-module descriptors. Sent right after `hello_ack`.
@@ -171,7 +171,7 @@ space, and UI module view all update automatically.
 
 ## agent_event streaming & structured logging
 
-`Modules/Steering/Trace.cs` is the single narration sink with two audiences:
+`Harness/Trace/Trace.cs` is the single narration sink with two audiences:
 
 - **`agent_event` frames** streamed over the WebSocket (monotonic `seq` per
   goal): `phase`, `thinking` (streamed model text), `tool_call`,

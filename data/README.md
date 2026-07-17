@@ -1,12 +1,12 @@
 # Mock world (`data/`)
 
 JSON files standing in for the Family Hub's sensors/actuators during development.
-The SK capability plugins read and write them through `MockWorldStore`.
+The SK capability plugins read and write them through `MockFamilyHubAdapter`.
 
 ## The generic-clock rule (hard invariant)
 
 **No absolute dates anywhere in mock data or code.** "Today" comes from `IClock`
-(`Modules/Steering/Clock.cs`): the real system date by default (`SystemClock`),
+(`Harness/Clock/Clock.cs`): the real system date by default (`SystemClock`),
 or a simulated date driven by `control` frames / `--date` (`SimulatedClock`,
 `set_date` + `advance_day`). Everything else is stored **relative**:
 
@@ -18,7 +18,7 @@ or a simulated date driven by `control` frames / `--date` (`SimulatedClock`,
 | `daily_events.json` | `day_offset` | resolves each demo event to the fixed week's target ISO date at snapshot time (does not decide when it fires — the presenter does, via `control: trigger_event`) |
 | `sample-contract.json` | `${today+N}` tokens | resolved to ISO dates when the file is loaded |
 
-`MockWorldStore.LoadResolvedAsync` resolves offsets against `IClock.Today` at
+`MockFamilyHubAdapter.LoadResolvedAsync` resolves offsets against `IClock.Today` at
 **read time**, so the same seed data is always "this week" — whether run today,
 next month, or under a simulated clock in a demo. `control: reset` restores the
 pristine seeds.

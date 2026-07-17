@@ -1,10 +1,10 @@
 using System.ComponentModel;
 using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Capabilities;
+namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
 /// CAPABILITY MODULE (shared): other appliances via SmartThings — oven,
@@ -17,9 +17,9 @@ namespace GoalFlow.Device.Modules.Capabilities;
 [Description("Controls SmartThings appliances: oven, dishwasher, vacuum, lights.")]
 public sealed class ApplianceControlPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public ApplianceControlPlugin(MockWorldStore store) => _store = store;
+    public ApplianceControlPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Lists the appliances SmartThings can reach and their current state.")]

@@ -4,7 +4,7 @@ using GoalFlow.Device.Contracts;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Steering;
+namespace GoalFlow.Device.Harness;
 
 /// <summary>
 /// HARNESS MODULE: Safety &amp; Policy Filter — "LLM plans, code checks."
@@ -94,6 +94,12 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
             return null;
         }
 
+        // PRODUCT-DEBT(M1): which check applies to which call is decided here by
+        // hardcoded product module/function names. M1 turns these into declarative
+        // rule bindings in the product pack's policy.json — the engine keeps the
+        // check implementations (ported 1:1) and learns WHERE to apply them from
+        // the pack. The ingredient-group table in ExpandIngredientGroups is the
+        // same debt.
         return CheckIngredients(_hardConstraints, function, arguments)
             ?? (string.Equals(module, "ShoppingList", StringComparison.OrdinalIgnoreCase) ? CheckBudgetCap(_hardConstraints, function, arguments) : null)
             ?? ((string.Equals(module, "Appliance", StringComparison.OrdinalIgnoreCase) || string.Equals(module, "Notify", StringComparison.OrdinalIgnoreCase))

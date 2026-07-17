@@ -1,9 +1,10 @@
 using System.ComponentModel;
 using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
+using GoalFlow.Device.Harness;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Capabilities;
+namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
 /// CAPABILITY MODULE (meal domain): the recipe box (Samsung Food stand-in).
@@ -14,9 +15,9 @@ namespace GoalFlow.Device.Modules.Capabilities;
 [Description("Recipe search and details: ingredients, allergen tags, prep time.")]
 public sealed class RecipePlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public RecipePlugin(MockWorldStore store) => _store = store;
+    public RecipePlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Finds recipes, optionally filtered by tags to prefer (e.g. more_protein, quick_prep) and ingredients/allergens to exclude.")]

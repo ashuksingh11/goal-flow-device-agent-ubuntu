@@ -1,10 +1,10 @@
 using System.ComponentModel;
 using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Capabilities;
+namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
 /// CAPABILITY MODULE (shared): reminders/notes on the Hub screen.
@@ -15,9 +15,9 @@ namespace GoalFlow.Device.Modules.Capabilities;
 [Description("Family reminders and notes shown on the Hub.")]
 public sealed class ReminderPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public ReminderPlugin(MockWorldStore store) => _store = store;
+    public ReminderPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Lists all active reminders with their due date/time.")]

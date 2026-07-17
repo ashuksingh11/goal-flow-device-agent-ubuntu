@@ -1,7 +1,7 @@
 using GoalFlow.Device.Contracts;
 using Microsoft.Extensions.Logging;
 
-namespace GoalFlow.Device.Modules.Steering;
+namespace GoalFlow.Device.Harness;
 
 /// <summary>
 /// HARNESS MODULE: Approval / Consent (HITL) — the device half.
@@ -40,11 +40,6 @@ public sealed class ApprovalCoordinator
         _logger.LogInformation("proposal_registered {ProposalId} {Module}.{Function} tier={Tier}", proposal.ProposalId, proposal.Module, proposal.Function, proposal.Tier);
         return proposal;
     }
-
-    /// <summary>Classifies a function's tier from its <see cref="SideEffectAttribute"/> metadata.</summary>
-    public string TierOf(string module, string function)
-        => CapabilityRegistry.GetSideEffectTier(module, function)
-           ?? throw new InvalidOperationException($"{module}.{function} is not marked as side-effecting.");
 
     /// <summary>
     /// Applies an <c>approval</c> frame: each decision flips its proposal to

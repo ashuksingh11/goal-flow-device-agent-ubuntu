@@ -1,7 +1,7 @@
 using System.Text.Json.Nodes;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
 
-namespace GoalFlow.Device.Modules.Capabilities;
+namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
 /// Shared mock-world access for the capability plugins (the Family Hub
@@ -18,13 +18,13 @@ namespace GoalFlow.Device.Modules.Capabilities;
 /// consumed inventory) land back in the JSON files so state survives a run.
 /// <c>control: reset</c> restores the pristine seed copies.
 /// </summary>
-public sealed class MockWorldStore
+public sealed class MockFamilyHubAdapter : IProductApiAdapter
 {
     private readonly string _dataDir;
     private readonly IClock _clock;
     private readonly Dictionary<string, string> _seed = [];
 
-    public MockWorldStore(string dataDir, IClock clock)
+    public MockFamilyHubAdapter(string dataDir, IClock clock)
     {
         _dataDir = dataDir;
         _clock = clock;

@@ -26,32 +26,51 @@ src/GoalFlow.Device/
   Program.cs                         # CLI + DI composition root                ← start here
   Agent/GoalAgent.cs                 # SK kernel host: BuildKernel / RunAsync / ApplyApprovalAsync / HandleControlAsync
   Contracts/                         # C# mirror of CONTRACT v2 (Dispatch, PlanReady, Proposal, Approval, Status, Control, AgentEvent, Capabilities, …)
-  Modules/
-    Capabilities/                    # SK plugins — the LLM's tools
-      MockWorldStore.cs              # shared data/ access; resolves day offsets against IClock at read time
+  Harness/                           # THE GENERIC CORE — no product types, no LLM inside
+    CapabilityManager/               # [1] the toolbox: discovery, advertisement, the planner's tool set
+      CapabilityManager.cs           #     discovery over kernel.Plugins + the pack's descriptors
+      CapabilityDescriptor.cs        #     name + live instance + availability (ORDER is significant)
+      SideEffectAttribute.cs         #     a function's intrinsic risk, declared where it lives
+      UnavailableAttribute.cs        #     "declared but not built" → withheld from the planner
+    SafetyPolicyEngine/
+      SafetyFilter.cs                # [2] SK IFunctionInvocationFilter — the safety gate
+    TaskManager/
+      MonitorAdapt.cs                # [4] sustain loop: WorldChange + MaterialityPolicy + adaptations
+    ProductApiAdapter/
+      IProductApiAdapter.cs          # [5] THE PRODUCT SEAM — all the harness may touch of the world
+    Approval/ApprovalCoordinator.cs  # tiered proposal ledger (pending → approved → executed)
+    Grounding/Grounding.cs           # planner context assembler (clock, constraints verbatim, digest)
+    Clock/Clock.cs                   # IClock + SystemClock + SimulatedClock (generic clock)
+    Trace/Trace.cs                   # agent_event streaming + structured logging (one sink, two audiences)
+    #  PrecheckEngine/               # [3] arrives in M3
+  Products/FamilyHub/                # THE PRODUCT PACK — everything fridge-specific
+    FamilyHubProduct.cs              # the manifest: THE single declaration of the plugin catalog
+    Adapter/MockFamilyHubAdapter.cs  # the mock world; resolves day offsets against IClock at read time
+    Plugins/                         # SK plugins — the LLM's tools
       InventoryPlugin.cs CalendarPlugin.cs RecipePlugin.cs ShoppingListPlugin.cs
       ReminderPlugin.cs GuestsPlugin.cs ApplianceControlPlugin.cs
-      FamilyProfilesPlugin.cs BudgetPlugin.cs NotifyPlugin.cs
-    Steering/                        # deterministic harness modules (no LLM inside)
-      SafetyFilter.cs                # SK IFunctionInvocationFilter — the safety gate
-      ApprovalCoordinator.cs         # tiered proposal ledger (pending → approved → executed)
-      Grounding.cs                   # planner context assembler (clock, constraints verbatim, digest)
-      Clock.cs                       # IClock + SystemClock + SimulatedClock (generic clock)
-      MonitorAdapt.cs                # sustain loop: WorldChange + MaterialityPolicy + adaptation proposals
-      Trace.cs                       # agent_event streaming + structured logging (one sink, two audiences)
-      CapabilityRegistry.cs          # [SideEffect] attribute + capabilities-message discovery
+      FamilyProfilesPlugin.cs BudgetPlugin.cs NotifyPlugin.cs   # ← the 3 [Unavailable] stubs
   Transport/WsClient.cs              # one outbound BCL ClientWebSocket to the cloud hub
+verify/m0/check.sh                   # the M0 gate — run it before every commit in this milestone
 ```
+
+**The split is the point.** `Harness/` is domain- and product-agnostic; `Products/`
+holds every fridge string. Namespaces are FLAT (`GoalFlow.Device.Harness`,
+`GoalFlow.Device.Products.FamilyHub`) — folders carry the structure, because
+per-folder namespaces would collide with `Trace.Trace` / `Grounding.Grounding` /
+`CapabilityManager.CapabilityManager`.
 
 ## Entry point (`Program.cs`)
 
 Parses CLI options, loads `.env`, then builds the composition root with
 `Microsoft.Extensions.DependencyInjection`: the `IClock` (real `SystemClock`
-by default; `SimulatedClock` when `--date` or a simulation mode is used),
-`MockWorldStore`, all ten capability plugins as singletons, and the steering
-modules (`SafetyFilter`, `ApprovalCoordinator`, `Grounding`,
-`MaterialityPolicy`, `MonitorAdapt`, `CapabilityRegistry`).
-`GoalAgent.BuildKernel` then assembles the SK kernel from that provider.
+by default; `SimulatedClock` when `--date` or a simulation mode is used), then
+**`services.AddFamilyHub(dataDir)`** — the one line that knows what product this
+is, registering the adapter, the ten plugins and the `CapabilityManager` over
+them — and finally the harness components (`SafetyFilter`, `ApprovalCoordinator`,
+`Grounding`, `MaterialityPolicy`, `MonitorAdapt`).
+`GoalAgent.BuildKernel` then assembles the SK kernel from that provider, looping
+the pack's descriptors — it names no plugin type.
 `ProgramHelpers.EnsureDataDir` runs first and auto-seeds a `--data` dir with
 no `*.json` from `./data` (so a second instance's `--data ./data-b` doesn't
 die on a missing `calendar.json`); in `--connect` mode,
@@ -94,7 +113,7 @@ whole way (via `Trace`; over the WebSocket when connected, stderr otherwise):
    stripping + brace-matched extraction before `JsonSerializer`.
 3. **`phase: checking`** — each proposal is normalized (tier overridden from
    the function's `[SideEffect]` attribute via
-   `CapabilityRegistry.GetSideEffectTier`; `requires_approval = true`; id
+   `CapabilityManager.GetSideEffectTier`; `requires_approval = true`; id
    assigned if missing) and registered in the `ApprovalCoordinator` ledger.
    Plan items stream as `plan_progress` events. The `SafetyFilter`'s verdict
    (`gate: passed|blocked` + recorded violations) becomes `payload.safety`.
@@ -116,7 +135,7 @@ different classes:
 
 - The **LLM** decides what to do — which tools to call, what to cook, what to
   propose. It is fallible by assumption.
-- The **`SafetyFilter`** (`Modules/Steering/SafetyFilter.cs`) is an SK
+- The **`SafetyFilter`** (`Harness/SafetyPolicyEngine/SafetyFilter.cs`) is an SK
   `IFunctionInvocationFilter` sitting in the kernel's invocation pipeline, so
   *every* function call — grounding reads and approved actuations alike —
   passes through `OnFunctionInvocationAsync` first. It checks the pending
@@ -138,7 +157,7 @@ Verify it: put an allergen a seeded recipe contains into `constraints.hard`
 and watch the filter block with `safety.gate: "blocked"` + the recorded
 `violations`.
 
-## The sustain / adaptation loop (`Modules/Steering/MonitorAdapt.cs`)
+## The sustain / adaptation loop (`Harness/TaskManager/MonitorAdapt.cs`)
 
 After a plan is out, `control: advance_day` (or `set_date`) frames drive
 `GoalAgent.HandleControlAsync`:
@@ -188,17 +207,17 @@ frozen for this path — `set_date`/`advance_day` handling only runs after the
 The "11 harness modules" of the v2 design are not conventions; each is a real
 type here or a real SK feature (full table in `docs/HARNESSES.md`):
 
-- **Capability modules** = SK plugins in `Modules/Capabilities/`, registered
+- **Capability modules** = SK plugins in `Products/FamilyHub/Plugins/`, registered
   in `GoalAgent.BuildKernel` under their advertised names (`Inventory`,
   `Calendar`, `Recipes`, `ShoppingList`, `Reminders`, `Guests`, `Appliance`,
   `FamilyProfiles`, `Budget`, `Notify`). Registration IS the action space.
   Side-effecting methods carry `[SideEffect(tier)]`; all world access goes
-  through `MockWorldStore` (writes persist to `data/*.json`).
-- **Steering modules** = the deterministic classes in `Modules/Steering/`:
+  through `MockFamilyHubAdapter` (writes persist to `data/*.json`).
+- **Steering modules** = the deterministic classes in `Harness/`:
   Planner host (`GoalAgent` + SK auto function-calling), Safety
   (`IFunctionInvocationFilter`), Approval (ledger), Grounding, Scheduler
   (`IClock`), MonitorAdapt (+ `MaterialityPolicy`), Trace, and
-  `CapabilityRegistry` — which builds the `capabilities` advertisement by
+  `CapabilityManager` — which builds the `capabilities` advertisement by
   *discovery* (walking `kernel.Plugins` metadata + `[SideEffect]` reflection),
   sent right after `hello_ack` in `--connect` mode.
 
@@ -206,14 +225,14 @@ type here or a real SK feature (full table in `docs/HARNESSES.md`):
 and reuses Calendar, Recipes, ShoppingList, Reminders, Appliance — same
 kernel host, same steering modules, same protocol, different toolbox subset.
 
-## The generic clock (`Modules/Steering/Clock.cs`)
+## The generic clock (`Harness/Clock/Clock.cs`)
 
 Nothing reads the wall clock or hardcodes a date. `IClock` (`Now`, `Today`)
 has two implementations: `SystemClock` (real date; the default) and
 `SimulatedClock` (starts at real today or `--date`; driven by `set_date` /
 `advance_day` controls). Mock data stores **day offsets**
 (`expires_in_days`, `day_offset`, `due_in_days`, `${today+N}` contract
-tokens) that `MockWorldStore` resolves against `IClock.Today` at read time —
+tokens) that `MockFamilyHubAdapter` resolves against `IClock.Today` at read time —
 the seed world is always "this week" no matter when or under what clock it
 runs. Never call `DateTime.Now`; inject `IClock`.
 
@@ -230,19 +249,27 @@ package breaks the port.
 
 **Add a capability plugin** (new device function):
 
-1. Create `Modules/Capabilities/FooPlugin.cs`: public methods tagged
+1. Create `Products/FamilyHub/Plugins/FooPlugin.cs`: public methods tagged
    `[KernelFunction]` + `[Description]` (descriptions are the LLM's tool
    docs); mutating methods get `[SideEffect(ApprovalTiers.…)]`; read/write
-   the world via `MockWorldStore`.
-2. Register it: DI singleton in `Program.cs`, `builder.Plugins.AddFromObject`
-   in `GoalAgent.BuildKernel`, and its type in
-   `CapabilityRegistry.PluginType`.
-3. If the planner should use it for grounding, add its read functions to
-   `GoalAgent.ReadOnlyPlanningFunctions` (and mention them in the grounding
-   instruction); side-effecting functions become valid proposal targets.
+   the world via `IProductApiAdapter`. If you are landing it as a stub that
+   throws, mark the class `[Unavailable("…")]` — that keeps it advertised as an
+   extension point while withholding it from the planner, so the model is never
+   handed a tool that throws. Delete the attribute in the same diff that writes
+   the bodies.
+2. Register it in `Products/FamilyHub/FamilyHubProduct.cs` — a DI singleton and
+   a `CapabilityDescriptor.From("Foo", …)` entry. **That's the whole
+   registration.** Mind where you put the descriptor: the list order is the
+   order the model sees its tools in.
 
-The `capabilities` advertisement, the planner's action space, and the UI's
-module view all update from the registration — no hand-maintained lists.
+Nothing else. The `capabilities` advertisement, the planner's grounding tool set
+(read functions, automatically), valid proposal targets, and the UI's module view
+all follow from that one registration.
+
+*(Until v3-M0 this said the same thing while listing four places to edit —
+`Program.cs`, `BuildKernel`, a `PluginType` switch, and a 13-entry read-only
+whitelist — any of which you could forget. Those are gone; `verify/m0/check.sh`
+gate 2 pins the derivation.)*
 
 **Add a domain:** write a dispatch with the new `domain` + `scope`/`context`,
 add whatever plugins the domain needs (above), and — if it should adapt over
@@ -251,7 +278,7 @@ time — teach `MonitorAdapt.ObserveAsync` its change signatures and
 approval ledger, clock, trace, and protocol need no changes.
 
 **Real actuators (Tizen):** keep every plugin's `[KernelFunction]` signature
-and replace its `MockWorldStore` internals with real Tizen/SmartThings calls.
+and replace its `MockFamilyHubAdapter` internals with real Tizen/SmartThings calls.
 The agent, filters, and contracts don't change.
 
 ## Run & verify

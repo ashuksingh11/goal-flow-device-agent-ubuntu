@@ -1,4 +1,4 @@
-namespace GoalFlow.Device.Modules.Steering;
+namespace GoalFlow.Device.Harness;
 
 /// <summary>
 /// HARNESS MODULE: Scheduler / Temporal (clock half).

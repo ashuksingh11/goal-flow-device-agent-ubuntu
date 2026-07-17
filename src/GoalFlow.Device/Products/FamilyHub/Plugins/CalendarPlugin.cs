@@ -1,10 +1,10 @@
 using System.ComponentModel;
 using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Capabilities;
+namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
 /// CAPABILITY MODULE (shared): the family's shared calendar.
@@ -15,9 +15,9 @@ namespace GoalFlow.Device.Modules.Capabilities;
 [Description("The shared family calendar — who is busy when.")]
 public sealed class CalendarPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public CalendarPlugin(MockWorldStore store) => _store = store;
+    public CalendarPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Lists calendar events between two ISO dates (inclusive), with attendee and start/end times.")]

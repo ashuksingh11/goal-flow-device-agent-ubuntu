@@ -1,6 +1,6 @@
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Capabilities;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
+using GoalFlow.Device.Products.FamilyHub;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
@@ -44,6 +44,7 @@ public sealed class GoalAgent
     private readonly SafetyFilter _safety;
     private readonly ApprovalCoordinator _approvals;
     private readonly MonitorAdapt _monitor;
+    private readonly CapabilityManager _capabilities;
     private readonly IClock _clock;
     private readonly ILogger<GoalAgent> _logger;
     private readonly Dictionary<string, ActiveGoalContext> _activeGoals = new(StringComparer.Ordinal);
@@ -64,6 +65,7 @@ public sealed class GoalAgent
         SafetyFilter safety,
         ApprovalCoordinator approvals,
         MonitorAdapt monitor,
+        CapabilityManager capabilities,
         IClock clock,
         ILogger<GoalAgent> logger)
     {
@@ -73,6 +75,7 @@ public sealed class GoalAgent
         _safety = safety;
         _approvals = approvals;
         _monitor = monitor;
+        _capabilities = capabilities;
         _clock = clock;
         _logger = logger;
     }
@@ -81,9 +84,9 @@ public sealed class GoalAgent
     /// Builds the device kernel:
     ///   1. OpenRouter chat completion (OpenAI-compatible connector; model
     ///      <see cref="AgentSettings.ModelId"/>, endpoint <see cref="AgentSettings.BaseUrl"/>).
-    ///   2. Capability plugins from DI, each under its advertised module name:
-    ///      Inventory, Calendar, Recipes, ShoppingList, Reminders, Guests, Appliance,
-    ///      FamilyProfiles, Budget, Notify.
+    ///   2. Capability plugins from the CapabilityManager's descriptors — i.e.
+    ///      whatever the product pack registered, in ITS order (which is the
+    ///      order the model sees its tools in). This method names no plugin type.
     ///   3. The <see cref="SafetyFilter"/> as an <see cref="IFunctionInvocationFilter"/>
     ///      service — every auto-invoked function passes through it.
     /// </summary>
@@ -98,18 +101,12 @@ public sealed class GoalAgent
 
         builder.Services.AddSingleton(services.GetRequiredService<ILoggerFactory>());
         builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<SafetyFilter>());
-        builder.Services.AddSingleton(services.GetRequiredService<MockWorldStore>());
+        builder.Services.AddSingleton(services.GetRequiredService<IProductApiAdapter>());
 
-        builder.Plugins.AddFromObject(services.GetRequiredService<InventoryPlugin>(), "Inventory");
-        builder.Plugins.AddFromObject(services.GetRequiredService<CalendarPlugin>(), "Calendar");
-        builder.Plugins.AddFromObject(services.GetRequiredService<RecipePlugin>(), "Recipes");
-        builder.Plugins.AddFromObject(services.GetRequiredService<ShoppingListPlugin>(), "ShoppingList");
-        builder.Plugins.AddFromObject(services.GetRequiredService<ReminderPlugin>(), "Reminders");
-        builder.Plugins.AddFromObject(services.GetRequiredService<GuestsPlugin>(), "Guests");
-        builder.Plugins.AddFromObject(services.GetRequiredService<ApplianceControlPlugin>(), "Appliance");
-        builder.Plugins.AddFromObject(services.GetRequiredService<FamilyProfilesPlugin>(), "FamilyProfiles");
-        builder.Plugins.AddFromObject(services.GetRequiredService<BudgetPlugin>(), "Budget");
-        builder.Plugins.AddFromObject(services.GetRequiredService<NotifyPlugin>(), "Notify");
+        foreach (var capability in services.GetRequiredService<CapabilityManager>().Descriptors)
+        {
+            builder.Plugins.AddFromObject(capability.Instance, capability.Name);
+        }
 
         return builder.Build();
     }
@@ -240,7 +237,7 @@ public sealed class GoalAgent
 
         var groundingSettings = new OpenAIPromptExecutionSettings
         {
-            FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(ReadOnlyPlanningFunctions(), autoInvoke: true, options: new FunctionChoiceBehaviorOptions
+            FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(GroundingFunctions(), autoInvoke: true, options: new FunctionChoiceBehaviorOptions
             {
                 AllowConcurrentInvocation = false,
                 AllowParallelCalls = false
@@ -892,7 +889,7 @@ public sealed class GoalAgent
 
         if (control.Command == ControlCommands.Reset)
         {
-            var store = _kernel.Services.GetRequiredService<MockWorldStore>();
+            var store = _kernel.Services.GetRequiredService<IProductApiAdapter>();
             await store.ResetAsync(ct);
             _activeGoals.Remove(control.GoalId);
         }
@@ -972,30 +969,19 @@ public sealed class GoalAgent
             }
         };
 
-    private IReadOnlyList<KernelFunction> ReadOnlyPlanningFunctions()
-    {
-        var names = new (string Module, string Function)[]
-        {
-            ("Inventory", "ListItems"),
-            ("Inventory", "GetExpiringItems"),
-            ("Inventory", "CheckAvailability"),
-            ("Calendar", "GetEvents"),
-            ("Calendar", "GetBusyEvenings"),
-            ("Recipes", "FindRecipes"),
-            ("Recipes", "GetRecipe"),
-            ("ShoppingList", "GetList"),
-            ("Reminders", "List"),
-            ("Guests", "GetEvent"),
-            ("Guests", "GetGuests"),
-            ("Guests", "GetDietaryConstraints"),
-            ("Appliance", "ListAppliances")
-        };
-        return names.Select(n => _kernel.Plugins.GetFunction(n.Module, n.Function)).ToArray();
-    }
+    /// <summary>
+    /// The planner's grounding tool set — DERIVED by the Capability Manager from
+    /// what the product pack registered, not hand-listed here. Both the CONTENT
+    /// and the ORDER are what the LLM receives as its tools array; the M0 gate
+    /// (<c>--dump-capabilities</c>) diffs both against what the old hand-written
+    /// whitelist produced.
+    /// </summary>
+    internal IReadOnlyList<KernelFunction> GroundingFunctions()
+        => _capabilities.GetGroundingFunctions(_kernel);
 
     private ProposalItem NormalizeProposal(ProposalItem proposal)
     {
-        var tier = CapabilityRegistry.GetSideEffectTier(proposal.Module, proposal.Function) ?? proposal.Tier;
+        var tier = _capabilities.GetSideEffectTier(proposal.Module, proposal.Function) ?? proposal.Tier;
         return proposal with
         {
             Tier = tier,

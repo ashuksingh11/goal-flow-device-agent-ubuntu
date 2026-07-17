@@ -1,0 +1,13 @@
+Inventory.ListItems
+Inventory.GetExpiringItems
+Inventory.CheckAvailability
+Calendar.GetEvents
+Calendar.GetBusyEvenings
+Recipes.FindRecipes
+Recipes.GetRecipe
+ShoppingList.GetList
+Reminders.List
+Guests.GetEvent
+Guests.GetGuests
+Guests.GetDietaryConstraints
+Appliance.ListAppliances

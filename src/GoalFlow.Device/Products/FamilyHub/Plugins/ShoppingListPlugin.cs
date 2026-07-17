@@ -1,10 +1,10 @@
 using System.ComponentModel;
 using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Capabilities;
+namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
 /// CAPABILITY MODULE (shared): shopping list + grocery ordering.
@@ -17,9 +17,9 @@ namespace GoalFlow.Device.Modules.Capabilities;
 [Description("The family shopping list and grocery ordering.")]
 public sealed class ShoppingListPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public ShoppingListPlugin(MockWorldStore store) => _store = store;
+    public ShoppingListPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Returns the current shopping list.")]

@@ -1,9 +1,8 @@
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Capabilities;
 using Microsoft.Extensions.Logging;
 using System.Text.Json.Nodes;
 
-namespace GoalFlow.Device.Modules.Steering;
+namespace GoalFlow.Device.Harness;
 
 /// <summary>
 /// HARNESS MODULE: Monitor &amp; Adapt.
@@ -17,12 +16,12 @@ namespace GoalFlow.Device.Modules.Steering;
 public sealed class MonitorAdapt
 {
     private readonly IClock _clock;
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
     private readonly MaterialityPolicy _policy;
     private readonly ApprovalCoordinator _approvals;
     private readonly ILogger<MonitorAdapt> _logger;
 
-    public MonitorAdapt(IClock clock, MockWorldStore store, MaterialityPolicy policy, ApprovalCoordinator approvals, ILogger<MonitorAdapt> logger)
+    public MonitorAdapt(IClock clock, IProductApiAdapter store, MaterialityPolicy policy, ApprovalCoordinator approvals, ILogger<MonitorAdapt> logger)
     {
         _clock = clock;
         _store = store;
@@ -41,6 +40,12 @@ public sealed class MonitorAdapt
 
     public Task<IReadOnlyList<WorldChange>> ObserveAsync(ActiveGoalContext goal, CancellationToken ct = default)
     {
+        // PRODUCT-DEBT(M2): a harness module switching on product domain names.
+        // The observers themselves (ObserveMealChanges / ObserveGuestChanges) are
+        // product knowledge living in the generic core; M2 extracts them behind
+        // IDomainObserver, contributed by the product pack, and this switch
+        // becomes "ask each registered observer". Deferred deliberately — doing
+        // it here would be a behavior change in a commit that must have none.
         var changes = goal.Dispatch.Domain switch
         {
             "meal_plan" => ObserveMealChanges(goal),

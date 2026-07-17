@@ -1,7 +1,7 @@
 using GoalFlow.Device.Agent;
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Capabilities;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
+using GoalFlow.Device.Products.FamilyHub;
 using GoalFlow.Device.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -52,26 +52,17 @@ services.AddSingleton<IClock>(_ => options.Date is { } start
     ? new SimulatedClock(DateOnly.Parse(start))
     : new SimulatedClock());
 
-// Mock world + capability plugins (meal domain + shared).
-services.AddSingleton(sp => new MockWorldStore(options.DataDir, sp.GetRequiredService<IClock>()));
-services.AddSingleton<InventoryPlugin>();
-services.AddSingleton<CalendarPlugin>();
-services.AddSingleton<RecipePlugin>();
-services.AddSingleton<ShoppingListPlugin>();
-services.AddSingleton<ReminderPlugin>();
-services.AddSingleton<GuestsPlugin>();
-services.AddSingleton<ApplianceControlPlugin>();
-services.AddSingleton<FamilyProfilesPlugin>();
-services.AddSingleton<BudgetPlugin>();
-services.AddSingleton<NotifyPlugin>();
+// THE PRODUCT PACK: the mock world (behind IProductApiAdapter), the capability
+// plugins, and the CapabilityManager over them. This is the ONLY line here that
+// knows what product this is — swapping packs is the whole extension story.
+services.AddFamilyHub(options.DataDir);
 
-// Steering modules.
+// Harness components (generic — no product types).
 services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
 services.AddSingleton<MaterialityPolicy>();
 services.AddSingleton<MonitorAdapt>();
-services.AddSingleton<CapabilityRegistry>();
 
 await using var provider = services.BuildServiceProvider();
 
@@ -104,8 +95,27 @@ var agent = new GoalAgent(
     provider.GetRequiredService<SafetyFilter>(),
     provider.GetRequiredService<ApprovalCoordinator>(),
     provider.GetRequiredService<MonitorAdapt>(),
+    provider.GetRequiredService<CapabilityManager>(),
     provider.GetRequiredService<IClock>(),
     loggerFactory.CreateLogger<GoalAgent>());
+
+// M0 VERIFICATION GATE (dev tool, not a demo path): print the deterministic
+// surface of the kernel so a refactor can be proven behavior-neutral.
+//   line 1  : the capabilities frame (pure reflection — no LLM, no network)
+//   line 2+ : one Module.Function per grounding tool, IN THE ORDER the planner
+//             hands them to the model.
+// Diffed against verify/m0/*.golden by verify/m0/check.sh. Needs no real API
+// key: BuildKernel only configures the connector, it never calls out.
+if (options.DumpCapabilities)
+{
+    Console.Out.WriteLine(ContractJson.Serialize(provider.GetRequiredService<CapabilityManager>().BuildCapabilitiesMessage(kernel)));
+    foreach (var fn in agent.GroundingFunctions())
+    {
+        Console.Out.WriteLine($"{fn.PluginName}.{fn.Name}");
+    }
+
+    return;
+}
 
 if (options.ConnectUrl is { } url)
 {
@@ -114,7 +124,7 @@ if (options.ConnectUrl is { } url)
     loggerFactory.CreateLogger("Connect").LogInformation("device_id={DeviceId} device_name={DeviceName}", deviceId, deviceName);
     await using var ws = new WsClient(new Uri(url), loggerFactory.CreateLogger<WsClient>(), deviceId, deviceName);
     liveWs = ws;
-    var capabilities = provider.GetRequiredService<CapabilityRegistry>().BuildCapabilitiesMessage(kernel);
+    var capabilities = provider.GetRequiredService<CapabilityManager>().BuildCapabilitiesMessage(kernel);
     var connectLogger = loggerFactory.CreateLogger("Connect");
     await ws.ConnectAsync(capabilities);
     // Handle each frame on a BACKGROUND task so the receive loop keeps pumping —
@@ -216,6 +226,9 @@ internal sealed record CliOptions
     /// <summary>--simulate-guest — plan the guest contract, then advance to the guest adaptation trigger.</summary>
     public bool SimulateGuest { get; init; }
 
+    /// <summary>--dump-capabilities — print the kernel's deterministic surface and exit (M0 gate; see verify/m0/).</summary>
+    public bool DumpCapabilities { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -254,6 +267,7 @@ internal sealed record CliOptions
                 "--verbose" => options with { Verbose = true },
                 "--simulate-week" => options with { SimulateWeek = true, Domain = "meal_plan" },
                 "--simulate-guest" => options with { SimulateGuest = true, Domain = "guest_dinner" },
+                "--dump-capabilities" => options with { DumpCapabilities = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
