@@ -1,0 +1,9 @@
+{
+  "comment": [
+    "SENT-NOTIFICATION LOG. Notify writes here so a sent message is a real, inspectable",
+    "side effect (the demo can show 'invitation sent to 20 guests') rather than a no-op.",
+    "Announce times are checked against quiet_hours by the SafetyFilter before they reach",
+    "here. Seeded empty; entries accrue as the agent notifies."
+  ],
+  "sent": []
+}

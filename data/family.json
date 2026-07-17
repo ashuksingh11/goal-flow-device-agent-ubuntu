@@ -1,0 +1,49 @@
+{
+  "comment": [
+    "WHO LIVES HERE — grounding/preference input for FamilyProfiles, NOT a safety",
+    "source. Hard health constraints (allergies/medical) still arrive on the dispatch's",
+    "constraints.hard from the cloud family profile; this file is diets, dislikes, ages,",
+    "and who to invite. No dates here, so the day-offset rule doesn't apply.",
+    "",
+    "Names align with the cloud memory profile (Priya, Rohan, Aarav): those are the",
+    "residents. The Maya/Leo/Sam set in guests.json are dinner GUESTS, a different list."
+  ],
+  "members": [
+    {
+      "id": "mem-priya",
+      "name": "Priya",
+      "role": "parent",
+      "age": 38,
+      "dietary": [],
+      "dislikes": ["mushrooms"],
+      "notes": "hosting style: casual, kid-friendly"
+    },
+    {
+      "id": "mem-rohan",
+      "name": "Rohan",
+      "role": "parent",
+      "age": 41,
+      "dietary": ["low_sodium"],
+      "dislikes": [],
+      "notes": "medical low-sodium — enforced as a hard constraint on the dispatch, listed here for menu grounding"
+    },
+    {
+      "id": "mem-aarav",
+      "name": "Aarav",
+      "role": "child",
+      "age": 9,
+      "dietary": [],
+      "dislikes": ["olives"],
+      "notes": "football practice Wednesday 18:00; birthday boy"
+    },
+    {
+      "id": "mem-diya",
+      "name": "Diya",
+      "role": "child",
+      "age": 5,
+      "dietary": [],
+      "dislikes": ["spicy"],
+      "notes": "youngest"
+    }
+  ]
+}

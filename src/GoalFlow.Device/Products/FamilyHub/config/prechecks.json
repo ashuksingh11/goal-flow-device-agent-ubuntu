@@ -30,6 +30,10 @@
     "Appliance.RunProgram": ["appliance_online:dishwasher"],
     "Appliance.Defrost": ["appliance_online:fridge"],
 
-    "ShoppingList.PlaceOrder": ["internet", "payment_configured"]
+    "ShoppingList.PlaceOrder": ["internet", "payment_configured"],
+
+    "$comment_security": "Locking is a local radio, so only SmartThings. Arming asserts the cameras are actually watching — camera_operational + ai_vision_initialized, the two probes that shipped in device_state.json unused since M3, waiting for exactly this. A goal must not tell a departing family the house is armed when the camera is dark.",
+    "Security.LockAllDoors": ["smartthings_connected"],
+    "Security.ArmSecurity": ["smartthings_connected", "camera_operational", "ai_vision_initialized"]
   }
 }

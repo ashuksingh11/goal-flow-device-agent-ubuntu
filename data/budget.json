@@ -1,0 +1,36 @@
+{
+  "comment": [
+    "GROCERY/HOUSEHOLD BUDGET. Read-only awareness for the planner: it ESTIMATES with",
+    "this so it can plan within the cap. ENFORCEMENT of budget_cap is the SafetyFilter's",
+    "job at ShoppingList.PlaceOrder time (the numeric_cap rule in policy.json) — 'LLM",
+    "plans, code checks'. The cap here is informational; the hard cap rides constraints.hard.",
+    "",
+    "No dates: `period` is a label, not a schedule, so the day-offset rule doesn't apply.",
+    "`prices` is a small price book so EstimateCost returns a real number instead of a guess."
+  ],
+  "period": "this week",
+  "currency": "USD",
+  "cap": 120.0,
+  "spent": 34.5,
+  "prices": {
+    "milk": 3.2,
+    "eggs": 4.0,
+    "bread": 2.5,
+    "lentils": 2.0,
+    "pasta": 1.8,
+    "rice": 3.5,
+    "spinach": 2.2,
+    "paneer": 5.0,
+    "chicken": 8.5,
+    "tomatoes": 3.0,
+    "onions": 2.0,
+    "birthday cake": 28.0,
+    "party decorations": 22.0,
+    "candles": 4.5,
+    "balloons": 6.0,
+    "paper plates": 5.5,
+    "juice boxes": 7.0,
+    "snacks": 12.0
+  },
+  "default_item_price": 4.0
+}
