@@ -39,6 +39,13 @@ public sealed class Grounding
             $"domain: {dispatch.Domain}",
             $"objective: {dispatch.Objective}",
             $"time_window: {window.Start}..{window.End}",
+            // PRODUCT-DEBT(prompts): this line names the Family Hub's nouns, so the
+            // generic core still describes a fridge. It could be generated from the
+            // CapabilityManager's advertised modules — but prompt wording IS
+            // behavior, and rewording it blind would change what the model grounds
+            // on with no way to tell a fix from a regression. It moves with the rest
+            // of the prompts (GoalAgent's compose instructions carry the same debt)
+            // once there is a PromptComposer and a diffable way to compare runs.
             "Use read-only tools to ground inventory, calendar, recipes, reminders, shopping list, guests, dietary constraints, and appliance state before finalizing."
         ]);
 

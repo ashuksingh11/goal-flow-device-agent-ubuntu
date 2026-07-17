@@ -62,8 +62,8 @@ services.AddFamilyHub(options.DataDir);
 services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
-services.AddSingleton<MaterialityPolicy>();
 services.AddSingleton<MonitorAdapt>();
+services.AddSingleton<TaskManager>();
 
 await using var provider = services.BuildServiceProvider();
 
@@ -97,6 +97,7 @@ var agent = new GoalAgent(
     provider.GetRequiredService<ApprovalCoordinator>(),
     provider.GetRequiredService<MonitorAdapt>(),
     provider.GetRequiredService<CapabilityManager>(),
+    provider.GetRequiredService<TaskManager>(),
     provider.GetRequiredService<IClock>(),
     loggerFactory.CreateLogger<GoalAgent>());
 
@@ -136,6 +137,12 @@ if (options.VerifySafetyRules)
 if (options.VerifyGrades)
 {
     Environment.ExitCode = ProgramHelpers.VerifyGrades(provider);
+    return;
+}
+
+if (options.VerifyTaskLifecycle)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyTaskLifecycleAsync(loggerFactory);
     return;
 }
 
@@ -260,6 +267,9 @@ internal sealed record CliOptions
     /// <summary>--verify-grades — assert the grade ratchet holds and AX is unproposable (M1 gate).</summary>
     public bool VerifyGrades { get; init; }
 
+    /// <summary>--verify-task-lifecycle — assert the task DAG, legal moves and derived progress (M2 gate).</summary>
+    public bool VerifyTaskLifecycle { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -302,6 +312,7 @@ internal sealed record CliOptions
                 "--verify-policy-isolation" => options with { VerifyPolicyIsolation = true },
                 "--verify-safety-rules" => options with { VerifySafetyRules = true },
                 "--verify-grades" => options with { VerifyGrades = true },
+                "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -335,6 +346,119 @@ internal static class DotEnv
 
 internal static class ProgramHelpers
 {
+/// <summary>
+/// M2 GATE: the task lifecycle — dependency order, legal moves, derived progress.
+///
+/// <para>
+/// Agent Board reports progress %, next step and pending counts as FACTS. They
+/// are only facts if the ledger underneath is sound, so this checks the three
+/// things it rests on: a task never runs before what it depends on, an illegal
+/// move is refused rather than silently applied, and progress is computed from
+/// task state rather than guessed.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyTaskLifecycleAsync(ILoggerFactory loggerFactory)
+{
+    var tasks = new TaskManager(loggerFactory.CreateLogger<TaskManager>());
+    var failures = new List<string>();
+    void Check(bool ok, string what) { if (!ok) failures.Add(what); }
+
+    // A four-task DAG: t1 → t2 → t3, and t4 waiting on both t2 and t3.
+    //
+    // DECLARED IN REVERSE DEPENDENCY ORDER, deliberately. Listed t1..t4, "the first
+    // unfinished task" and "the first task whose deps are met" are the same answer,
+    // so a NextReady that ignored dependencies entirely would still look correct —
+    // the test would pass for the wrong reason. (It did: breaking dependency
+    // resolution on purpose tripped only one assertion until this was reversed.)
+    var dispatch = ProgramHelpers.BuildLocalDispatch("verify the task lifecycle", "verify", new SimulatedClock());
+    var goal = tasks.CreateGoal(dispatch, [
+        new TaskRecord { TaskId = "t4", GoalId = dispatch.GoalId, Title = "notify family", DependsOn = ["t2", "t3"] },
+        new TaskRecord { TaskId = "t3", GoalId = dispatch.GoalId, Title = "build shopping list", DependsOn = ["t2"] },
+        new TaskRecord { TaskId = "t2", GoalId = dispatch.GoalId, Title = "find recipes", DependsOn = ["t1"] },
+        new TaskRecord { TaskId = "t1", GoalId = dispatch.GoalId, Title = "check inventory" },
+    ], new JsonObject());
+
+    Check(goal.ProgressPercent == 0, "a fresh goal is 0%");
+    Check(goal.PendingTasks == 4, "a fresh goal has 4 pending");
+    Check(tasks.NextReady(dispatch.GoalId)?.TaskId == "t1", "t1 is ready first (nothing blocks it)");
+
+    // Dependencies gate the frontier: completing t1 releases t2, and only t2.
+    await tasks.TransitionAsync(dispatch.GoalId, "t1", TaskState.Ready);
+    await tasks.TransitionAsync(dispatch.GoalId, "t1", TaskState.Planning);
+    await tasks.TransitionAsync(dispatch.GoalId, "t1", TaskState.Executing);
+    await tasks.TransitionAsync(dispatch.GoalId, "t1", TaskState.Completed);
+    Check(tasks.NextReady(dispatch.GoalId)?.TaskId == "t2", "completing t1 releases t2");
+    Check(goal.ProgressPercent == 25, $"1 of 4 done is 25%, got {goal.ProgressPercent}");
+    Check(goal.PendingTasks == 3, "3 pending after t1");
+
+    // t4 must NOT be reachable while t3 is outstanding, even though t2 is done.
+    await tasks.TransitionAsync(dispatch.GoalId, "t2", TaskState.Ready);
+    await tasks.TransitionAsync(dispatch.GoalId, "t2", TaskState.Planning);
+    await tasks.TransitionAsync(dispatch.GoalId, "t2", TaskState.Executing);
+    await tasks.TransitionAsync(dispatch.GoalId, "t2", TaskState.Completed);
+    Check(tasks.NextReady(dispatch.GoalId)?.TaskId == "t3", "t4 waits for BOTH its deps — t3 is next, not t4");
+
+    // Illegal moves are refused, not applied. Completed is terminal.
+    Check(!await tasks.TransitionAsync(dispatch.GoalId, "t1", TaskState.Planning), "Completed is terminal — no move out of it");
+    Check(goal.Tasks.First(t => t.TaskId == "t1").State == TaskState.Completed, "a refused move must not mutate the task");
+    Check(!await tasks.TransitionAsync(dispatch.GoalId, "t3", TaskState.Completed), "Created -> Completed skips the work — refused");
+    Check(!await tasks.TransitionAsync(dispatch.GoalId, "nope", TaskState.Ready), "an unknown task id is refused, not created");
+
+    // Retries are counted, and a retried task returns to the frontier.
+    await tasks.TransitionAsync(dispatch.GoalId, "t3", TaskState.Ready);
+    await tasks.TransitionAsync(dispatch.GoalId, "t3", TaskState.Planning);
+    await tasks.TransitionAsync(dispatch.GoalId, "t3", TaskState.Retrying, "the store was unreachable");
+    Check(goal.Tasks.First(t => t.TaskId == "t3").RetryCount == 1, "Retrying increments the retry count");
+    Check(tasks.NextReady(dispatch.GoalId)?.TaskId == "t3", "a retrying task is still the frontier");
+
+    // Monitoring counts as progress — the agent's work on that task is done and the
+    // world is playing out. (t3 is mid-flight here, so this only checks the rule.)
+    Check(goal.ProgressPercent == 50, $"2 of 4 done is 50%, got {goal.ProgressPercent}");
+
+    // The percentage and the "n/m" line must never be able to disagree.
+    Check(goal.WorkDone + goal.PendingTasks + goal.Tasks.Count(t => t.State is TaskState.Failed or TaskState.Cancelled) == goal.Tasks.Count,
+        "WorkDone + Pending + terminal-failures must account for every task");
+
+    // A failure reason is kept; failure is terminal and does NOT count as progress.
+    await tasks.TransitionAsync(dispatch.GoalId, "t3", TaskState.Failed, "the oven never came back");
+    Check(goal.Tasks.First(t => t.TaskId == "t3").FailureReason == "the oven never came back", "a failure keeps its reason");
+    Check(goal.ProgressPercent == 50, $"a FAILED task is terminal but not progress: 2 of 4 = 50%, got {goal.ProgressPercent}");
+    Check(tasks.NextReady(dispatch.GoalId) is null, "t4's dep failed, so nothing is ready — the goal is stuck, not silently done");
+    Check(!goal.IsComplete, "a goal with an unreachable task is not complete");
+
+    // ---- The DAG sanitizer: what protects the ledger from a bad decomposition ----
+    // The decomposition is an LLM suggestion, so it can name a dependency that
+    // doesn't exist, depend on itself, or form a cycle. A cycle is the dangerous
+    // one: NextReady returns nothing and the goal looks alive forever.
+    TaskRecord T(string id, params string[] deps) => new() { TaskId = id, GoalId = "g", Title = id, DependsOn = deps };
+
+    var (unknown, r1) = TaskDag.Sanitize([T("t1", "nope"), T("t2", "t1")]);
+    Check(unknown[0].DependsOn.Count == 0, "an unknown dependency is dropped, not kept");
+    Check(r1.Any(r => r.Contains("unknown")), "dropping an unknown dep is reported");
+
+    var (self, _) = TaskDag.Sanitize([T("t1", "t1")]);
+    Check(self[0].DependsOn.Count == 0, "a self-dependency is dropped (it can never be satisfied)");
+
+    var (cycle, r2) = TaskDag.Sanitize([T("t1", "t2"), T("t2", "t1")]);
+    Check(cycle.Count == 2, "a cycle keeps both tasks — break the edge, not the goal");
+    Check(r2.Any(r => r.Contains("cycle")), "breaking a cycle is reported");
+    var cycleGoal = tasks.CreateGoal(
+        ProgramHelpers.BuildLocalDispatch("cycle", "verify", new SimulatedClock()) with { GoalId = "cyc" },
+        cycle.Select(t => t with { GoalId = "cyc" }).ToArray(), new JsonObject());
+    Check(tasks.NextReady("cyc") is not null, "a repaired cycle must be RUNNABLE — else the goal hangs forever");
+
+    var (capped, r3) = TaskDag.Sanitize(Enumerable.Range(1, 20).Select(i => T($"t{i}")).ToArray());
+    Check(capped.Count == TaskDag.MaxTasks, $"20 tasks capped to {TaskDag.MaxTasks}");
+    Check(r3.Any(r => r.Contains("capped")), "capping is reported, not silent");
+
+    var (ordered, _) = TaskDag.Sanitize([T("t3", "t2"), T("t1"), T("t2", "t1")]);
+    Check(ordered.Select(t => t.TaskId).SequenceEqual(["t1", "t2", "t3"]), "tasks come back in dependency order");
+
+    foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
+    Console.Out.WriteLine(failures.Count == 0 ? "gate 8 (task lifecycle + DAG): PASS" : $"gate 8 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
+}
+
 /// <summary>
 /// M1 GATE: automation grades — the ratchet, and AX.
 ///

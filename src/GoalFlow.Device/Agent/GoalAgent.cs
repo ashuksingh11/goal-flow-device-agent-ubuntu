@@ -47,7 +47,7 @@ public sealed class GoalAgent
     private readonly CapabilityManager _capabilities;
     private readonly IClock _clock;
     private readonly ILogger<GoalAgent> _logger;
-    private readonly Dictionary<string, ActiveGoalContext> _activeGoals = new(StringComparer.Ordinal);
+    private readonly TaskManager _tasks;
 
     /// <summary>Plan patches awaiting approval, keyed by proposal id → (goalId, patch).
     /// Registered when a daily adaptation is proposed; applied in ApplyApproval.</summary>
@@ -66,6 +66,7 @@ public sealed class GoalAgent
         ApprovalCoordinator approvals,
         MonitorAdapt monitor,
         CapabilityManager capabilities,
+        TaskManager tasks,
         IClock clock,
         ILogger<GoalAgent> logger)
     {
@@ -76,6 +77,7 @@ public sealed class GoalAgent
         _approvals = approvals;
         _monitor = monitor;
         _capabilities = capabilities;
+        _tasks = tasks;
         _clock = clock;
         _logger = logger;
     }
@@ -144,6 +146,192 @@ public sealed class GoalAgent
         => HandleControlCoreAsync(control, ct);
 
     private const int MaxComposeAttempts = 3;
+
+    /// <summary>Id of the one task a goal falls back to when decomposition is unavailable.</summary>
+    private const string SingleTaskId = "t1";
+
+    /// <summary>
+    /// THE FALL-BACK: one task for the whole goal — exactly the v2 shape. Used
+    /// when decomposition fails or the model returns nothing usable. The goal
+    /// still plans and still runs; the board just shows one coarse step instead of
+    /// several. A decomposition failure must never cost the user their goal.
+    /// </summary>
+    private static IReadOnlyList<TaskRecord> SynthesizeTasks(Dispatch dispatch)
+        => [new TaskRecord { TaskId = SingleTaskId, GoalId = dispatch.GoalId, Title = dispatch.Objective }];
+
+    /// <summary>
+    /// Moves every task currently in <paramref name="from"/> to <paramref name="to"/>.
+    ///
+    /// <para>
+    /// The compose plans the whole goal at once, so its tasks move as a cohort
+    /// rather than one at a time. Filtering on the CURRENT state matters: a task
+    /// that already failed or was cancelled must not be dragged forward, and the
+    /// ledger would refuse the illegal move anyway — this just doesn't ask.
+    /// </para>
+    /// </summary>
+    private async Task AdvanceTasksAsync(string goalId, TaskState from, TaskState to)
+    {
+        var goal = _tasks.GetGoal(goalId);
+        if (goal is null)
+        {
+            return;
+        }
+
+        foreach (var task in goal.Tasks.Where(t => t.State == from).ToArray())
+        {
+            await _tasks.TransitionAsync(goalId, task.TaskId, to);
+        }
+    }
+
+    /// <summary>
+    /// Completes a goal's monitoring tasks once its time window has closed.
+    ///
+    /// <para>
+    /// Without this a goal monitors forever: the board would show a finished meal
+    /// week stuck at "in progress" all year. The end condition is the contract's
+    /// own <c>time_window.end</c> read against the GENERIC clock — not a guess, and
+    /// not the agent deciding for itself that it is finished.
+    /// </para>
+    ///
+    /// <para>Returns true when this call is what completed it.</para>
+    /// </summary>
+    private async Task<bool> CompleteIfWindowPassedAsync(GoalRecord goal, CancellationToken ct)
+    {
+        if (!DateOnly.TryParse(goal.Dispatch.TimeWindow.End, out var end) || _clock.Today <= end)
+        {
+            return false;
+        }
+
+        var monitoring = goal.Tasks.Where(t => t.State == TaskState.Monitoring).ToArray();
+        if (monitoring.Length == 0)
+        {
+            return false;
+        }
+
+        foreach (var task in monitoring)
+        {
+            await _tasks.TransitionAsync(goal.Dispatch.GoalId, task.TaskId, TaskState.Completed);
+        }
+
+        _logger.LogInformation("goal_complete {GoalId} window_end={End} progress={Progress}%",
+            goal.Dispatch.GoalId, goal.Dispatch.TimeWindow.End, goal.ProgressPercent);
+        return true;
+    }
+
+    /// <summary>
+    /// The one-line progress summary — what Agent Board will render as a
+    /// percentage and a next step. Derived from the ledger, never from the clock.
+    /// </summary>
+    private static string ProgressNote(GoalRecord? goal)
+        => goal is null || goal.Tasks.Count <= 1
+            ? ""
+            : $" Goal {goal.ProgressPercent}% ({goal.WorkDone}/{goal.Tasks.Count} steps done).";
+
+    /// <summary>
+    /// ALTITUDE ONE of the planner: what are the pieces of this goal?
+    ///
+    /// <para>
+    /// A JSON-mode call with NO tools, over the capabilities the device actually
+    /// advertises, asking only for structure — titles and dependencies — never
+    /// world facts. Grounding is altitude two's job (that pass has the tools);
+    /// asking a toolless model about the fridge would just invite invention.
+    /// </para>
+    ///
+    /// <para>
+    /// The result is a suggestion: <see cref="TaskDag.Sanitize"/> repairs it into
+    /// something executable. FAIL-SOFT everywhere — any failure returns the single
+    /// synthesized task rather than throwing, because a goal that plans coarsely
+    /// beats a goal that dies.
+    /// </para>
+    /// </summary>
+    private async Task<IReadOnlyList<TaskRecord>> DecomposeAsync(IChatCompletionService chat, Dispatch dispatch, CancellationToken ct)
+    {
+        try
+        {
+            var history = new ChatHistory();
+            history.AddSystemMessage(DecomposeSystemPrompt);
+            history.AddUserMessage(BuildDecomposeInstruction(dispatch));
+
+            var content = await GetComposeContentAsync(chat, history, ct);
+            var json = ExtractJson(content);
+            if (json is null)
+            {
+                _logger.LogWarning("decompose_unparseable — falling back to a single task");
+                return SynthesizeTasks(dispatch);
+            }
+
+            var proposed = JsonSerializer.Deserialize<DecomposeResult>(json, ContractJson.Options)?.Tasks;
+            if (proposed is null || proposed.Count == 0)
+            {
+                _logger.LogWarning("decompose_empty — falling back to a single task");
+                return SynthesizeTasks(dispatch);
+            }
+
+            var (tasks, repairs) = TaskDag.Sanitize(proposed
+                .Select((t, i) => new TaskRecord
+                {
+                    TaskId = string.IsNullOrWhiteSpace(t.Id) ? $"t{i + 1}" : t.Id,
+                    GoalId = dispatch.GoalId,
+                    Title = t.Title ?? dispatch.Objective,
+                    DependsOn = t.DependsOn ?? [],
+                    Capabilities = t.Capabilities ?? []
+                })
+                .ToArray());
+
+            foreach (var repair in repairs)
+            {
+                _logger.LogWarning("decompose_repaired {Repair}", repair);
+            }
+
+            _logger.LogInformation("decomposed {GoalId} into {Count} task(s){Repaired}",
+                dispatch.GoalId, tasks.Count, repairs.Count > 0 ? $" ({repairs.Count} repaired)" : "");
+            await _trace.ThinkingAsync($"broke the goal into {tasks.Count} steps: {string.Join(" → ", tasks.Select(t => t.Title))}");
+            return tasks;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "decompose_failed — falling back to a single task");
+            return SynthesizeTasks(dispatch);
+        }
+    }
+
+    private const string DecomposeSystemPrompt = """
+        You break a home-assistant goal into the few steps needed to achieve it.
+        Reply with JSON only (no prose, no Markdown, no code fence):
+        { "tasks": [ { "id": "t1", "title": "short imperative step", "depends_on": [], "capabilities": ["Inventory"] } ] }
+
+        Rules:
+        - Between 1 and 8 tasks. Fewer, meaningful steps beat many trivial ones.
+        - Order them so dependencies come first; depends_on lists ids from THIS list only.
+        - A task is a unit of work worth showing a person as "next step" — not a tool call.
+        - capabilities: which listed modules the step will likely use. Advisory.
+        - Do NOT state world facts (what is in the fridge, who is busy). You cannot
+          see the world here; a later pass grounds each step against it.
+        """;
+
+    /// <summary>The decompose instruction: the contract + what this device can actually do.</summary>
+    private string BuildDecomposeInstruction(Dispatch dispatch)
+        => $"""
+        Task Contract:
+        {ContractJson.Serialize(dispatch)}
+
+        Capabilities available on this device:
+        {string.Join("\n", _capabilities.Descriptors.Where(d => d.Available).Select(d => $"- {d.Name}"))}
+        """;
+
+    /// <summary>The decompose call's wire shape (snake_case via ContractJson).</summary>
+    private sealed record DecomposeResult
+    {
+        public List<DecomposedTask> Tasks { get; init; } = [];
+    }
+
+    private sealed record DecomposedTask
+    {
+        public string? Id { get; init; }
+        public string? Title { get; init; }
+        public List<string>? DependsOn { get; init; }
+        public List<string>? Capabilities { get; init; }
+    }
 
     /// <summary>The grounding instruction (user message) rendered from the contract.</summary>
     internal static string BuildGroundingInstruction(Dispatch dispatch)
@@ -231,6 +419,13 @@ public sealed class GoalAgent
         _safety.SetTrace(_trace);
 
         _logger.LogInformation("plan_start domain={Domain} model_clock={Today}", dispatch.Domain, _clock.Today);
+        var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
+
+        // ALTITUDE ONE: what are the pieces of this goal? Structure only, no tools,
+        // no world facts — that is what grounding below is for. Fails soft to one
+        // task, so the goal always plans.
+        var taskDag = await DecomposeAsync(chat, dispatch, ct);
+
         await _trace.PhaseAsync("grounding");
         var ground = await _grounding.AssembleAsync(dispatch, _kernel, ct);
 
@@ -249,7 +444,6 @@ public sealed class GoalAgent
             MaxTokens = 2500
         };
 
-        var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
         var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
 
         if (groundingSummary.Length > 0)
@@ -278,9 +472,9 @@ public sealed class GoalAgent
         }
 
         var worldSnapshot = await _monitor.CaptureSnapshotAsync(ct);
-        var demoEvents = dispatch.Domain == "meal_plan"
-            ? _monitor.GetDemoEventsCatalog(worldSnapshot)
-            : null;
+        // Whether this domain has fire-able events is the observer's business, not
+        // a domain name this method has to recognise.
+        var demoEvents = _monitor.DemoEventsFor(dispatch.Domain, worldSnapshot);
 
         var ready = new PlanReady
         {
@@ -299,12 +493,18 @@ public sealed class GoalAgent
         };
 
         await _trace.PhaseAsync("awaiting_approval");
-        _activeGoals[dispatch.GoalId] = new ActiveGoalContext
+        var goal = _tasks.CreateGoal(dispatch, taskDag, worldSnapshot);
+        goal.Plan = modelPlan.Plan;
+        // The compose above planned the whole goal in one pass, so every task is
+        // planned and waiting on the same approval. (Per-task planning — pulling
+        // one task off the frontier at a time — is the next altitude; the DAG and
+        // the ledger are what make it possible.)
+        foreach (var task in goal.Tasks)
         {
-            Dispatch = dispatch,
-            Plan = modelPlan.Plan,
-            WorldSnapshot = worldSnapshot
-        };
+            await _tasks.TransitionAsync(dispatch.GoalId, task.TaskId, TaskState.Ready);
+            await _tasks.TransitionAsync(dispatch.GoalId, task.TaskId, TaskState.Planning);
+            await _tasks.TransitionAsync(dispatch.GoalId, task.TaskId, TaskState.AwaitingApproval);
+        }
         _logger.LogInformation("plan_ready items={ItemCount} proposals={ProposalCount} safety={Safety}", ready.Payload.Plan.Count, ready.Payload.Proposals.Count, ready.Payload.Safety.Gate);
         return ready;
     }
@@ -481,7 +681,7 @@ public sealed class GoalAgent
         use a new id only to ADD a step. Honor the steer.
         """;
 
-    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, ActiveGoalContext active, WorldChange change, CancellationToken ct, string? eventId = null)
+    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, GoalRecord active, WorldChange change, CancellationToken ct, string? eventId = null)
     {
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
         var history = new ChatHistory();
@@ -669,7 +869,8 @@ public sealed class GoalAgent
     private (ExecutedEffect Effect, IReadOnlyList<PlanItem>? Updated, IReadOnlyList<string> ChangedIds, IReadOnlyList<ImpactItem> ImpactDelta) ApplyPendingPatch(string proposalId)
     {
         _approvals.MarkExecuted(proposalId);
-        if (!_pendingPatches.Remove(proposalId, out var pending) || !_activeGoals.TryGetValue(pending.GoalId, out var active))
+        var active = _pendingPatches.Remove(proposalId, out var pending) ? _tasks.GetGoal(pending.GoalId) : null;
+        if (active is null)
         {
             return (new ExecutedEffect { ProposalId = proposalId, Action = $"{PlanPatchModule}.{PlanPatchFunction}", Result = "skipped", Detail = "no pending patch or active goal" }, null, [], []);
         }
@@ -735,6 +936,9 @@ public sealed class GoalAgent
         using var policy = _safety.EnterGoal(approval.GoalId);
         _safety.SetTrace(_trace);
         await _trace.PhaseAsync("executing");
+        // The human answered, so every task waiting on that answer moves. This is
+        // where a goal stops being 0% — progress is the ledger, not the clock.
+        await AdvanceTasksAsync(approval.GoalId, TaskState.AwaitingApproval, TaskState.Executing);
         var cleared = _approvals.ApplyDecisions(approval);
         var executed = new List<ExecutedEffect>();
         IReadOnlyList<PlanItem>? updatedPlan = null;
@@ -773,6 +977,12 @@ public sealed class GoalAgent
             });
         }
 
+        // Effects are done; the plan now lives in the world and the observers watch
+        // it. Monitoring is not "finished" — a meal week is only complete when its
+        // last day has passed — so tasks rest here, not at Completed.
+        await AdvanceTasksAsync(approval.GoalId, TaskState.Executing, TaskState.Monitoring);
+        var progress = _tasks.GetGoal(approval.GoalId);
+
         return new Status
         {
             GoalId = approval.GoalId,
@@ -785,16 +995,16 @@ public sealed class GoalAgent
                 UpdatedPlan = updatedPlan,
                 ChangedIds = changedIds,
                 ImpactDelta = impactDelta,
-                Note = executed.Count == 0 ? "No new proposals executed; approval may be a replay or rejection." : $"Executed {executed.Count} proposal(s)."
+                Note = executed.Count == 0
+                    ? "No new proposals executed; approval may be a replay or rejection."
+                    : $"Executed {executed.Count} proposal(s).{ProgressNote(progress)}"
             }
         };
     }
 
     private async Task<(Status Status, Proposal? Adaptation)> HandleControlCoreAsync(Control control, CancellationToken ct)
     {
-        var correlationId = _activeGoals.TryGetValue(control.GoalId, out var activeForScope)
-            ? activeForScope.Dispatch.CorrelationId
-            : null;
+        var correlationId = _tasks.GetGoal(control.GoalId)?.Dispatch.CorrelationId;
         using var scope = _trace.BeginGoalScope(control.GoalId, correlationId);
         // A control tick can re-plan a slice of this goal (trigger_event →
         // ProposeDailyAdaptationAsync), so enter its policy scope too.
@@ -804,7 +1014,8 @@ public sealed class GoalAgent
         if (control.Command == ControlCommands.TriggerEvent)
         {
             var eventId = control.Payload?.EventId ?? control.EventId;
-            if (!_activeGoals.TryGetValue(control.GoalId, out var activeGoal))
+            var activeGoal = _tasks.GetGoal(control.GoalId);
+            if (activeGoal is null)
             {
                 var noGoalStatus = BuildMonitoringStatus(
                     control.GoalId,
@@ -828,12 +1039,11 @@ public sealed class GoalAgent
                 return (missingStatus, null);
             }
 
-            var ev = activeGoal.WorldSnapshot["daily_events"]?["events"]?.AsArray()
-                .Select(n => n?.AsObject())
-                .OfType<JsonObject>()
-                .FirstOrDefault(e => string.Equals(e["id"]?.GetValue<string>(), eventId, StringComparison.Ordinal));
-
-            if (ev is null)
+            // The goal's domain observer owns the catalog and knows how to turn one
+            // entry into a change; this path just asks. (It used to read
+            // daily_events out of the snapshot itself.)
+            var change = _monitor.TriggerEvent(activeGoal, eventId);
+            if (change is null)
             {
                 var unknownStatus = BuildMonitoringStatus(
                     control.GoalId,
@@ -845,7 +1055,6 @@ public sealed class GoalAgent
                 return (unknownStatus, null);
             }
 
-            var change = _monitor.BuildDailyEventChange(activeGoal, ev);
             if (!activeGoal.EmittedMaterialChanges.Add(change.Key))
             {
                 var replayStatus = BuildMonitoringStatus(
@@ -903,11 +1112,12 @@ public sealed class GoalAgent
         {
             var store = _kernel.Services.GetRequiredService<IProductApiAdapter>();
             await store.ResetAsync(ct);
-            _activeGoals.Remove(control.GoalId);
+            _tasks.RemoveGoal(control.GoalId);
             _safety.RemoveGoal(control.GoalId);
         }
 
-        if (!_activeGoals.TryGetValue(control.GoalId, out var active))
+        var active = _tasks.GetGoal(control.GoalId);
+        if (active is null)
         {
             var noGoalStatus = new Status
             {
@@ -924,6 +1134,22 @@ public sealed class GoalAgent
             };
             await _trace.ThinkingAsync(noGoalStatus.Payload.Note);
             return (noGoalStatus, null);
+        }
+
+        // A monitored goal has to be able to FINISH, or the board shows it working
+        // forever. It is done when the world moves past what it planned for: the
+        // time window closes. Derived from the clock against the contract — the
+        // agent doesn't decide it's finished, the calendar does.
+        if (await CompleteIfWindowPassedAsync(active, ct))
+        {
+            var doneStatus = BuildMonitoringStatus(
+                control.GoalId,
+                active.Dispatch.CorrelationId,
+                false,
+                $"goal complete — its time window closed on {active.Dispatch.TimeWindow.End}.{ProgressNote(active)}",
+                null);
+            await _trace.ThinkingAsync(doneStatus.Payload.Note ?? "");
+            return (doneStatus with { TaskStatus = TaskStatuses.Done }, null);
         }
 
         var changes = await _monitor.ObserveAsync(active, ct);
