@@ -44,11 +44,13 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     private Trace? _trace;
 
     private readonly SafetyPolicy _policy;
+    private readonly CapabilityManager _capabilities;
 
-    public SafetyFilter(ILogger<SafetyFilter> logger, SafetyPolicy policy)
+    public SafetyFilter(ILogger<SafetyFilter> logger, SafetyPolicy policy, CapabilityManager capabilities)
     {
         _logger = logger;
         _policy = policy;
+        _capabilities = capabilities;
     }
 
     private sealed class GoalPolicy
@@ -203,7 +205,19 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     /// </para>
     /// </summary>
     internal string? Check(JsonObject? hard, string? module, string function, KernelArguments arguments)
-        => hard is null ? null : _policy.Evaluate(RuleStage.Arguments, hard, module, function, arguments, null);
+    {
+        // AX FIRST, and independent of the goal's constraints. A prohibited action
+        // is not "blocked because of what this family asked for" — it is blocked
+        // because the agent does not do it, for anyone, ever. So it is checked
+        // before the policy is even consulted, and it blocks even a call with no
+        // constraints armed at all.
+        if (_capabilities.GradeOf(module ?? "", function) == AutomationGrade.AX)
+        {
+            return $"{module}.{function} is prohibited (grade AX): this action is never performed automatically";
+        }
+
+        return hard is null ? null : _policy.Evaluate(RuleStage.Arguments, hard, module, function, arguments, null);
+    }
 
     /// <summary>Screens what a function RETURNED, so a forbidden thing never reaches the model.</summary>
     private string? CheckResult(JsonObject? hard, string? module, string function, string resultText)

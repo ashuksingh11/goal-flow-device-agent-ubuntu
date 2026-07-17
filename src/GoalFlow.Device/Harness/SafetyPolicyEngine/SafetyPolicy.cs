@@ -98,15 +98,14 @@ public sealed class SafetyPolicy
     /// worse than one that refuses to start.
     /// </summary>
     public static SafetyPolicy Load(string path)
+        => File.Exists(path)
+            ? Parse(JsonNode.Parse(File.ReadAllText(path))?.AsObject()
+                    ?? throw new InvalidOperationException($"{path} is not a JSON object."), path)
+            : Empty;
+
+    /// <summary>Parses an already-read policy document. <paramref name="path"/> only labels errors.</summary>
+    public static SafetyPolicy Parse(JsonObject root, string path)
     {
-        if (!File.Exists(path))
-        {
-            return Empty;
-        }
-
-        var root = JsonNode.Parse(File.ReadAllText(path))?.AsObject()
-            ?? throw new InvalidOperationException($"{path} is not a JSON object.");
-
         var overrides = new Dictionary<string, AutomationGrade>(StringComparer.OrdinalIgnoreCase);
         if (root["grades"]?["overrides"] is JsonObject gradeNode)
         {

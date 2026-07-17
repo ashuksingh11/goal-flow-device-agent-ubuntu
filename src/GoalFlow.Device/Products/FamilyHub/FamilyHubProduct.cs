@@ -60,7 +60,7 @@ public static class FamilyHubProduct
         services.AddSingleton<BudgetPlugin>();
         services.AddSingleton<NotifyPlugin>();
 
-        services.AddSingleton(sp => new CapabilityManager(CreateDescriptors(sp)));
+        services.AddSingleton(sp => new CapabilityManager(CreateDescriptors(sp), sp.GetRequiredService<SafetyPolicy>()));
         return services;
     }
 

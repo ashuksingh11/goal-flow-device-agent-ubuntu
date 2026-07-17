@@ -133,6 +133,12 @@ if (options.VerifySafetyRules)
     return;
 }
 
+if (options.VerifyGrades)
+{
+    Environment.ExitCode = ProgramHelpers.VerifyGrades(provider);
+    return;
+}
+
 if (options.ConnectUrl is { } url)
 {
     var deviceId = ProgramHelpers.ResolveDeviceId(options.DeviceId, options.DataDir);
@@ -251,6 +257,9 @@ internal sealed record CliOptions
     /// <summary>--verify-safety-rules — assert the declarative rules block/allow the right things (M1 gate).</summary>
     public bool VerifySafetyRules { get; init; }
 
+    /// <summary>--verify-grades — assert the grade ratchet holds and AX is unproposable (M1 gate).</summary>
+    public bool VerifyGrades { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -292,6 +301,7 @@ internal sealed record CliOptions
                 "--dump-capabilities" => options with { DumpCapabilities = true },
                 "--verify-policy-isolation" => options with { VerifyPolicyIsolation = true },
                 "--verify-safety-rules" => options with { VerifySafetyRules = true },
+                "--verify-grades" => options with { VerifyGrades = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -325,6 +335,66 @@ internal static class DotEnv
 
 internal static class ProgramHelpers
 {
+/// <summary>
+/// M1 GATE: automation grades — the ratchet, and AX.
+///
+/// <para>
+/// AX has no natural subject in this product yet (nothing the Family Hub does is
+/// prohibited; the first one is the smart lock, in M7), so it is exercised here
+/// through a throwaway policy rather than left as a mechanism nobody runs until
+/// the demo. The ratchet is checked in BOTH directions, because a one-way check
+/// would pass on a rule that rejects everything.
+/// </para>
+/// </summary>
+public static int VerifyGrades(IServiceProvider provider)
+{
+    var descriptors = FamilyHubProduct.CreateDescriptors(provider);
+    var failures = new List<string>();
+
+    SafetyPolicy Policy(string overridesJson) => SafetyPolicy.Parse(
+        JsonNode.Parse("{\"grades\":{\"overrides\":{" + overridesJson + "}},\"rules\":[]}")!.AsObject(), "<test>");
+
+    // Intrinsic grades come from [SideEffect] with no config at all.
+    var plain = new CapabilityManager(descriptors, Policy(""));
+    void Expect(string module, string function, AutomationGrade? want, CapabilityManager mgr, string why)
+    {
+        var got = mgr.GradeOf(module, function);
+        if (got != want) failures.Add($"{why}: {module}.{function} graded {got?.ToString() ?? "null"}, expected {want?.ToString() ?? "null"}");
+    }
+
+    Expect("ShoppingList", "PlaceOrder", AutomationGrade.A2, plain, "firm -> A2");
+    Expect("ShoppingList", "Add", AutomationGrade.A1, plain, "light -> A1");
+    Expect("Reminders", "Create", AutomationGrade.A0, plain, "auto -> A0");
+    Expect("Inventory", "ListItems", null, plain, "a read is not an action");
+
+    // TIGHTENING is allowed.
+    var tightened = new CapabilityManager(descriptors, Policy("\"ShoppingList.Add\":\"A2\""));
+    Expect("ShoppingList", "Add", AutomationGrade.A2, tightened, "policy may tighten A1 -> A2");
+
+    // WEAKENING must throw, at construction, not at the call that matters.
+    try
+    {
+        _ = new CapabilityManager(descriptors, Policy("\"ShoppingList.PlaceOrder\":\"A0\""));
+        failures.Add("THE RATCHET DID NOT HOLD: policy weakened PlaceOrder A2 -> A0 and nothing threw");
+    }
+    catch (InvalidOperationException)
+    {
+        // expected
+    }
+
+    // AX: prohibited actions are never offered to the planner.
+    var prohibited = new CapabilityManager(descriptors, Policy("\"ShoppingList.PlaceOrder\":\"AX\""));
+    Expect("ShoppingList", "PlaceOrder", AutomationGrade.AX, prohibited, "policy may tighten A2 -> AX");
+    if (prohibited.IsProposable("ShoppingList", "PlaceOrder")) failures.Add("an AX action must never be a proposal target");
+    if (!prohibited.IsProposable("ShoppingList", "Add")) failures.Add("a non-AX action must stay proposable");
+    if (plain.IsProposable("Budget", "GetBudgetStatus")) failures.Add("an unavailable plugin's function must not be proposable");
+    if (plain.IsProposable("Inventory", "ListItems")) failures.Add("a read is not an action and must not be proposable");
+
+    foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
+    Console.Out.WriteLine(failures.Count == 0 ? "gate 7 (grades: ratchet + AX): PASS" : $"gate 7 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
+}
+
 /// <summary>
 /// M1 GATE: the declarative safety rules block what they must and — just as
 /// important — allow what they must not block.
