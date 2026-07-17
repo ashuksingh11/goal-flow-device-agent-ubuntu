@@ -59,8 +59,19 @@ echo "gate 2 (grounding set, 13 fns in order): PASS"
 # was gone but the count hadn't moved.) Stripping only ever UNDER-counts prose;
 # real code coupling still trips it.
 if [ -d src/GoalFlow.Device/Harness ] && [ -f verify/m0/harness-debt.count ]; then
+  # The vocabulary is CASE-INSENSITIVE and covers three ways product knowledge
+  # leaks in, not just one. The first version listed capitalized module names
+  # only and reported 4 while the real figure was 17: MonitorAdapt does not
+  # merely switch on domain names, it knows the product's DATA MODEL — which
+  # documents exist ("calendar", "daily_events") and their shapes
+  # ("guests.pending_updates") — none of which the old pattern could see.
+  #   1. domains        meal_plan, guest_dinner
+  #   2. module names   ShoppingList, Appliance, …  (any case)
+  #   3. resource names calendar, daily_events, …   (the pack's documents)
+  #   4. change kinds   guest.*, inventory.*, appliance.*, meal.*
   debt=$(find src/GoalFlow.Device/Harness -name '*.cs' -exec sed -E 's;//.*$;;' {} + \
-         | grep -Eo 'meal_plan|guest_dinner|ShoppingList|PlaceOrder|Recipes|Appliance|Notify|Inventory|Calendar|Reminders|Guests' | wc -l)
+         | grep -Eoi 'meal_plan|guest_dinner|daily_events|shopping_list|shoppinglist|placeorder|pending_updates|inventory|calendar|recipes|appliances?|notify|reminders|guests?|"(guest|inventory|appliance|meal)\.[a-z_]+"' \
+         | wc -l)
   pinned=$(cat verify/m0/harness-debt.count)
   if [ "$debt" -gt "$pinned" ]; then
     echo "gate 3 FAIL: product strings in Harness/ rose to $debt (pinned $pinned)." >&2
