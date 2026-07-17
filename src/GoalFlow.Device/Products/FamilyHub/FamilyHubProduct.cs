@@ -27,6 +27,15 @@ namespace GoalFlow.Device.Products.FamilyHub;
 public static class FamilyHubProduct
 {
     /// <summary>
+    /// The pack's safety policy, resolved against the APP directory, not the
+    /// working directory — it ships with the binary (see the Content item in the
+    /// csproj), so it is found no matter where the agent is launched from, and on
+    /// Tizen it resolves inside the read-only resource bundle.
+    /// </summary>
+    private static string PolicyPath =>
+        Path.Combine(AppContext.BaseDirectory, "Products", "FamilyHub", "config", "policy.json");
+
+    /// <summary>
     /// Registers the pack: the mock world adapter, the capability plugins, and
     /// the Capability Manager built over them. Requires <see cref="IClock"/> to
     /// be registered already (the adapter resolves day offsets against it).
@@ -34,6 +43,11 @@ public static class FamilyHubProduct
     public static IServiceCollection AddFamilyHub(this IServiceCollection services, string dataDir)
     {
         services.AddSingleton<IProductApiAdapter>(sp => new MockFamilyHubAdapter(dataDir, sp.GetRequiredService<IClock>()));
+
+        // This product's safety policy: which harness rule kinds apply to which of
+        // its calls, and its ingredient vocabulary. Read-only and code-adjacent, so
+        // it ships next to the pack rather than in the runtime --data dir.
+        services.AddSingleton(_ => SafetyPolicy.Load(PolicyPath));
 
         services.AddSingleton<InventoryPlugin>();
         services.AddSingleton<CalendarPlugin>();

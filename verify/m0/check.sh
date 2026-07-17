@@ -50,10 +50,17 @@ echo "gate 2 (grounding set, 13 fns in order): PASS"
 # design: the design doc defers the IDomainObserver extraction to M2 and
 # policy.json to M1. So the honest invariant is "no NEW product strings" —
 # this pins the count. Lower it when a milestone clears debt; never raise it.
-# (Inert until the final M0 commit measures and pins the baseline.)
+#
+# COMMENTS ARE STRIPPED FIRST. The invariant is about a harness module DEPENDING
+# on a product literal; prose explaining why the design is the way it is does not
+# couple anything, and counting it would price honest comments as debt and reward
+# deleting them. (M1 made this concrete: moving the checks into policy.json left
+# behind doc comments saying "this used to hardcode ShoppingList" — the coupling
+# was gone but the count hadn't moved.) Stripping only ever UNDER-counts prose;
+# real code coupling still trips it.
 if [ -d src/GoalFlow.Device/Harness ] && [ -f verify/m0/harness-debt.count ]; then
-  debt=$(grep -rEo 'meal_plan|guest_dinner|ShoppingList|PlaceOrder|Recipes|Appliance|Notify|Inventory|Calendar|Reminders|Guests' \
-         src/GoalFlow.Device/Harness/ --include='*.cs' | wc -l)
+  debt=$(find src/GoalFlow.Device/Harness -name '*.cs' -exec sed -E 's;//.*$;;' {} + \
+         | grep -Eo 'meal_plan|guest_dinner|ShoppingList|PlaceOrder|Recipes|Appliance|Notify|Inventory|Calendar|Reminders|Guests' | wc -l)
   pinned=$(cat verify/m0/harness-debt.count)
   if [ "$debt" -gt "$pinned" ]; then
     echo "gate 3 FAIL: product strings in Harness/ rose to $debt (pinned $pinned)." >&2

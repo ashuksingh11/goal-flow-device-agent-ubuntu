@@ -43,7 +43,13 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
 
     private Trace? _trace;
 
-    public SafetyFilter(ILogger<SafetyFilter> logger) => _logger = logger;
+    private readonly SafetyPolicy _policy;
+
+    public SafetyFilter(ILogger<SafetyFilter> logger, SafetyPolicy policy)
+    {
+        _logger = logger;
+        _policy = policy;
+    }
 
     private sealed class GoalPolicy
     {
@@ -188,214 +194,27 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     /// <summary>
     /// Pure, deterministic check of one pending call against one goal's hard
     /// constraints. Returns a human-readable violation, or null when allowed.
+    ///
+    /// <para>
+    /// The decisions live in the product pack's policy.json now; this only asks
+    /// the rules bound to this call. It used to be a chain of hardcoded
+    /// module-name comparisons ("ShoppingList" ? check the budget cap), which is
+    /// exactly the product knowledge that does not belong in the harness.
+    /// </para>
     /// </summary>
     internal string? Check(JsonObject? hard, string? module, string function, KernelArguments arguments)
-    {
-        if (hard is null)
-        {
-            return null;
-        }
+        => hard is null ? null : _policy.Evaluate(RuleStage.Arguments, hard, module, function, arguments, null);
 
-        // PRODUCT-DEBT(M1): which check applies to which call is decided here by
-        // hardcoded product module/function names. M1 turns these into declarative
-        // rule bindings in the product pack's policy.json — the engine keeps the
-        // check implementations (ported 1:1) and learns WHERE to apply them from
-        // the pack. The ingredient-group table in ExpandIngredientGroups is the
-        // same debt.
-        return CheckIngredients(hard, function, arguments)
-            ?? (string.Equals(module, "ShoppingList", StringComparison.OrdinalIgnoreCase) ? CheckBudgetCap(hard, function, arguments) : null)
-            ?? ((string.Equals(module, "Appliance", StringComparison.OrdinalIgnoreCase) || string.Equals(module, "Notify", StringComparison.OrdinalIgnoreCase))
-                ? CheckQuietHours(hard, function, arguments)
-                : null);
-    }
-
-    /// <summary>Allergen/dietary/medical screen over ingredient-bearing arguments.</summary>
-    internal string? CheckIngredients(JsonObject policy, string function, KernelArguments arguments)
-    {
-        var blocked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        AddStrings(policy, "allergens", blocked);
-        AddStrings(policy, "dietary", blocked);
-        AddStrings(policy, "medical", blocked);
-        ExpandIngredientGroups(blocked);
-        if (blocked.Count == 0)
-        {
-            return null;
-        }
-
-        var scan = new JsonObject();
-        foreach (var key in new[] { "items", "ingredients", "name", "item", "message", "title" })
-        {
-            if (arguments.TryGetValue(key, out var value))
-            {
-                scan[key] = JsonSerializer.SerializeToNode(value, ContractJson.Options);
-            }
-        }
-
-        var haystack = scan.ToJsonString(ContractJson.Options);
-        foreach (var term in blocked)
-        {
-            var normalized = NormalizeDietary(term);
-            if (haystack.Contains(term, StringComparison.OrdinalIgnoreCase) ||
-                haystack.Contains(normalized, StringComparison.OrdinalIgnoreCase))
-            {
-                return $"{function} arguments include hard-blocked ingredient or group '{term}'";
-            }
-        }
-
-        return null;
-    }
-
-    private static string? CheckResult(JsonObject? hard, string? module, string function, string resultText)
-    {
-        if (!string.Equals(module, "Recipes", StringComparison.OrdinalIgnoreCase) || hard is null)
-        {
-            return null;
-        }
-
-        var blocked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        AddStrings(hard, "allergens", blocked);
-        AddStrings(hard, "dietary", blocked);
-        AddStrings(hard, "medical", blocked);
-        ExpandIngredientGroups(blocked);
-        foreach (var term in blocked)
-        {
-            var normalized = NormalizeDietary(term);
-            if (resultText.Contains($"\"{term}\"", StringComparison.OrdinalIgnoreCase) ||
-                resultText.Contains($"\"{normalized}\"", StringComparison.OrdinalIgnoreCase))
-            {
-                return $"{function} result contains hard-blocked ingredient or group '{term}'";
-            }
-        }
-
-        return null;
-    }
-
-    /// <summary>Blocks money-spending calls whose estimated total exceeds <c>budget_cap</c>.</summary>
-    internal string? CheckBudgetCap(JsonObject policy, string function, KernelArguments arguments)
-    {
-        if (!string.Equals(function, "PlaceOrder", StringComparison.OrdinalIgnoreCase) ||
-            policy["budget_cap"] is null ||
-            policy["budget_cap"]!.GetValueKind() == JsonValueKind.Null)
-        {
-            return null;
-        }
-
-        var cap = policy["budget_cap"]!.GetValue<double>();
-        var total = GetDouble(arguments, "estimatedTotal") ?? GetDouble(arguments, "estimated_total") ?? 0;
-        return total > cap ? $"PlaceOrder estimate {total:0.00} exceeds budget_cap {cap:0.00}" : null;
-    }
-
-    /// <summary>Blocks appliance/announce actions scheduled inside <c>quiet_hours</c>.</summary>
-    internal string? CheckQuietHours(JsonObject policy, string function, KernelArguments arguments)
-    {
-        if (policy["quiet_hours"] is not JsonObject quiet)
-        {
-            return null;
-        }
-
-        var timeText = GetString(arguments, "time") ?? ExtractTime(GetString(arguments, "atTime"));
-        if (timeText is null)
-        {
-            return null;
-        }
-
-        var startText = quiet["start"]?.GetValue<string>();
-        var endText = quiet["end"]?.GetValue<string>();
-        if (startText is null || endText is null)
-        {
-            return null;
-        }
-
-        var time = TimeOnly.Parse(timeText);
-        var start = TimeOnly.Parse(startText);
-        var end = TimeOnly.Parse(endText);
-        var inside = start <= end ? time >= start && time < end : time >= start || time < end;
-        return inside ? $"{function} scheduled at {timeText} inside quiet_hours {startText}-{endText}" : null;
-    }
-
-    private static void AddStrings(JsonObject policy, string key, HashSet<string> target)
-    {
-        if (policy[key] is not JsonArray arr)
-        {
-            return;
-        }
-
-        foreach (var item in arr)
-        {
-            var value = item?.GetValue<string>();
-            if (!string.IsNullOrWhiteSpace(value))
-            {
-                target.Add(value);
-            }
-        }
-    }
-
-    private static void ExpandIngredientGroups(HashSet<string> target)
-    {
-        if (target.Contains("dairy") || target.Contains("no_dairy"))
-        {
-            target.Add("milk");
-            target.Add("yogurt");
-            target.Add("paneer");
-            target.Add("cheese");
-        }
-
-        if (target.Contains("gluten") || target.Contains("no_gluten"))
-        {
-            target.Add("bread");
-            target.Add("toast");
-            target.Add("pasta");
-            target.Add("tortilla wraps");
-        }
-
-        if (target.Contains("pork") || target.Contains("no_pork"))
-        {
-            target.Add("pork");
-            target.Add("bacon");
-            target.Add("ham");
-        }
-    }
-
-    private static double? GetDouble(KernelArguments args, string name)
-    {
-        if (!args.TryGetValue(name, out var value) || value is null)
-        {
-            return null;
-        }
-
-        return value switch
-        {
-            double d => d,
-            float f => f,
-            int i => i,
-            long l => l,
-            JsonElement e when e.ValueKind == JsonValueKind.Number => e.GetDouble(),
-            _ when double.TryParse(value.ToString(), out var parsed) => parsed,
-            _ => null
-        };
-    }
-
-    private static string? GetString(KernelArguments args, string name)
-        => args.TryGetValue(name, out var value) ? value?.ToString() : null;
-
-    private static string? ExtractTime(string? atTime)
-    {
-        if (string.IsNullOrWhiteSpace(atTime))
-        {
-            return null;
-        }
-
-        if (DateTimeOffset.TryParse(atTime, out var dto))
-        {
-            return TimeOnly.FromDateTime(dto.DateTime).ToString("HH:mm");
-        }
-
-        return TimeOnly.TryParse(atTime, out var time) ? time.ToString("HH:mm") : null;
-    }
+    /// <summary>Screens what a function RETURNED, so a forbidden thing never reaches the model.</summary>
+    private string? CheckResult(JsonObject? hard, string? module, string function, string resultText)
+        => hard is null ? null : _policy.Evaluate(RuleStage.Result, hard, module, function, [], resultText);
 
 
-    private static string NormalizeDietary(string value)
-        => value.StartsWith("no_", StringComparison.OrdinalIgnoreCase) ? value[3..] : value;
+
+
+
+
+
 
     private static JsonObject ArgumentsToJson(KernelArguments args)
     {
