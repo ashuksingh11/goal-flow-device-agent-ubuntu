@@ -9,6 +9,7 @@ using Microsoft.SemanticKernel.Connectors.OpenAI;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Collections.Concurrent;
 
 namespace GoalFlow.Device.Agent;
 
@@ -51,8 +52,30 @@ public sealed class GoalAgent
     private readonly TaskManager _tasks;
 
     /// <summary>Plan patches awaiting approval, keyed by proposal id → (goalId, patch).
-    /// Registered when a daily adaptation is proposed; applied in ApplyApproval.</summary>
-    private readonly Dictionary<string, (string GoalId, PlanPatch Patch)> _pendingPatches = new(StringComparer.Ordinal);
+    /// Registered when a daily adaptation is proposed; applied in ApplyApproval.
+    /// CONCURRENT: two goals can be adapting at once, and Program dispatches every
+    /// frame on its own Task.Run — a plain Dictionary tears under that.</summary>
+    private readonly ConcurrentDictionary<string, (string GoalId, PlanPatch Patch)> _pendingPatches = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Only ONE goal may be in the planning passes at a time.
+    ///
+    /// <para>
+    /// Not a correctness fix — the state is per-goal now — but an honesty one. Three
+    /// concurrent plans mean three simultaneous grounding tool-loops and composes:
+    /// triple the token burn on a key that already 402s on low credit, and a
+    /// "watch it think" stream interleaved from three goals that reads as noise.
+    /// Serialising planning makes a queued goal show up on the board as WAITING —
+    /// a visible state a person can understand — instead of a hidden stall.
+    /// </para>
+    ///
+    /// <para>
+    /// Approvals, control ticks and adaptations do NOT take this: they are short,
+    /// and blocking them behind someone else's 60-second plan would be the very
+    /// stall this avoids.
+    /// </para>
+    /// </summary>
+    private readonly SemaphoreSlim _planningSlot = new(1, 1);
 
     /// <summary>Marker module/function on an adaptation ProposalItem meaning "apply
     /// the pending plan patch" — intercepted in ApplyApproval, never kernel-invoked.</summary>
@@ -125,9 +148,29 @@ public sealed class GoalAgent
     ///                       tiered proposals via ApprovalCoordinator
     ///   phase(awaiting_approval) → return the plan_ready frame.
     /// </summary>
-    public Task<PlanReady> RunAsync(Dispatch dispatch, CancellationToken ct = default)
+    public async Task<PlanReady> RunAsync(Dispatch dispatch, CancellationToken ct = default)
     {
-        return RunCoreAsync(dispatch, ct);
+        // Planning is serialised (see _planningSlot). If someone else holds the slot
+        // this goal is QUEUED, and it says so rather than going quiet: the board
+        // shows Waiting, which is a state a person can read, instead of a card that
+        // sits there doing nothing for a minute.
+        if (!await _planningSlot.WaitAsync(0, ct))
+        {
+            using var queuedScope = _trace.BeginGoalScope(dispatch.GoalId, dispatch.CorrelationId);
+            _logger.LogInformation("plan_queued {GoalId} — another goal is planning", dispatch.GoalId);
+            await _trace.PhaseAsync(Phases.Queued);
+            await _trace.ThinkingAsync("Another goal is planning right now — I'll start on this one next.");
+            await _planningSlot.WaitAsync(ct);
+        }
+
+        try
+        {
+            return await RunCoreAsync(dispatch, ct);
+        }
+        finally
+        {
+            _planningSlot.Release();
+        }
     }
 
     /// <summary>
@@ -932,7 +975,7 @@ public sealed class GoalAgent
     private (ExecutedEffect Effect, IReadOnlyList<PlanItem>? Updated, IReadOnlyList<string> ChangedIds, IReadOnlyList<ImpactItem> ImpactDelta) ApplyPendingPatch(string proposalId)
     {
         _approvals.MarkExecuted(proposalId);
-        var active = _pendingPatches.Remove(proposalId, out var pending) ? _tasks.GetGoal(pending.GoalId) : null;
+        var active = _pendingPatches.TryRemove(proposalId, out var pending) ? _tasks.GetGoal(pending.GoalId) : null;
         if (active is null)
         {
             return (new ExecutedEffect { ProposalId = proposalId, Action = $"{PlanPatchModule}.{PlanPatchFunction}", Result = "skipped", Detail = "no pending patch or active goal" }, null, [], []);
