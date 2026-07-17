@@ -3,7 +3,7 @@ using System.Text.Json;
 using GoalFlow.Device.Contracts;
 using Microsoft.Extensions.Logging;
 
-namespace GoalFlow.Device.Modules.Steering;
+namespace GoalFlow.Device.Harness;
 
 /// <summary>
 /// HARNESS MODULE: Trace / Explain.

@@ -2,10 +2,10 @@ using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Capabilities;
+namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
 /// CAPABILITY MODULE (meal domain): the fridge's interior view.

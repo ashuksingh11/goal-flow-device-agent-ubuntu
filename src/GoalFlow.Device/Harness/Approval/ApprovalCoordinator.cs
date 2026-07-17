@@ -1,7 +1,7 @@
 using GoalFlow.Device.Contracts;
 using Microsoft.Extensions.Logging;
 
-namespace GoalFlow.Device.Modules.Steering;
+namespace GoalFlow.Device.Harness;
 
 /// <summary>
 /// HARNESS MODULE: Approval / Consent (HITL) — the device half.

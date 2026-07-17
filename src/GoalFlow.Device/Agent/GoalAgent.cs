@@ -1,6 +1,6 @@
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Capabilities;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
+using GoalFlow.Device.Products.FamilyHub;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;

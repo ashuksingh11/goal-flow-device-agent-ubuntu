@@ -3,7 +3,7 @@ using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Capabilities;
+namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
 /// CAPABILITY MODULE (guest_dinner domain): hosted event, RSVPs, and guest

@@ -1,9 +1,9 @@
 using System.Reflection;
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Capabilities;
+using GoalFlow.Device.Products.FamilyHub;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Steering;
+namespace GoalFlow.Device.Harness;
 
 /// <summary>
 /// Marks a [KernelFunction] as SIDE-EFFECTING with its approval tier.

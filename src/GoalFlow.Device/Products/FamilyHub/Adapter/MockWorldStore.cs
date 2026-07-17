@@ -1,7 +1,7 @@
 using System.Text.Json.Nodes;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
 
-namespace GoalFlow.Device.Modules.Capabilities;
+namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
 /// Shared mock-world access for the capability plugins (the Family Hub

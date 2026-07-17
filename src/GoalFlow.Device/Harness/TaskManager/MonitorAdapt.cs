@@ -1,9 +1,9 @@
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Capabilities;
+using GoalFlow.Device.Products.FamilyHub;
 using Microsoft.Extensions.Logging;
 using System.Text.Json.Nodes;
 
-namespace GoalFlow.Device.Modules.Steering;
+namespace GoalFlow.Device.Harness;
 
 /// <summary>
 /// HARNESS MODULE: Monitor &amp; Adapt.

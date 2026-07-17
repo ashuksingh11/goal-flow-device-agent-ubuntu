@@ -4,7 +4,7 @@ using GoalFlow.Device.Contracts;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Steering;
+namespace GoalFlow.Device.Harness;
 
 /// <summary>
 /// HARNESS MODULE: Safety &amp; Policy Filter — "LLM plans, code checks."

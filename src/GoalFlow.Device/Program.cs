@@ -1,7 +1,7 @@
 using GoalFlow.Device.Agent;
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Modules.Capabilities;
-using GoalFlow.Device.Modules.Steering;
+using GoalFlow.Device.Harness;
+using GoalFlow.Device.Products.FamilyHub;
 using GoalFlow.Device.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;

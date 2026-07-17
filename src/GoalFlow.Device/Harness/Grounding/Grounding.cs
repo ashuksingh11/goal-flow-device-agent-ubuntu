@@ -2,7 +2,7 @@ using GoalFlow.Device.Contracts;
 using System.Text.Json.Nodes;
 using Microsoft.SemanticKernel;
 
-namespace GoalFlow.Device.Modules.Steering;
+namespace GoalFlow.Device.Harness;
 
 /// <summary>
 /// HARNESS MODULE: Context Grounding.
