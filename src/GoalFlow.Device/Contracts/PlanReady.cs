@@ -32,6 +32,13 @@ public sealed record PlanReadyPayload
     /// <summary>Verdict of the deterministic Safety filter over the whole run.</summary>
     public required SafetyVerdict Safety { get; init; }
 
+    /// <summary>
+    /// Verdict of the Pre-check Engine — whether the WORLD was ready (v3-M3).
+    /// Distinct from <see cref="Safety"/> on purpose: safety says "never", a
+    /// precheck says "not yet". Absent when nothing was checked.
+    /// </summary>
+    public PrecheckVerdict? Precheck { get; init; }
+
     /// <summary>Headline outcomes for the UI, e.g. {"label":"waste","value":"-2 items"}.</summary>
     public IReadOnlyList<ImpactItem> Impact { get; init; } = [];
 
@@ -117,6 +124,33 @@ public sealed record SafetyVerdict
 
     /// <summary>Human-readable violations when blocked; empty when passed.</summary>
     public IReadOnlyList<string> Violations { get; init; } = [];
+}
+
+/// <summary>
+/// Whether the WORLD was ready (v3-M3). Deliberately separate from
+/// <see cref="SafetyVerdict"/>: safety is a refusal ("never"), a precheck is a
+/// delay ("not yet"). The UI should say which — one means the house rules
+/// stopped it, the other means something is unplugged and it will resume.
+/// </summary>
+public sealed record PrecheckVerdict
+{
+    /// <summary>True when nothing failed. Warnings do not block.</summary>
+    public required bool Ok { get; init; }
+
+    public IReadOnlyList<PrecheckResultDto> Results { get; init; } = [];
+}
+
+/// <summary>One probe's answer, on the wire.</summary>
+public sealed record PrecheckResultDto
+{
+    /// <summary>The check as bound in the pack's config, e.g. "appliance_online:oven".</summary>
+    public required string Id { get; init; }
+
+    /// <summary>"pass" | "warn" | "fail" | "skipped".</summary>
+    public required string Status { get; init; }
+
+    /// <summary>What to DO about it — the sentence the user actually needs.</summary>
+    public string? Detail { get; init; }
 }
 
 public static class SafetyGates

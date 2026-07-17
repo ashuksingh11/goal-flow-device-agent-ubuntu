@@ -121,7 +121,15 @@ wired separately in each host.
     THIS and changes nothing else.
   - `Approval/` `Grounding/` `Clock/` (`IClock`/`SystemClock`/`SimulatedClock` — NEVER
     call wall-clock, read the clock) `Trace/`.
-  - `PrecheckEngine/` arrives in M3.
+  - `PrecheckEngine/` — IS THE WORLD READY? (v3-M3). The third gate, and it asks a
+    different question from the other two: safety says "never", approval says
+    "waiting on a person", a precheck says "not YET" — something is unplugged and
+    it will resume. Two gates at phase boundaries (NOT in the SK filter, which
+    stays safety-only): before planning (fail → the goal waits, with a remediation
+    a person can act on, before a token is spent) and before actuating each
+    approved effect (fail → `deferred_precheck`; the approval still stands, so it
+    executes when the world recovers). Probes are product knowledge and live in the
+    pack (`Probes/`, bound by `config/prechecks.json`, reading `data/device_state.json`).
 - `Contracts/*.cs` — C# mirror of CONTRACT v2. `PlanReady.cs` has `PlanItem.Day`,
   `DemoEvent {Id,Day,Label,Title,Kind,Order}`, `DemoEvents` catalog. `Control.cs` has
   `EventId` + `TriggerEvent` const. `Status.cs` has `EventId`/`UpdatedPlan`/

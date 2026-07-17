@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "THE PRECHECK WORLD: what is working right now. Read by the pack's probes",
+    "through IProductApiAdapter, exactly like every other mock document in data/.",
+    "",
+    "No dates here, so the day-offset invariant doesn't apply — this is state, not",
+    "schedule. A presenter event (or a hand edit) flips a flag to false and the",
+    "affected goal goes Waiting/At Risk with a reason, then recovers when it comes",
+    "back. That is the whole point of the component: a plan blocked by REALITY,",
+    "which is different from blocked by safety (never allowed) or by approval",
+    "(waiting on a person).",
+    "",
+    "Seeded healthy: the demo starts working and breaks on cue, not the reverse."
+  ],
+
+  "samsung_account": true,
+  "internet": true,
+  "smartthings_connected": true,
+  "device_online": true,
+  "payment_configured": true,
+
+  "camera_operational": true,
+  "ai_vision_initialized": true,
+  "display_awake": true,
+  "storage_available_mb": 4200,
+
+  "appliances_online": {
+    "oven": true,
+    "dishwasher": true,
+    "fridge": true
+  }
+}

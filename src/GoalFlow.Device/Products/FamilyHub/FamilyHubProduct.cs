@@ -32,8 +32,19 @@ public static class FamilyHubProduct
     /// csproj), so it is found no matter where the agent is launched from, and on
     /// Tizen it resolves inside the read-only resource bundle.
     /// </summary>
-    private static string PolicyPath =>
-        Path.Combine(AppContext.BaseDirectory, "Products", "FamilyHub", "config", "policy.json");
+    private static string PolicyPath => ConfigPath("policy.json");
+
+    /// <summary>Which runtime conditions this product's calls need (harness component 3).</summary>
+    private static string PrechecksPath => ConfigPath("prechecks.json");
+
+    /// <summary>
+    /// Pack config resolves against the APP directory, not the working directory:
+    /// it ships with the binary (a Content item in the csproj), so it is found
+    /// wherever the agent is launched from, and on Tizen it lands in the read-only
+    /// resource bundle — which is right for config and wrong for data/.
+    /// </summary>
+    private static string ConfigPath(string file)
+        => Path.Combine(AppContext.BaseDirectory, "Products", "FamilyHub", "config", file);
 
     /// <summary>
     /// Registers the pack: the mock world adapter, the capability plugins, and
@@ -69,8 +80,25 @@ public static class FamilyHubProduct
         services.AddSingleton<IDomainObserver, MealPlanObserver>();
         services.AddSingleton<IDomainObserver, GuestDinnerObserver>();
 
+        // Pre-checks: which of this product's runtime conditions matter, and how to
+        // ask. Only the Family Hub knows it has an oven and a Samsung account.
+        services.AddSingleton(_ => PrecheckBindings.Load(PrechecksPath));
+        services.AddSingleton<IPrecheckProbe>(sp => new ApplianceOnlineProbe(sp.GetRequiredService<IProductApiAdapter>()));
+        AddFlagProbe(services, "samsung_account", "samsung_account", "you are signed out of your Samsung account — sign in and this will resume");
+        AddFlagProbe(services, "device_online", "device_online", "this Family Hub is offline");
+        AddFlagProbe(services, "internet", "internet", "there is no internet connection");
+        AddFlagProbe(services, "smartthings_connected", "smartthings_connected", "SmartThings is disconnected — the appliances can't be reached");
+        AddFlagProbe(services, "payment_configured", "payment_configured", "no payment method is set up, so orders can't be placed");
+        AddFlagProbe(services, "camera_operational", "camera_operational", "the interior camera isn't responding");
+        AddFlagProbe(services, "ai_vision_initialized", "ai_vision_initialized", "AI Vision hasn't finished starting up");
+
         return services;
     }
+
+    /// <summary>One flag in device_state.json, with the sentence a person can act on.</summary>
+    private static void AddFlagProbe(IServiceCollection services, string id, string flag, string remediation)
+        => services.AddSingleton<IPrecheckProbe>(sp =>
+            new DeviceStateProbe(sp.GetRequiredService<IProductApiAdapter>(), id, flag, remediation));
 
     /// <summary>
     /// The capability catalog: advertised module name → live plugin instance.

@@ -80,6 +80,23 @@ public static class TaskStatuses
 }
 
 /// <summary>
+/// What happened to an approved effect (<c>status.payload.executed[].result</c>).
+/// </summary>
+public static class ExecutionResults
+{
+    /// <summary>It ran.</summary>
+    public const string Executed = "executed";
+
+    /// <summary>
+    /// It did NOT run: a pre-check failed at actuation time (the oven went offline
+    /// between planning and approval). The approval still stands — re-applying it
+    /// once the world recovers executes it. NOT a failure, and not a silent drop:
+    /// v3-M3.
+    /// </summary>
+    public const string DeferredPrecheck = "deferred_precheck";
+}
+
+/// <summary>
 /// Approval tiers for side-effecting actions (reversibility × cost × risk).
 /// Nothing <see cref="Firm"/> executes until an <c>approval</c> arrives.
 /// </summary>

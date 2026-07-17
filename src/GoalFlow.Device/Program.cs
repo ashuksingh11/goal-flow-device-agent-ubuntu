@@ -64,6 +64,7 @@ services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
 services.AddSingleton<MonitorAdapt>();
 services.AddSingleton<TaskManager>();
+services.AddSingleton<PrecheckEngine>();
 
 await using var provider = services.BuildServiceProvider();
 
@@ -98,6 +99,7 @@ var agent = new GoalAgent(
     provider.GetRequiredService<MonitorAdapt>(),
     provider.GetRequiredService<CapabilityManager>(),
     provider.GetRequiredService<TaskManager>(),
+    provider.GetRequiredService<PrecheckEngine>(),
     provider.GetRequiredService<IClock>(),
     loggerFactory.CreateLogger<GoalAgent>());
 
@@ -143,6 +145,12 @@ if (options.VerifyGrades)
 if (options.VerifyTaskLifecycle)
 {
     Environment.ExitCode = await ProgramHelpers.VerifyTaskLifecycleAsync(loggerFactory);
+    return;
+}
+
+if (options.VerifyPrechecks)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyPrechecksAsync(provider, options.DataDir);
     return;
 }
 
@@ -270,6 +278,9 @@ internal sealed record CliOptions
     /// <summary>--verify-task-lifecycle — assert the task DAG, legal moves and derived progress (M2 gate).</summary>
     public bool VerifyTaskLifecycle { get; init; }
 
+    /// <summary>--verify-prechecks — assert the runtime gates pass, block and defer correctly (M3 gate).</summary>
+    public bool VerifyPrechecks { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -313,6 +324,7 @@ internal sealed record CliOptions
                 "--verify-safety-rules" => options with { VerifySafetyRules = true },
                 "--verify-grades" => options with { VerifyGrades = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
+                "--verify-prechecks" => options with { VerifyPrechecks = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -346,6 +358,84 @@ internal static class DotEnv
 
 internal static class ProgramHelpers
 {
+/// <summary>
+/// M3 GATE: the Pre-check Engine — is the world ready?
+///
+/// <para>
+/// Drives the probes against a REAL device_state.json in a temp dir, flipping
+/// flags to force each outcome. The failure paths are the point: a gate that only
+/// ever sees a healthy world proves nothing, because passing is also what a probe
+/// that does nothing does.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyPrechecksAsync(IServiceProvider provider, string dataDir)
+{
+    var failures = new List<string>();
+    void Check(bool ok, string what) { if (!ok) failures.Add(what); }
+
+    var statePath = Path.Combine(dataDir, "device_state.json");
+    var pristine = await File.ReadAllTextAsync(statePath);
+    var engine = provider.GetRequiredService<PrecheckEngine>();
+    var dispatch = ProgramHelpers.BuildLocalDispatch("verify prechecks", "verify", new SimulatedClock());
+    var preheat = new ProposalItem { ProposalId = "p1", Action = "preheat", Module = "Appliance", Function = "PreheatOven", Tier = ApprovalTiers.Light };
+    var order = new ProposalItem { ProposalId = "p2", Action = "order", Module = "ShoppingList", Function = "PlaceOrder", Tier = ApprovalTiers.Firm };
+    var read = new ProposalItem { ProposalId = "p3", Action = "list", Module = "Inventory", Function = "ListItems", Tier = ApprovalTiers.Auto };
+
+    async Task SetState(string json) => await File.WriteAllTextAsync(statePath, json);
+    async Task Flip(string path, bool value)
+    {
+        var node = JsonNode.Parse(pristine)!.AsObject();
+        var parts = path.Split('.');
+        if (parts.Length == 1) node[parts[0]] = value;
+        else node[parts[0]]![parts[1]] = value;
+        await SetState(node.ToJsonString());
+    }
+
+    try
+    {
+        // A healthy world blocks nothing.
+        await SetState(pristine);
+        Check((await engine.RunForDispatchAsync(dispatch)).Ok, "a healthy world passes the goal gate");
+        Check((await engine.RunForProposalAsync(preheat)).Ok, "a healthy world passes the oven's checks");
+
+        // An unbound call has no checks — silence, not a fabricated dependency.
+        var unbound = await engine.RunForProposalAsync(read);
+        Check(unbound.Ok && unbound.Results.Count == 0, "a call with no bindings runs no checks");
+
+        // GATE 1: the goal can't even start.
+        await Flip("samsung_account", false);
+        var signedOut = await engine.RunForDispatchAsync(dispatch);
+        Check(!signedOut.Ok, "signed out blocks the goal gate");
+        Check(signedOut.Remediation.Contains("sign in"), $"the reason must be actionable, got: {signedOut.Remediation}");
+
+        // GATE 2: the parameterized probe — one appliance offline, not the others.
+        await Flip("appliances_online.oven", false);
+        var ovenDown = await engine.RunForProposalAsync(preheat);
+        Check(!ovenDown.Ok, "an offline oven defers PreheatOven");
+        Check(ovenDown.Remediation.Contains("oven"), "the reason names the oven");
+        Check((await engine.RunForProposalAsync(order)).Ok, "an offline OVEN must not block an unrelated ORDER");
+
+        // Module-wide bindings are a floor: Appliance.* needs SmartThings, whatever
+        // the function.
+        await Flip("smartthings_connected", false);
+        var noHub = await engine.RunForProposalAsync(preheat);
+        Check(!noHub.Ok, "Appliance.* requires SmartThings — the module-wide rule applies");
+        Check(noHub.Remediation.Contains("SmartThings"), "the reason names SmartThings");
+
+        // Recovery: the whole point of "not yet" rather than "never".
+        await SetState(pristine);
+        Check((await engine.RunForProposalAsync(preheat)).Ok, "the check passes again once the world recovers");
+    }
+    finally
+    {
+        await File.WriteAllTextAsync(statePath, pristine);
+    }
+
+    foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
+    Console.Out.WriteLine(failures.Count == 0 ? "gate 9 (prechecks): PASS" : $"gate 9 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
+}
+
 /// <summary>
 /// M2 GATE: the task lifecycle — dependency order, legal moves, derived progress.
 ///
