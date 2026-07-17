@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json.Nodes;
 using System.Text.Json;
 using GoalFlow.Device.Contracts;
@@ -24,30 +25,96 @@ namespace GoalFlow.Device.Harness;
 public sealed class SafetyFilter : IFunctionInvocationFilter
 {
     private readonly ILogger<SafetyFilter> _logger;
-    private readonly List<string> _violations = [];
-    private JsonObject? _hardConstraints;
+
+    /// <summary>
+    /// Armed policy + recorded violations, PER GOAL. This used to be two plain
+    /// fields on a singleton, which made the gate unsound the moment two goals
+    /// overlapped — see <see cref="BeginGoal"/>.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, GoalPolicy> _policies = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Which goal the current call belongs to. AsyncLocal because the kernel
+    /// invokes plugin functions deep inside the planning await-chain: there is no
+    /// parameter to thread a goal id through, but the ExecutionContext flows —
+    /// including across the <c>Task.Run</c> that Program uses to dispatch frames.
+    /// </summary>
+    private static readonly AsyncLocal<string?> CurrentGoalId = new();
+
     private Trace? _trace;
 
     public SafetyFilter(ILogger<SafetyFilter> logger) => _logger = logger;
 
-    /// <summary>
-    /// Arms the filter for a goal run. <paramref name="hardConstraints"/> is
-    /// the dispatch's free-form <c>constraints.hard</c> object (allergens,
-    /// medical, dietary, budget_cap, quiet_hours, ...).
-    /// </summary>
-    public void SetPolicy(JsonObject hardConstraints)
+    private sealed class GoalPolicy
     {
-        _hardConstraints = hardConstraints;
-        _violations.Clear();
+        public required JsonObject Hard { get; init; }
+        public List<string> Violations { get; } = [];
     }
+
+    /// <summary>
+    /// Arms the filter for a goal and enters its scope. <paramref name="hardConstraints"/>
+    /// is the dispatch's free-form <c>constraints.hard</c> (allergens, medical,
+    /// dietary, budget_cap, quiet_hours, …). Dispose leaves the scope; the policy
+    /// STAYS armed, because approvals and control ticks arrive later and must be
+    /// checked against their own goal's constraints (see <see cref="EnterGoal"/>).
+    ///
+    /// <para>
+    /// WHY PER GOAL: this was a live safety bug. The policy was a single field
+    /// set at the top of every plan run, so with two goals in flight — which
+    /// Program has always allowed, dispatching each frame on its own Task.Run —
+    /// goal B's dispatch overwrote goal A's hard constraints mid-plan, and the
+    /// deterministic gate then enforced the wrong family's allergens against
+    /// goal A's calls. Silent, and in the exact component whose entire purpose is
+    /// to be trustworthy. Agent Board makes concurrent goals routine, so this had
+    /// to be fixed before anything can submit a second goal.
+    /// </para>
+    /// </summary>
+    public IDisposable BeginGoal(string goalId, JsonObject hardConstraints)
+    {
+        _policies[goalId] = new GoalPolicy { Hard = hardConstraints };
+        return new GoalScope(goalId);
+    }
+
+    /// <summary>
+    /// Re-enters an already-armed goal's scope, for calls that happen after
+    /// planning: actuating an approved proposal, or a control tick's adaptation.
+    ///
+    /// <para>
+    /// The approval path in particular used to run with NO policy of its own —
+    /// it never armed one, so it silently reused whatever the last plan run left
+    /// behind. With one goal that is the same policy by luck; with two it means
+    /// the last gate before a real side effect (spending money, starting an
+    /// appliance) checks the wrong goal's constraints.
+    /// </para>
+    /// </summary>
+    public IDisposable EnterGoal(string goalId) => new GoalScope(goalId);
+
+    /// <summary>Forgets a goal's policy and violations (control: reset).</summary>
+    public void RemoveGoal(string goalId) => _policies.TryRemove(goalId, out _);
 
     public void SetTrace(Trace trace) => _trace = trace;
 
-    /// <summary>Violations recorded during the run → plan_ready payload.safety.</summary>
-    public IReadOnlyList<string> Violations => _violations;
+    /// <summary>Violations recorded for one goal → its plan_ready payload.safety.</summary>
+    public IReadOnlyList<string> ViolationsFor(string goalId)
+        => _policies.TryGetValue(goalId, out var policy) ? policy.Violations.ToArray() : [];
 
-    /// <summary>Overall gate for the run ("passed" / "blocked").</summary>
-    public string Gate => _violations.Count == 0 ? SafetyGates.Passed : SafetyGates.Blocked;
+    /// <summary>That goal's overall gate ("passed" / "blocked").</summary>
+    public string GateFor(string goalId)
+        => ViolationsFor(goalId).Count == 0 ? SafetyGates.Passed : SafetyGates.Blocked;
+
+    /// <summary>Sets the ambient goal for this async flow; restores the previous on dispose.</summary>
+    private sealed class GoalScope : IDisposable
+    {
+        private readonly string? _previous;
+
+        public GoalScope(string goalId)
+        {
+            _previous = CurrentGoalId.Value;
+            CurrentGoalId.Value = goalId;
+        }
+
+        public void Dispose() => CurrentGoalId.Value = _previous;
+    }
 
     /// <inheritdoc />
     public async Task OnFunctionInvocationAsync(
@@ -58,10 +125,11 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
         var function = context.Function.Name;
         await (_trace?.ToolCallAsync(module, function, ArgumentsToJson(context.Arguments)) ?? Task.CompletedTask);
 
-        var violation = Check(module, function, context.Arguments);
+        var policy = CurrentPolicy(module, function);
+        var violation = Check(policy?.Hard, module, function, context.Arguments);
         if (violation is not null)
         {
-            _violations.Add(violation);
+            policy?.Violations.Add(violation);
             _logger.LogWarning("safety_blocked {Module}.{Function}: {Violation}", module, function, violation);
             var refusal = $"BLOCKED by safety policy: {violation}. Re-plan without violating hard constraints.";
             context.Result = new FunctionResult(context.Function, refusal);
@@ -71,10 +139,10 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
 
         await next(context);
         var resultText = context.Result.ToString();
-        var resultViolation = CheckResult(module, function, resultText);
+        var resultViolation = CheckResult(policy?.Hard, module, function, resultText);
         if (resultViolation is not null)
         {
-            _violations.Add(resultViolation);
+            policy?.Violations.Add(resultViolation);
             _logger.LogWarning("safety_result_blocked {Module}.{Function}: {Violation}", module, function, resultViolation);
             resultText = $"BLOCKED by safety policy: {resultViolation}. Re-plan without violating hard constraints.";
             context.Result = new FunctionResult(context.Function, resultText);
@@ -84,12 +152,46 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     }
 
     /// <summary>
-    /// Pure, deterministic check of one pending call against the armed policy.
-    /// Returns a human-readable violation, or null when the call is allowed.
+    /// The policy of the goal this call belongs to, or null if the flow is not
+    /// inside a goal scope.
+    ///
+    /// <para>
+    /// Null means "no constraints were declared for this call" — the same
+    /// situation as a dispatch with an empty <c>constraints.hard</c>, so it is
+    /// not a fail-open: there is genuinely nothing to enforce. But it is also
+    /// how the old approval path silently ran, so it is logged loudly enough to
+    /// be noticed if a code path ever forgets to enter a scope.
+    /// </para>
     /// </summary>
-    internal string? Check(string? module, string function, KernelArguments arguments)
+    private GoalPolicy? CurrentPolicy(string module, string function)
     {
-        if (_hardConstraints is null)
+        var goalId = CurrentGoalId.Value;
+        if (goalId is not null && _policies.TryGetValue(goalId, out var policy))
+        {
+            return policy;
+        }
+
+        _logger.LogWarning(
+            "safety_unscoped {Module}.{Function} ran with no armed policy (goal_id={GoalId}) — nothing to enforce; a caller likely forgot BeginGoal/EnterGoal",
+            module, function, goalId ?? "<none>");
+        return null;
+    }
+
+    /// <summary>
+    /// Resolves the ambient goal's constraints and checks one call against them.
+    /// Exercises the same scope lookup the kernel pipeline uses, so tests of goal
+    /// isolation go through the real path.
+    /// </summary>
+    internal string? CheckCurrent(string module, string function, KernelArguments arguments)
+        => Check(CurrentPolicy(module, function)?.Hard, module, function, arguments);
+
+    /// <summary>
+    /// Pure, deterministic check of one pending call against one goal's hard
+    /// constraints. Returns a human-readable violation, or null when allowed.
+    /// </summary>
+    internal string? Check(JsonObject? hard, string? module, string function, KernelArguments arguments)
+    {
+        if (hard is null)
         {
             return null;
         }
@@ -100,10 +202,10 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
         // check implementations (ported 1:1) and learns WHERE to apply them from
         // the pack. The ingredient-group table in ExpandIngredientGroups is the
         // same debt.
-        return CheckIngredients(_hardConstraints, function, arguments)
-            ?? (string.Equals(module, "ShoppingList", StringComparison.OrdinalIgnoreCase) ? CheckBudgetCap(_hardConstraints, function, arguments) : null)
+        return CheckIngredients(hard, function, arguments)
+            ?? (string.Equals(module, "ShoppingList", StringComparison.OrdinalIgnoreCase) ? CheckBudgetCap(hard, function, arguments) : null)
             ?? ((string.Equals(module, "Appliance", StringComparison.OrdinalIgnoreCase) || string.Equals(module, "Notify", StringComparison.OrdinalIgnoreCase))
-                ? CheckQuietHours(_hardConstraints, function, arguments)
+                ? CheckQuietHours(hard, function, arguments)
                 : null);
     }
 
@@ -143,17 +245,17 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
         return null;
     }
 
-    private string? CheckResult(string? module, string function, string resultText)
+    private static string? CheckResult(JsonObject? hard, string? module, string function, string resultText)
     {
-        if (!string.Equals(module, "Recipes", StringComparison.OrdinalIgnoreCase) || _hardConstraints is null)
+        if (!string.Equals(module, "Recipes", StringComparison.OrdinalIgnoreCase) || hard is null)
         {
             return null;
         }
 
         var blocked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        AddStrings(_hardConstraints, "allergens", blocked);
-        AddStrings(_hardConstraints, "dietary", blocked);
-        AddStrings(_hardConstraints, "medical", blocked);
+        AddStrings(hard, "allergens", blocked);
+        AddStrings(hard, "dietary", blocked);
+        AddStrings(hard, "medical", blocked);
         ExpandIngredientGroups(blocked);
         foreach (var term in blocked)
         {
@@ -291,32 +393,6 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
         return TimeOnly.TryParse(atTime, out var time) ? time.ToString("HH:mm") : null;
     }
 
-    private static IEnumerable<string> ArgumentStrings(KernelArguments args, string name)
-    {
-        if (!args.TryGetValue(name, out var value) || value is null)
-        {
-            return [];
-        }
-
-        if (value is string[] values)
-        {
-            return values;
-        }
-
-        if (value is IEnumerable<string> enumerable)
-        {
-            return enumerable;
-        }
-
-        if (value is JsonElement element && element.ValueKind == JsonValueKind.Array)
-        {
-            return element.EnumerateArray().Select(e => e.GetString() ?? "").Where(s => s.Length > 0).ToArray();
-        }
-
-        var text = value.ToString() ?? "";
-        return text.Trim('[', ']').Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
-            .Select(s => s.Trim('"'));
-    }
 
     private static string NormalizeDietary(string value)
         => value.StartsWith("no_", StringComparison.OrdinalIgnoreCase) ? value[3..] : value;

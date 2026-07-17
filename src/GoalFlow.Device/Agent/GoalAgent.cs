@@ -224,7 +224,10 @@ public sealed class GoalAgent
     private async Task<PlanReady> RunCoreAsync(Dispatch dispatch, CancellationToken ct)
     {
         using var scope = _trace.BeginGoalScope(dispatch.GoalId, dispatch.CorrelationId);
-        _safety.SetPolicy(dispatch.Constraints.Hard);
+        // Arm THIS goal's hard constraints and enter its scope: every kernel call
+        // made inside this async flow is checked against them and nothing else.
+        // (Previously one shared field — a second goal overwrote it mid-plan.)
+        using var policy = _safety.BeginGoal(dispatch.GoalId, dispatch.Constraints.Hard);
         _safety.SetTrace(_trace);
 
         _logger.LogInformation("plan_start domain={Domain} model_clock={Today}", dispatch.Domain, _clock.Today);
@@ -288,7 +291,7 @@ public sealed class GoalAgent
             {
                 Plan = modelPlan.Plan,
                 Proposals = proposals,
-                Safety = new SafetyVerdict { Gate = _safety.Gate, Violations = _safety.Violations.ToArray() },
+                Safety = new SafetyVerdict { Gate = _safety.GateFor(dispatch.GoalId), Violations = _safety.ViolationsFor(dispatch.GoalId).ToArray() },
                 Impact = modelPlan.Impact,
                 DemoEvents = demoEvents,
                 Explanation = modelPlan.Explanation
@@ -724,6 +727,12 @@ public sealed class GoalAgent
     private async Task<Status> ApplyApprovalCoreAsync(Approval approval, CancellationToken ct)
     {
         using var scope = _trace.BeginGoalScope(approval.GoalId, approval.CorrelationId);
+        // Enter THIS goal's armed policy before actuating anything. This path
+        // invokes approved proposals through the kernel, so the filter runs again
+        // here — the last gate before a real side effect (spending money, starting
+        // an appliance). It used to arm nothing at all and silently inherited
+        // whatever policy the last plan run left behind.
+        using var policy = _safety.EnterGoal(approval.GoalId);
         _safety.SetTrace(_trace);
         await _trace.PhaseAsync("executing");
         var cleared = _approvals.ApplyDecisions(approval);
@@ -787,6 +796,9 @@ public sealed class GoalAgent
             ? activeForScope.Dispatch.CorrelationId
             : null;
         using var scope = _trace.BeginGoalScope(control.GoalId, correlationId);
+        // A control tick can re-plan a slice of this goal (trigger_event →
+        // ProposeDailyAdaptationAsync), so enter its policy scope too.
+        using var policy = _safety.EnterGoal(control.GoalId);
         await _trace.PhaseAsync("monitoring");
 
         if (control.Command == ControlCommands.TriggerEvent)
@@ -892,6 +904,7 @@ public sealed class GoalAgent
             var store = _kernel.Services.GetRequiredService<IProductApiAdapter>();
             await store.ResetAsync(ct);
             _activeGoals.Remove(control.GoalId);
+            _safety.RemoveGoal(control.GoalId);
         }
 
         if (!_activeGoals.TryGetValue(control.GoalId, out var active))

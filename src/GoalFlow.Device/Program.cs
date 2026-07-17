@@ -5,6 +5,7 @@ using GoalFlow.Device.Products.FamilyHub;
 using GoalFlow.Device.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
@@ -114,6 +115,15 @@ if (options.DumpCapabilities)
         Console.Out.WriteLine($"{fn.PluginName}.{fn.Name}");
     }
 
+    return;
+}
+
+// M1 VERIFICATION GATE (dev tool): prove two concurrent goals cannot see each
+// other's safety policy. Deterministic, no LLM — it drives the filter's real
+// scope lookup, the same one the kernel pipeline uses.
+if (options.VerifyPolicyIsolation)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyPolicyIsolationAsync(provider.GetRequiredService<SafetyFilter>());
     return;
 }
 
@@ -229,6 +239,9 @@ internal sealed record CliOptions
     /// <summary>--dump-capabilities — print the kernel's deterministic surface and exit (M0 gate; see verify/m0/).</summary>
     public bool DumpCapabilities { get; init; }
 
+    /// <summary>--verify-policy-isolation — assert two concurrent goals cannot see each other's safety policy (M1 gate).</summary>
+    public bool VerifyPolicyIsolation { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -268,6 +281,7 @@ internal sealed record CliOptions
                 "--simulate-week" => options with { SimulateWeek = true, Domain = "meal_plan" },
                 "--simulate-guest" => options with { SimulateGuest = true, Domain = "guest_dinner" },
                 "--dump-capabilities" => options with { DumpCapabilities = true },
+                "--verify-policy-isolation" => options with { VerifyPolicyIsolation = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -301,6 +315,77 @@ internal static class DotEnv
 
 internal static class ProgramHelpers
 {
+/// <summary>
+/// M1 GATE: two goals with DIFFERENT hard constraints, running concurrently,
+/// must each be checked against their own — and only their own.
+///
+/// <para>
+/// This is the regression test for a live safety bug: the armed policy was one
+/// field on a singleton filter, so goal B's dispatch overwrote goal A's
+/// constraints mid-plan and the gate then enforced the wrong family's allergens.
+/// The two goals here interleave deliberately (awaits inside both scopes, a
+/// barrier between arming and checking) so that a shared field cannot pass:
+/// whichever armed last would win both assertions.
+/// </para>
+///
+/// <para>Deterministic and offline — it drives <c>SafetyFilter.CheckCurrent</c>,
+/// the same scope lookup the kernel pipeline uses, with no LLM involved.</para>
+/// </summary>
+public static async Task<int> VerifyPolicyIsolationAsync(SafetyFilter safety)
+{
+    // Goal A cannot have peanuts; goal B cannot have dairy (which the policy
+    // expands to milk/yogurt/paneer/cheese).
+    var goalA = new JsonObject { ["allergens"] = new JsonArray("peanuts") };
+    var goalB = new JsonObject { ["allergens"] = new JsonArray(), ["dietary"] = new JsonArray("dairy") };
+
+    var armed = new TaskCompletionSource();
+    var failures = new List<string>();
+
+    async Task RunGoal(string goalId, JsonObject hard, string mustBlock, string mustAllow)
+    {
+        using var scope = safety.BeginGoal(goalId, hard);
+
+        // Both goals are now armed before either checks — a shared field would
+        // hold only the second one's constraints from here on.
+        if (goalId == "goal-a") { armed.SetResult(); }
+        await armed.Task;
+        await Task.Yield();
+
+        var blocked = safety.CheckCurrent("ShoppingList", "Add", new KernelArguments { ["items"] = new[] { mustBlock } });
+        if (blocked is null)
+        {
+            failures.Add($"{goalId}: '{mustBlock}' should have been BLOCKED by its own constraints, but passed");
+        }
+
+        var allowed = safety.CheckCurrent("ShoppingList", "Add", new KernelArguments { ["items"] = new[] { mustAllow } });
+        if (allowed is not null)
+        {
+            failures.Add($"{goalId}: '{mustAllow}' should have been ALLOWED ({goalId} has no such constraint), but was blocked: {allowed}");
+        }
+    }
+
+    // NB: terms are matched as literal substrings, so the probes use terms the
+    // current checker actually recognises ("peanuts", not "peanut butter").
+    // This gate is about ISOLATION between goals, not about match quality.
+    await Task.WhenAll(
+        Task.Run(() => RunGoal("goal-a", goalA, mustBlock: "peanuts", mustAllow: "milk")),
+        Task.Run(() => RunGoal("goal-b", goalB, mustBlock: "milk", mustAllow: "peanuts")));
+
+    // Each goal's verdict must be its own, after the fact too.
+    if (safety.GateFor("goal-a") != SafetyGates.Passed) failures.Add("goal-a gate should be 'passed' (CheckCurrent records nothing)");
+    if (safety.GateFor("unknown-goal") != SafetyGates.Passed) failures.Add("an unknown goal should report a clean gate, not throw");
+
+    foreach (var failure in failures)
+    {
+        Console.Error.WriteLine($"  FAIL {failure}");
+    }
+
+    Console.Out.WriteLine(failures.Count == 0
+        ? "gate 5 (per-goal policy isolation): PASS"
+        : $"gate 5 FAIL: {failures.Count} assertion(s) — two goals are seeing each other's safety policy");
+    return failures.Count == 0 ? 0 : 1;
+}
+
 /// <summary>
 /// Ensure a mock-world dir has its seed JSONs. Running a SECOND agent with its own
 /// <c>--data ./data-b</c> (so two instances don't clobber each other's world) would
