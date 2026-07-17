@@ -147,17 +147,123 @@ public sealed class GoalAgent
 
     private const int MaxComposeAttempts = 3;
 
-    /// <summary>Id of the one task a goal has until the planner decomposes for real (c4).</summary>
+    /// <summary>Id of the one task a goal falls back to when decomposition is unavailable.</summary>
     private const string SingleTaskId = "t1";
 
     /// <summary>
-    /// One task per goal — the v2 shape, preserved so this commit is bookkeeping
-    /// only. c4 replaces this with a real decomposition pass, and everything the
-    /// Task Manager derives (progress, next step, pending) starts being interesting
-    /// the moment a goal has more than one.
+    /// THE FALL-BACK: one task for the whole goal — exactly the v2 shape. Used
+    /// when decomposition fails or the model returns nothing usable. The goal
+    /// still plans and still runs; the board just shows one coarse step instead of
+    /// several. A decomposition failure must never cost the user their goal.
     /// </summary>
     private static IReadOnlyList<TaskRecord> SynthesizeTasks(Dispatch dispatch)
         => [new TaskRecord { TaskId = SingleTaskId, GoalId = dispatch.GoalId, Title = dispatch.Objective }];
+
+    /// <summary>
+    /// ALTITUDE ONE of the planner: what are the pieces of this goal?
+    ///
+    /// <para>
+    /// A JSON-mode call with NO tools, over the capabilities the device actually
+    /// advertises, asking only for structure — titles and dependencies — never
+    /// world facts. Grounding is altitude two's job (that pass has the tools);
+    /// asking a toolless model about the fridge would just invite invention.
+    /// </para>
+    ///
+    /// <para>
+    /// The result is a suggestion: <see cref="TaskDag.Sanitize"/> repairs it into
+    /// something executable. FAIL-SOFT everywhere — any failure returns the single
+    /// synthesized task rather than throwing, because a goal that plans coarsely
+    /// beats a goal that dies.
+    /// </para>
+    /// </summary>
+    private async Task<IReadOnlyList<TaskRecord>> DecomposeAsync(IChatCompletionService chat, Dispatch dispatch, CancellationToken ct)
+    {
+        try
+        {
+            var history = new ChatHistory();
+            history.AddSystemMessage(DecomposeSystemPrompt);
+            history.AddUserMessage(BuildDecomposeInstruction(dispatch));
+
+            var content = await GetComposeContentAsync(chat, history, ct);
+            var json = ExtractJson(content);
+            if (json is null)
+            {
+                _logger.LogWarning("decompose_unparseable — falling back to a single task");
+                return SynthesizeTasks(dispatch);
+            }
+
+            var proposed = JsonSerializer.Deserialize<DecomposeResult>(json, ContractJson.Options)?.Tasks;
+            if (proposed is null || proposed.Count == 0)
+            {
+                _logger.LogWarning("decompose_empty — falling back to a single task");
+                return SynthesizeTasks(dispatch);
+            }
+
+            var (tasks, repairs) = TaskDag.Sanitize(proposed
+                .Select((t, i) => new TaskRecord
+                {
+                    TaskId = string.IsNullOrWhiteSpace(t.Id) ? $"t{i + 1}" : t.Id,
+                    GoalId = dispatch.GoalId,
+                    Title = t.Title ?? dispatch.Objective,
+                    DependsOn = t.DependsOn ?? [],
+                    Capabilities = t.Capabilities ?? []
+                })
+                .ToArray());
+
+            foreach (var repair in repairs)
+            {
+                _logger.LogWarning("decompose_repaired {Repair}", repair);
+            }
+
+            _logger.LogInformation("decomposed {GoalId} into {Count} task(s){Repaired}",
+                dispatch.GoalId, tasks.Count, repairs.Count > 0 ? $" ({repairs.Count} repaired)" : "");
+            await _trace.ThinkingAsync($"broke the goal into {tasks.Count} steps: {string.Join(" → ", tasks.Select(t => t.Title))}");
+            return tasks;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "decompose_failed — falling back to a single task");
+            return SynthesizeTasks(dispatch);
+        }
+    }
+
+    private const string DecomposeSystemPrompt = """
+        You break a home-assistant goal into the few steps needed to achieve it.
+        Reply with JSON only (no prose, no Markdown, no code fence):
+        { "tasks": [ { "id": "t1", "title": "short imperative step", "depends_on": [], "capabilities": ["Inventory"] } ] }
+
+        Rules:
+        - Between 1 and 8 tasks. Fewer, meaningful steps beat many trivial ones.
+        - Order them so dependencies come first; depends_on lists ids from THIS list only.
+        - A task is a unit of work worth showing a person as "next step" — not a tool call.
+        - capabilities: which listed modules the step will likely use. Advisory.
+        - Do NOT state world facts (what is in the fridge, who is busy). You cannot
+          see the world here; a later pass grounds each step against it.
+        """;
+
+    /// <summary>The decompose instruction: the contract + what this device can actually do.</summary>
+    private string BuildDecomposeInstruction(Dispatch dispatch)
+        => $"""
+        Task Contract:
+        {ContractJson.Serialize(dispatch)}
+
+        Capabilities available on this device:
+        {string.Join("\n", _capabilities.Descriptors.Where(d => d.Available).Select(d => $"- {d.Name}"))}
+        """;
+
+    /// <summary>The decompose call's wire shape (snake_case via ContractJson).</summary>
+    private sealed record DecomposeResult
+    {
+        public List<DecomposedTask> Tasks { get; init; } = [];
+    }
+
+    private sealed record DecomposedTask
+    {
+        public string? Id { get; init; }
+        public string? Title { get; init; }
+        public List<string>? DependsOn { get; init; }
+        public List<string>? Capabilities { get; init; }
+    }
 
     /// <summary>The grounding instruction (user message) rendered from the contract.</summary>
     internal static string BuildGroundingInstruction(Dispatch dispatch)
@@ -245,6 +351,13 @@ public sealed class GoalAgent
         _safety.SetTrace(_trace);
 
         _logger.LogInformation("plan_start domain={Domain} model_clock={Today}", dispatch.Domain, _clock.Today);
+        var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
+
+        // ALTITUDE ONE: what are the pieces of this goal? Structure only, no tools,
+        // no world facts — that is what grounding below is for. Fails soft to one
+        // task, so the goal always plans.
+        var taskDag = await DecomposeAsync(chat, dispatch, ct);
+
         await _trace.PhaseAsync("grounding");
         var ground = await _grounding.AssembleAsync(dispatch, _kernel, ct);
 
@@ -263,7 +376,6 @@ public sealed class GoalAgent
             MaxTokens = 2500
         };
 
-        var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
         var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
 
         if (groundingSummary.Length > 0)
@@ -313,14 +425,18 @@ public sealed class GoalAgent
         };
 
         await _trace.PhaseAsync("awaiting_approval");
-        // Register the goal and its tasks in the ledger. The decomposition is the
-        // planner's (c4); until then every goal is one task, which is exactly the
-        // v2 shape — so this commit changes bookkeeping, not behaviour.
-        var goal = _tasks.CreateGoal(dispatch, SynthesizeTasks(dispatch), worldSnapshot);
+        var goal = _tasks.CreateGoal(dispatch, taskDag, worldSnapshot);
         goal.Plan = modelPlan.Plan;
-        await _tasks.TransitionAsync(dispatch.GoalId, SingleTaskId, TaskState.Ready);
-        await _tasks.TransitionAsync(dispatch.GoalId, SingleTaskId, TaskState.Planning);
-        await _tasks.TransitionAsync(dispatch.GoalId, SingleTaskId, TaskState.AwaitingApproval);
+        // The compose above planned the whole goal in one pass, so every task is
+        // planned and waiting on the same approval. (Per-task planning — pulling
+        // one task off the frontier at a time — is the next altitude; the DAG and
+        // the ledger are what make it possible.)
+        foreach (var task in goal.Tasks)
+        {
+            await _tasks.TransitionAsync(dispatch.GoalId, task.TaskId, TaskState.Ready);
+            await _tasks.TransitionAsync(dispatch.GoalId, task.TaskId, TaskState.Planning);
+            await _tasks.TransitionAsync(dispatch.GoalId, task.TaskId, TaskState.AwaitingApproval);
+        }
         _logger.LogInformation("plan_ready items={ItemCount} proposals={ProposalCount} safety={Safety}", ready.Payload.Plan.Count, ready.Payload.Proposals.Count, ready.Payload.Safety.Gate);
         return ready;
     }

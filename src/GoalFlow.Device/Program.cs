@@ -418,8 +418,36 @@ public static async Task<int> VerifyTaskLifecycleAsync(ILoggerFactory loggerFact
     Check(tasks.NextReady(dispatch.GoalId) is null, "t4's dep failed, so nothing is ready — the goal is stuck, not silently done");
     Check(!goal.IsComplete, "a goal with an unreachable task is not complete");
 
+    // ---- The DAG sanitizer: what protects the ledger from a bad decomposition ----
+    // The decomposition is an LLM suggestion, so it can name a dependency that
+    // doesn't exist, depend on itself, or form a cycle. A cycle is the dangerous
+    // one: NextReady returns nothing and the goal looks alive forever.
+    TaskRecord T(string id, params string[] deps) => new() { TaskId = id, GoalId = "g", Title = id, DependsOn = deps };
+
+    var (unknown, r1) = TaskDag.Sanitize([T("t1", "nope"), T("t2", "t1")]);
+    Check(unknown[0].DependsOn.Count == 0, "an unknown dependency is dropped, not kept");
+    Check(r1.Any(r => r.Contains("unknown")), "dropping an unknown dep is reported");
+
+    var (self, _) = TaskDag.Sanitize([T("t1", "t1")]);
+    Check(self[0].DependsOn.Count == 0, "a self-dependency is dropped (it can never be satisfied)");
+
+    var (cycle, r2) = TaskDag.Sanitize([T("t1", "t2"), T("t2", "t1")]);
+    Check(cycle.Count == 2, "a cycle keeps both tasks — break the edge, not the goal");
+    Check(r2.Any(r => r.Contains("cycle")), "breaking a cycle is reported");
+    var cycleGoal = tasks.CreateGoal(
+        ProgramHelpers.BuildLocalDispatch("cycle", "verify", new SimulatedClock()) with { GoalId = "cyc" },
+        cycle.Select(t => t with { GoalId = "cyc" }).ToArray(), new JsonObject());
+    Check(tasks.NextReady("cyc") is not null, "a repaired cycle must be RUNNABLE — else the goal hangs forever");
+
+    var (capped, r3) = TaskDag.Sanitize(Enumerable.Range(1, 20).Select(i => T($"t{i}")).ToArray());
+    Check(capped.Count == TaskDag.MaxTasks, $"20 tasks capped to {TaskDag.MaxTasks}");
+    Check(r3.Any(r => r.Contains("capped")), "capping is reported, not silent");
+
+    var (ordered, _) = TaskDag.Sanitize([T("t3", "t2"), T("t1"), T("t2", "t1")]);
+    Check(ordered.Select(t => t.TaskId).SequenceEqual(["t1", "t2", "t3"]), "tasks come back in dependency order");
+
     foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
-    Console.Out.WriteLine(failures.Count == 0 ? "gate 8 (task lifecycle): PASS" : $"gate 8 FAIL: {failures.Count}");
+    Console.Out.WriteLine(failures.Count == 0 ? "gate 8 (task lifecycle + DAG): PASS" : $"gate 8 FAIL: {failures.Count}");
     return failures.Count == 0 ? 0 : 1;
 }
 
