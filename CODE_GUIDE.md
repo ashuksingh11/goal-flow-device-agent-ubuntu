@@ -50,10 +50,14 @@ src/GoalFlow.Device/
     Grounding/Grounding.cs           # planner context assembler (clock, constraints verbatim, digest)
     Clock/Clock.cs                   # IClock + SystemClock + SimulatedClock (generic clock)
     Trace/Trace.cs                   # agent_event streaming + structured logging (one sink, two audiences)
-    #  PrecheckEngine/               # [3] arrives in M3
+    PrecheckEngine/                  # [3] IS THE WORLD READY? — "not yet", vs safety's "never"
+      IPrecheckProbe.cs              #     a probe + its verdict; the remediation is the point
+      PrecheckEngine.cs              #     two gates (before planning, before actuating) + bindings
   Products/FamilyHub/                # THE PRODUCT PACK — everything fridge-specific
     FamilyHubProduct.cs              # the manifest: THE single declaration of the plugin catalog
     Observers/                       # what this product watches: MealPlan (daily feed), GuestDinner (RSVPs)
+    Probes/                          # what this product can check: device flags, appliance_online:<id>
+    config/prechecks.json            # which of THIS product's calls need which checks
     Adapter/MockFamilyHubAdapter.cs  # the mock world; resolves day offsets against IClock at read time
     config/policy.json               # THIS product's safety rules: which kinds bind to which calls
     Plugins/                         # SK plugins — the LLM's tools
@@ -61,7 +65,7 @@ src/GoalFlow.Device/
       ReminderPlugin.cs GuestsPlugin.cs ApplianceControlPlugin.cs
       FamilyProfilesPlugin.cs BudgetPlugin.cs NotifyPlugin.cs   # ← the 3 [Unavailable] stubs
   Transport/WsClient.cs              # one outbound BCL ClientWebSocket to the cloud hub
-verify/m0/ verify/m1/ verify/m2/    # the gates — run the LATEST milestone's check.sh before every commit
+verify/m0/ … verify/m3/            # the gates — run the LATEST milestone's check.sh before every commit
 ```
 
 **The split is the point.** `Harness/` is domain- and product-agnostic; `Products/`
@@ -149,7 +153,7 @@ invoked **through the kernel** (`_kernel.InvokeAsync` — the SafetyFilter still
 applies), then `MarkExecuted` makes replays no-ops. Returns a `status` frame
 listing executed effects.
 
-## The two-gate rule — "LLM plans, code checks"
+## The three gates — "LLM plans, code checks"
 
 The planner and the safety check are different *mechanisms*, not just
 different classes:
@@ -181,6 +185,13 @@ different classes:
     Over-blocking is a real failure mode, not a safe default: an agent that
     vetoes coconut gets switched off.
   - **`constraints.hard` remains its ONLY input.** Soft preferences never gate.
+- The **pre-check gate** (`Harness/PrecheckEngine/`, v3-M3) asks the question the
+  other two don't: is this POSSIBLE right now? A plan that preheats an unplugged
+  oven passes safety (nothing forbids it) and passes approval (the user said yes)
+  and then fails in the kitchen. It runs at phase boundaries — before planning,
+  and again before actuating each approved effect, because the world moves while
+  the user is deciding. A failure DEFERS (`deferred_precheck`), it does not fail:
+  the approval still stands and executes when the oven comes back.
 - The **approval gate** is the user: `[SideEffect]`-tagged functions surface
   as tiered proposals (`auto` = cheap/reversible, `light` = batched into the
   plan approval, `firm` = spends money / irreversible — never executes before

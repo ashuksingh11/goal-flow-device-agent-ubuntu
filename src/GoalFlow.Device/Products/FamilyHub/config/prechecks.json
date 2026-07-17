@@ -1,0 +1,35 @@
+{
+  "$comment": [
+    "FAMILY HUB PRE-CHECKS: which runtime conditions this product's calls need.",
+    "The harness owns WHEN checks run and what a failure means; this says WHICH.",
+    "",
+    "Bindings, not code, for the same reason the safety rules are: the same",
+    "ApplianceControl plugin needs appliance_online:oven here and something else",
+    "entirely on another product. A probe id may carry a parameter after a colon,",
+    "so one probe serves every appliance.",
+    "",
+    "Keep this HONEST rather than exhaustive. Every check is a way for the demo to",
+    "stall, and a check that guards nothing real is just a chance to be wrong: the",
+    "recipe box is a local file, so binding 'internet' to Recipes.FindRecipes would",
+    "invent a dependency that does not exist.",
+    "",
+    "A binding naming a probe nobody implements FAILS at run time (see the engine) —",
+    "a precheck that quietly does nothing reads as a guarantee."
+  ],
+
+  "$comment_goal": "true of ANY goal on this device — checked before the planner spends a token",
+  "goal": [
+    "samsung_account",
+    "device_online"
+  ],
+
+  "$comment_capabilities": "exact match and Module.* both apply — a module-wide rule is a floor, not a default",
+  "capabilities": {
+    "Appliance.*": ["smartthings_connected"],
+    "Appliance.PreheatOven": ["appliance_online:oven"],
+    "Appliance.RunProgram": ["appliance_online:dishwasher"],
+    "Appliance.Defrost": ["appliance_online:fridge"],
+
+    "ShoppingList.PlaceOrder": ["internet", "payment_configured"]
+  }
+}

@@ -45,6 +45,7 @@ public sealed class GoalAgent
     private readonly ApprovalCoordinator _approvals;
     private readonly MonitorAdapt _monitor;
     private readonly CapabilityManager _capabilities;
+    private readonly PrecheckEngine _prechecks;
     private readonly IClock _clock;
     private readonly ILogger<GoalAgent> _logger;
     private readonly TaskManager _tasks;
@@ -67,6 +68,7 @@ public sealed class GoalAgent
         MonitorAdapt monitor,
         CapabilityManager capabilities,
         TaskManager tasks,
+        PrecheckEngine prechecks,
         IClock clock,
         ILogger<GoalAgent> logger)
     {
@@ -78,6 +80,7 @@ public sealed class GoalAgent
         _monitor = monitor;
         _capabilities = capabilities;
         _tasks = tasks;
+        _prechecks = prechecks;
         _clock = clock;
         _logger = logger;
     }
@@ -158,6 +161,55 @@ public sealed class GoalAgent
     /// </summary>
     private static IReadOnlyList<TaskRecord> SynthesizeTasks(Dispatch dispatch)
         => [new TaskRecord { TaskId = SingleTaskId, GoalId = dispatch.GoalId, Title = dispatch.Objective }];
+
+    /// <summary>
+    /// The goal can't be planned yet: the world isn't ready. It WAITS — an empty
+    /// plan with the reason and a `waiting` status — rather than failing.
+    ///
+    /// <para>
+    /// The distinction is the component's whole point, and it is a distinction the
+    /// user feels. "Blocked by safety" means never. "Waiting for approval" means
+    /// the user must act. "Waiting on a precheck" means something in the house is
+    /// unplugged: nobody did anything wrong, and it will resume by itself. Saying
+    /// which one is why the remediation text exists.
+    /// </para>
+    /// </summary>
+    private PlanReady BuildPrecheckBlockedPlan(Dispatch dispatch, PrecheckReport precheck)
+    {
+        _logger.LogInformation("plan_precheck_blocked {GoalId}: {Remediation}", dispatch.GoalId, precheck.Remediation);
+        return new PlanReady
+        {
+            GoalId = dispatch.GoalId,
+            CorrelationId = dispatch.CorrelationId,
+            // Not "blocked": nothing is wrong with the goal, and it should be
+            // retried when the world recovers.
+            TaskStatus = TaskStatuses.Monitoring,
+            Payload = new PlanReadyPayload
+            {
+                Plan = [],
+                Proposals = [],
+                Safety = new SafetyVerdict { Gate = SafetyGates.Passed, Violations = [] },
+                Precheck = ToPrecheckVerdict(precheck),
+                Impact = [],
+                Explanation = $"I can't start this yet — {precheck.Remediation}. I'll pick it up once that's sorted."
+            }
+        };
+    }
+
+    /// <summary>The wire shape of a precheck report (plan_ready.payload.precheck).</summary>
+    private static PrecheckVerdict ToPrecheckVerdict(PrecheckReport report)
+        => new()
+        {
+            Ok = report.Ok,
+            Results = report.Results
+                .Select(r => new PrecheckResultDto
+                {
+                    Id = r.Id,
+                    Status = r.Status.ToString().ToLowerInvariant(),
+                    Detail = r.Detail
+                })
+                .ToArray()
+        };
 
     /// <summary>
     /// Moves every task currently in <paramref name="from"/> to <paramref name="to"/>.
@@ -419,6 +471,16 @@ public sealed class GoalAgent
         _safety.SetTrace(_trace);
 
         _logger.LogInformation("plan_start domain={Domain} model_clock={Today}", dispatch.Domain, _clock.Today);
+        // PRE-CHECK GATE 1: can this goal be planned at all? Before a single token
+        // is spent. A plan built while signed out is a plan that cannot be
+        // delivered, and finding that out at approval time wastes the user's
+        // decision as well as the tokens.
+        var precheck = await _prechecks.RunForDispatchAsync(dispatch, ct);
+        if (!precheck.Ok)
+        {
+            return BuildPrecheckBlockedPlan(dispatch, precheck);
+        }
+
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
 
         // ALTITUDE ONE: what are the pieces of this goal? Structure only, no tools,
@@ -486,6 +548,7 @@ public sealed class GoalAgent
                 Plan = modelPlan.Plan,
                 Proposals = proposals,
                 Safety = new SafetyVerdict { Gate = _safety.GateFor(dispatch.GoalId), Violations = _safety.ViolationsFor(dispatch.GoalId).ToArray() },
+                Precheck = ToPrecheckVerdict(precheck),
                 Impact = modelPlan.Impact,
                 DemoEvents = demoEvents,
                 Explanation = modelPlan.Explanation
@@ -960,6 +1023,29 @@ public sealed class GoalAgent
                     changedIds = applied.ChangedIds;
                     impactDelta = applied.ImpactDelta;
                 }
+                continue;
+            }
+
+            // PRE-CHECK GATE 2: can this effect actually happen, right now? The world
+            // moves between planning and approval — and approval is precisely where
+            // the delay is, because it waits on a person. An oven that was online
+            // when planned can be unplugged by the time someone taps Approve.
+            var effectCheck = await _prechecks.RunForProposalAsync(proposal, ct);
+            if (!effectCheck.Ok)
+            {
+                // DEFERRED, not failed and not silently dropped: the approval still
+                // stands, so re-applying it once the world recovers executes it (the
+                // ledger is idempotent). MarkExecuted is deliberately NOT called —
+                // marking it executed would lose the effect forever.
+                _logger.LogWarning("proposal_deferred {ProposalId} {Module}.{Function}: {Why}",
+                    proposal.ProposalId, proposal.Module, proposal.Function, effectCheck.Remediation);
+                executed.Add(new ExecutedEffect
+                {
+                    ProposalId = proposal.ProposalId,
+                    Action = $"{proposal.Module}.{proposal.Function}",
+                    Result = ExecutionResults.DeferredPrecheck,
+                    Detail = effectCheck.Remediation
+                });
                 continue;
             }
 
