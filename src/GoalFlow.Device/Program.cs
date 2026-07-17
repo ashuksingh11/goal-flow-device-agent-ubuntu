@@ -107,6 +107,24 @@ var agent = new GoalAgent(
     provider.GetRequiredService<IClock>(),
     loggerFactory.CreateLogger<GoalAgent>());
 
+// M0 VERIFICATION GATE (dev tool, not a demo path): print the deterministic
+// surface of the kernel so a refactor can be proven behavior-neutral.
+//   line 1  : the capabilities frame (pure reflection — no LLM, no network)
+//   line 2+ : one Module.Function per grounding tool, IN THE ORDER the planner
+//             hands them to the model.
+// Diffed against verify/m0/*.golden by verify/m0/check.sh. Needs no real API
+// key: BuildKernel only configures the connector, it never calls out.
+if (options.DumpCapabilities)
+{
+    Console.Out.WriteLine(ContractJson.Serialize(provider.GetRequiredService<CapabilityRegistry>().BuildCapabilitiesMessage(kernel)));
+    foreach (var fn in agent.GroundingFunctions())
+    {
+        Console.Out.WriteLine($"{fn.PluginName}.{fn.Name}");
+    }
+
+    return;
+}
+
 if (options.ConnectUrl is { } url)
 {
     var deviceId = ProgramHelpers.ResolveDeviceId(options.DeviceId, options.DataDir);
@@ -216,6 +234,9 @@ internal sealed record CliOptions
     /// <summary>--simulate-guest — plan the guest contract, then advance to the guest adaptation trigger.</summary>
     public bool SimulateGuest { get; init; }
 
+    /// <summary>--dump-capabilities — print the kernel's deterministic surface and exit (M0 gate; see verify/m0/).</summary>
+    public bool DumpCapabilities { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -254,6 +275,7 @@ internal sealed record CliOptions
                 "--verbose" => options with { Verbose = true },
                 "--simulate-week" => options with { SimulateWeek = true, Domain = "meal_plan" },
                 "--simulate-guest" => options with { SimulateGuest = true, Domain = "guest_dinner" },
+                "--dump-capabilities" => options with { DumpCapabilities = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }

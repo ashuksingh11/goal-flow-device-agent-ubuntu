@@ -972,6 +972,14 @@ public sealed class GoalAgent
             }
         };
 
+    /// <summary>
+    /// The planner's grounding tool set, for the M0 verification gate
+    /// (<c>--dump-capabilities</c>). Both the CONTENT and the ORDER are what the
+    /// LLM receives as its tools array, so the v3 restructure must reproduce
+    /// both exactly — set equality alone would not prove zero behavior change.
+    /// </summary>
+    internal IReadOnlyList<KernelFunction> GroundingFunctions() => ReadOnlyPlanningFunctions();
+
     private IReadOnlyList<KernelFunction> ReadOnlyPlanningFunctions()
     {
         var names = new (string Module, string Function)[]
