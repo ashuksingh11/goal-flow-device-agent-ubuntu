@@ -26,9 +26,15 @@ public sealed class TaskManager
 {
     private readonly ConcurrentDictionary<string, GoalRecord> _goals = new(StringComparer.Ordinal);
     private readonly ILogger<TaskManager> _logger;
-    private readonly Func<TaskRecord, Task>? _onTransition;
+    private readonly Func<GoalRecord, TaskRecord, Task>? _onTransition;
 
-    public TaskManager(ILogger<TaskManager> logger, Func<TaskRecord, Task>? onTransition = null)
+    /// <param name="onTransition">
+    /// Called after every accepted transition — the hook Trace uses to stream
+    /// task_update. Takes the GOAL as well as the task, because the interesting
+    /// number is the goal-level rollup (progress, next step), which only makes
+    /// sense across the whole DAG.
+    /// </param>
+    public TaskManager(ILogger<TaskManager> logger, Func<GoalRecord, TaskRecord, Task>? onTransition = null)
     {
         _logger = logger;
         _onTransition = onTransition;
@@ -101,8 +107,9 @@ public sealed class TaskManager
     /// </summary>
     public async Task<bool> TransitionAsync(string goalId, string taskId, TaskState next, string? reason = null)
     {
-        var task = GetGoal(goalId)?.Tasks.FirstOrDefault(t => t.TaskId == taskId);
-        if (task is null)
+        var goal = GetGoal(goalId);
+        var task = goal?.Tasks.FirstOrDefault(t => t.TaskId == taskId);
+        if (goal is null || task is null)
         {
             _logger.LogWarning("task_transition_unknown {GoalId}/{TaskId} -> {Next}", goalId, taskId, next);
             return false;
@@ -134,7 +141,7 @@ public sealed class TaskManager
         _logger.LogInformation("task_transition {GoalId}/{TaskId} {From} -> {To} {Reason}", goalId, taskId, from, next, reason ?? "");
         if (_onTransition is not null)
         {
-            await _onTransition(task);
+            await _onTransition(goal, task);
         }
 
         return true;

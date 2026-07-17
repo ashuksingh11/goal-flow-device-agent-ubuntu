@@ -63,7 +63,6 @@ services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
 services.AddSingleton<MonitorAdapt>();
-services.AddSingleton<TaskManager>();
 services.AddSingleton<PrecheckEngine>();
 
 await using var provider = services.BuildServiceProvider();
@@ -90,6 +89,17 @@ Func<AgentEvent, Task> emit = evt =>
     return Task.CompletedTask;
 };
 var trace = new Trace(loggerFactory.CreateLogger<Trace>(), emit);
+// Every accepted task transition streams a task_update. The cloud folds these into
+// Agent Board's progress/next-step — the task DAG lives here, so this is the only
+// way it can know. Wired here rather than in the DI block because the ledger and
+// the trace sink are built at different times and this is where both exist.
+var tasks = new TaskManager(
+    loggerFactory.CreateLogger<TaskManager>(),
+    (goal, task) => trace.TaskUpdateAsync(
+        task,
+        goal.ProgressPercent,
+        goal.PendingTasks,
+        tasksNextStep(goal)));
 var agent = new GoalAgent(
     kernel,
     trace,
@@ -98,7 +108,7 @@ var agent = new GoalAgent(
     provider.GetRequiredService<ApprovalCoordinator>(),
     provider.GetRequiredService<MonitorAdapt>(),
     provider.GetRequiredService<CapabilityManager>(),
-    provider.GetRequiredService<TaskManager>(),
+    tasks,
     provider.GetRequiredService<PrecheckEngine>(),
     provider.GetRequiredService<IClock>(),
     loggerFactory.CreateLogger<GoalAgent>());
@@ -142,6 +152,11 @@ if (options.VerifyGrades)
     return;
 }
 
+// The goal's next step: the frontier task's title — what Agent Board shows as
+// "Next Step". Null once nothing is left to do.
+static string? tasksNextStep(GoalRecord goal)
+    => goal.Tasks.FirstOrDefault(t => !t.IsTerminal && t.State != TaskState.Monitoring)?.Title;
+
 if (options.VerifyTaskLifecycle)
 {
     Environment.ExitCode = await ProgramHelpers.VerifyTaskLifecycleAsync(loggerFactory);
@@ -151,6 +166,12 @@ if (options.VerifyTaskLifecycle)
 if (options.VerifyPrechecks)
 {
     Environment.ExitCode = await ProgramHelpers.VerifyPrechecksAsync(provider, options.DataDir);
+    return;
+}
+
+if (options.VerifyDeadline)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyDeadlineAsync(loggerFactory);
     return;
 }
 
@@ -290,6 +311,9 @@ internal sealed record CliOptions
     /// <summary>--verify-trace-isolation — assert concurrent goals don't collide on goal_id/seq (M5 gate).</summary>
     public bool VerifyTraceIsolation { get; init; }
 
+    /// <summary>--verify-deadline — assert a stalled provider stream aborts rather than wedging a goal (M6 gate).</summary>
+    public bool VerifyDeadline { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -335,6 +359,7 @@ internal sealed record CliOptions
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
                 "--verify-trace-isolation" => options with { VerifyTraceIsolation = true },
+                "--verify-deadline" => options with { VerifyDeadline = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -1128,5 +1153,136 @@ private static string ResolveTodayToken(string value, IClock clock)
 
 public static LogLevel? ParseLogLevel()
     => Enum.TryParse<LogLevel>(Environment.GetEnvironmentVariable("LOG_LEVEL"), ignoreCase: true, out var level) ? level : null;
+
+/// <summary>
+/// --verify-deadline (M6 gate 15) — a stalled provider stream must not wedge a goal.
+///
+/// <para>
+/// This reproduces the real failure rather than describing it: a local endpoint that
+/// accepts the request, returns 200 with SSE headers, emits a few tokens, and then
+/// goes silent forever. That is exactly what OpenRouter did twice in one session —
+/// the device streamed, stopped mid-JSON, and sat there for FOUR HOURS while every
+/// surface reported "Working out the steps…".
+/// </para>
+/// <para>
+/// It is a real <c>IChatCompletionService</c> against a real socket, because the claim
+/// under test is a claim about the SDK: that cancelling a linked token actually aborts
+/// a streaming read. <c>HttpClient.Timeout</c> notably does NOT — streaming uses
+/// <c>ResponseHeadersRead</c>, so the timeout is satisfied once headers arrive and the
+/// body read is unbounded. Asserting on <see cref="CancellationTokenSource"/> in
+/// isolation would prove the token cancels and tell us nothing about the hang.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyDeadlineAsync(ILoggerFactory loggerFactory)
+{
+    var log = loggerFactory.CreateLogger("verify-deadline");
+    var failures = 0;
+    void Check(bool ok, string what)
+    {
+        if (!ok) { failures++; Console.WriteLine($"  FAIL {what}"); }
+        else { Console.WriteLine($"  ok   {what}"); }
+    }
+
+    using var listener = new System.Net.HttpListener();
+    var port = 8100 + (Environment.ProcessId % 500);
+    listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+    listener.Start();
+
+    var served = new TaskCompletionSource();
+    var serve = Task.Run(async () =>
+    {
+        var context = await listener.GetContextAsync();
+        context.Response.StatusCode = 200;
+        context.Response.ContentType = "text/event-stream";
+        context.Response.SendChunked = true;
+        var body = context.Response.OutputStream;
+        // A few WELL-FORMED chunks, so the client parses them happily and is committed
+        // to the stream. The shape matters: an earlier version of this fixture omitted
+        // id/object/created/model, the SDK threw JsonReaderException after 127ms, and
+        // this gate PASSED — on a parse error, with the deadline never firing, because
+        // JsonException is itself in the transient list. A fixture the client rejects
+        // tests the rejection, not the hang.
+        // Plain tokens: no quotes or braces. They were "{", "\"pl", "an\"" to look like
+        // a plan being emitted, but an unescaped quote inside a JSON string value made
+        // the chunk itself invalid ("content":""pl") — which the SDK rejected in 86ms,
+        // and the loose assertions called a pass. What flows before the stall does not
+        // matter; that it PARSES does.
+        foreach (var token in new[] { "Planning", " the", " party" })
+        {
+            var chunk = System.Text.Encoding.UTF8.GetBytes(
+                "data: {\"id\":\"chatcmpl-hang\",\"object\":\"chat.completion.chunk\",\"created\":1,"
+                + "\"model\":\"hang-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+                + "\"content\":\"" + token + "\"},\"finish_reason\":null}]}\n\n");
+            await body.WriteAsync(chunk);
+            await body.FlushAsync();
+        }
+        served.SetResult();
+        // ...and then nothing, ever. No error, no close: the exact shape of the hang.
+        await Task.Delay(Timeout.Infinite);
+    });
+
+    var kernel = Kernel.CreateBuilder()
+        .AddOpenAIChatCompletion(modelId: "hang-test", endpoint: new Uri($"http://127.0.0.1:{port}"), apiKey: "test")
+        .Build();
+    var chat = kernel.GetRequiredService<Microsoft.SemanticKernel.ChatCompletion.IChatCompletionService>();
+    var history = new Microsoft.SemanticKernel.ChatCompletion.ChatHistory();
+    history.AddUserMessage("plan something");
+
+    // The goal's own token — NEVER cancelled here. That distinction is the whole
+    // design: the deadline must be invisible to it, or a hang would be indistinguishable
+    // from a shutdown and IsTransientProviderError would refuse to retry.
+    using var goalCts = new CancellationTokenSource();
+    using var deadline = CancellationTokenSource.CreateLinkedTokenSource(goalCts.Token);
+    deadline.CancelAfter(TimeSpan.FromSeconds(3));
+
+    var started = System.Diagnostics.Stopwatch.StartNew();
+    Exception? thrown = null;
+    try
+    {
+        await foreach (var chunk in chat.GetStreamingChatMessageContentsAsync(history, null, kernel, deadline.Token))
+        {
+            // drain
+        }
+    }
+    catch (Exception ex)
+    {
+        thrown = ex;
+    }
+    started.Stop();
+    listener.Stop();
+
+    await served.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    log.LogInformation("stream aborted after {Elapsed}ms with {Type}: {Message}",
+        started.ElapsedMilliseconds, thrown?.GetType().Name ?? "<nothing>", thrown?.Message ?? "-");
+
+    Check(thrown is not null, "a stalled stream throws instead of hanging forever");
+    // The client must have PARSED the tokens and then WAITED. If it choked on the
+    // fixture, everything below measures the choke and not the hang — which is exactly
+    // how the first version of this gate passed.
+    Check(thrown is OperationCanceledException,
+        $"the DEADLINE ended the stream, not a parse error (got {thrown?.GetType().Name ?? "<nothing>"})");
+
+    // Both bounds. The lower one is what makes this a test: anything that ends the
+    // stream early (a malformed fixture, a refused connection) fails here, so the
+    // assertion can only be satisfied by waiting out the deadline and no other way.
+    Check(started.Elapsed >= TimeSpan.FromSeconds(2.5),
+        $"it waited for the deadline rather than failing fast ({started.ElapsedMilliseconds}ms, deadline 3000ms)");
+    Check(started.Elapsed < TimeSpan.FromSeconds(10),
+        $"it gives up ON the deadline, not eventually ({started.ElapsedMilliseconds}ms)");
+
+    Check(!goalCts.IsCancellationRequested, "the goal's own token is untouched — only the linked deadline fired");
+    Check(thrown is not null && GoalAgent.IsTransientProviderErrorForTests(thrown, goalCts.Token),
+        "a fired deadline classifies as TRANSIENT, so the existing retry handles it");
+
+    // ...and the same exception under a REAL cancellation must NOT be retried, or
+    // shutdown would spin through three attempts before giving up.
+    using var cancelled = new CancellationTokenSource();
+    cancelled.Cancel();
+    Check(thrown is not null && !GoalAgent.IsTransientProviderErrorForTests(thrown, cancelled.Token),
+        "the same exception under genuine cancellation is NOT transient");
+
+    Console.WriteLine(failures == 0 ? "gate 15 (provider deadline): PASS" : $"gate 15 (provider deadline): FAIL: {failures}");
+    return failures == 0 ? 0 : 1;
+}
 
 }

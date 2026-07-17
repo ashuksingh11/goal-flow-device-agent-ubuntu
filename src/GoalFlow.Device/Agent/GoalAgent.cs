@@ -193,6 +193,20 @@ public sealed class GoalAgent
 
     private const int MaxComposeAttempts = 3;
 
+    /// <summary>
+    /// How long ONE provider call may take before it is treated as a hang.
+    ///
+    /// <para>
+    /// Generous on purpose — a healthy call to this model answers in seconds, so these
+    /// are not latency targets. They are the line past which "slow" becomes "never":
+    /// the alternative is what shipped before them, a goal wedged for four hours while
+    /// the board reported progress. Streaming gets more room because it runs the tool
+    /// loop and reasons aloud. See <see cref="Deadline"/>.
+    /// </para>
+    /// </summary>
+    private static readonly TimeSpan LlmCallBudget = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan StreamingCallBudget = TimeSpan.FromSeconds(150);
+
     /// <summary>Id of the one task a goal falls back to when decomposition is unavailable.</summary>
     private const string SingleTaskId = "t1";
 
@@ -347,7 +361,28 @@ public sealed class GoalAgent
             history.AddSystemMessage(DecomposeSystemPrompt);
             history.AddUserMessage(BuildDecomposeInstruction(dispatch));
 
-            var content = await GetComposeContentAsync(chat, history, ct);
+            // RETRY transient provider errors, like every other LLM call here.
+            // Fail-soft is the LAST resort, not the first response to a known-flaky
+            // provider: OpenRouter regularly returns finish_reason=error mid-stream
+            // ("Unknown ChatFinishReason value"), and without this a single hiccup
+            // permanently collapsed the goal to one task — the board would show 1
+            // step instead of 7 at random. Retrying is safe: decompose has no tools
+            // and no side effects.
+            string content = "";
+            for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
+            {
+                try
+                {
+                    content = await GetComposeContentAsync(chat, history, ct);
+                    break;
+                }
+                catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
+                {
+                    _logger.LogWarning("decompose_transient attempt {Attempt}/{Max}: {Message}; retrying", attempt, MaxComposeAttempts, ex.Message);
+                    await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+                }
+            }
+
             var json = ExtractJson(content);
             if (json is null)
             {
@@ -648,7 +683,10 @@ public sealed class GoalAgent
             var summary = new StringBuilder();
             try
             {
-                await foreach (var chunk in chat.GetStreamingChatMessageContentsAsync(history, settings, _kernel, ct))
+                // The grounding pass calls tools and streams its reasoning, so it gets
+                // the widest budget of any call here — but a budget nonetheless.
+                using var cts = Deadline(ct, StreamingCallBudget);
+                await foreach (var chunk in chat.GetStreamingChatMessageContentsAsync(history, settings, _kernel, cts.Token))
                 {
                     if (!string.IsNullOrEmpty(chunk.Content))
                     {
@@ -736,7 +774,8 @@ public sealed class GoalAgent
 
         try
         {
-            var response = await chat.GetChatMessageContentAsync(history, jsonSettings, _kernel, ct);
+            using var cts = Deadline(ct, LlmCallBudget);
+            var response = await chat.GetChatMessageContentAsync(history, jsonSettings, _kernel, cts.Token);
             var content = response.Content ?? "";
             if (!string.IsNullOrWhiteSpace(content))
             {
@@ -764,7 +803,8 @@ public sealed class GoalAgent
             Temperature = 0.1,
             MaxTokens = 6000
         };
-        var response = await chat.GetChatMessageContentAsync(history, strictSettings, _kernel, ct);
+        using var cts = Deadline(ct, LlmCallBudget);
+        var response = await chat.GetChatMessageContentAsync(history, strictSettings, _kernel, cts.Token);
         return response.Content ?? "";
     }
 
@@ -937,7 +977,8 @@ public sealed class GoalAgent
         {
             try
             {
-                var resp = await chat.GetChatMessageContentAsync(history, settings, _kernel, ct);
+                using var cts = Deadline(ct, LlmCallBudget);
+                var resp = await chat.GetChatMessageContentAsync(history, settings, _kernel, cts.Token);
                 var content = resp.Content ?? "";
                 if (!string.IsNullOrWhiteSpace(content))
                 {
@@ -1508,12 +1549,53 @@ public sealed class GoalAgent
     }
 
     /// <summary>
+    /// A deadline for ONE provider call, linked to the goal's own token.
+    ///
+    /// <para>
+    /// Without this a goal can hang forever. Observed twice in one session: the stream
+    /// delivered tokens, stopped mid-JSON, and never returned — the process stayed
+    /// alive, nothing was logged, and every surface kept reporting "Working out the
+    /// steps…". The provider was healthy; OpenRouter had simply routed that stream to
+    /// one that hung.
+    /// </para>
+    /// <para>
+    /// <c>HttpClient.Timeout</c> does NOT cover this. Streaming reads the response with
+    /// <c>ResponseHeadersRead</c>, so the timeout is satisfied the moment headers
+    /// arrive — everything after that is an unbounded read. The deadline has to be a
+    /// cancellation token.
+    /// </para>
+    /// <para>
+    /// Expiry cancels only the LINKED token, never the caller's, so
+    /// <see cref="IsTransientProviderError"/> sees <c>ct.IsCancellationRequested ==
+    /// false</c> and classifies it as transient. That is deliberate: a hang then flows
+    /// into the retry machinery that already exists for provider flakiness, rather than
+    /// needing a second path. A genuine shutdown cancels <c>ct</c> itself and still
+    /// propagates.
+    /// </para>
+    /// </summary>
+    private static CancellationTokenSource Deadline(CancellationToken ct, TimeSpan budget)
+    {
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(budget);
+        return cts;
+    }
+
+    /// <summary>
     /// True for TRANSPORT/provider flakiness worth retrying the LLM over — a
     /// finish_reason the OpenAI SDK can't deserialize (throws
     /// <see cref="ArgumentOutOfRangeException"/>), a JSON deserialization glitch in
-    /// the SDK, an HTTP 5xx/429/timeout — as opposed to a genuine cancellation
-    /// (which must propagate) or a modelling error (handled by the parse retry).
+    /// the SDK, an HTTP 5xx/429/timeout, or our own per-call deadline expiring — as
+    /// opposed to a genuine cancellation (which must propagate) or a modelling error
+    /// (handled by the parse retry).
     /// </summary>
+    /// <summary>
+    /// Gate 15's window onto the classifier. The gate's whole point is that a fired
+    /// deadline is judged TRANSIENT while a real cancellation is not — asserting that
+    /// against a copy of the rule would test the copy.
+    /// </summary>
+    internal static bool IsTransientProviderErrorForTests(Exception ex, CancellationToken ct)
+        => IsTransientProviderError(ex, ct);
+
     private static bool IsTransientProviderError(Exception ex, CancellationToken ct)
     {
         if (ct.IsCancellationRequested)
@@ -1523,6 +1605,7 @@ public sealed class GoalAgent
 
         var text = ex.ToString();
         return ex is HttpRequestException
+            || ex is OperationCanceledException     // our own per-call deadline fired (ct excluded above)
             || ex is TaskCanceledException          // client-side/socket timeout (ct excluded above)
             || ex is JsonException                  // SDK failed to deserialize the provider response
             || ex is ArgumentOutOfRangeException     // e.g. "Unknown ChatFinishReason value"

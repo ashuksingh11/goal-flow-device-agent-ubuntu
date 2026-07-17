@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using System.Text;
 using System.Text.Json;
 using GoalFlow.Device.Contracts;
 using Microsoft.Extensions.Logging;
@@ -115,6 +116,57 @@ public sealed class Trace
             ["function"] = function,
             ["summary"] = summary.Length <= 800 ? summary : summary[..800]
         });
+
+    /// <summary>
+    /// Emits a task_update as one task changes state, with the goal-level rollup.
+    ///
+    /// <para>
+    /// The task DAG lives HERE — only the device can ground a decomposition — so this
+    /// is how the cloud (and therefore Agent Board) learns what a goal is made of and
+    /// how far along it is. progress/pending/next_step are DERIVED from task state,
+    /// never from the clock: that is the whole reason the Task Manager exists.
+    /// </para>
+    /// </summary>
+    public Task TaskUpdateAsync(TaskRecord task, int progressPercent, int pendingTasks, string? nextStep)
+        => EmitAsync(AgentEventKinds.TaskUpdate, new JsonObject
+        {
+            ["task_id"] = task.TaskId,
+            ["title"] = task.Title,
+            ["state"] = ToWire(task.State),
+            ["depends_on"] = new JsonArray(task.DependsOn.Select(d => JsonValue.Create(d)).ToArray<JsonNode?>()),
+            ["progress_pct"] = progressPercent,
+            ["pending_tasks"] = pendingTasks,
+            ["next_step"] = nextStep,
+            ["retry_count"] = task.RetryCount,
+            ["failure_reason"] = task.FailureReason
+        });
+
+    /// <summary>
+    /// PascalCase enum -> snake_case wire value ("AwaitingApproval" -> "awaiting_approval").
+    ///
+    /// <para>
+    /// ToString().ToLowerInvariant() shipped "awaitingapproval", while the very same
+    /// concept goes out as "awaiting_approval" in `task_status` and `phase` — one wire,
+    /// two spellings of one idea. It hid because AwaitingApproval is the only multi-word
+    /// member of TaskState, so every other value round-tripped correctly by accident,
+    /// and a cloud check for a single-word state ("completed") passed on luck. Doing the
+    /// conversion here keeps it right for whatever members get added later.
+    /// </para>
+    /// </summary>
+    internal static string ToWire(TaskState state)
+    {
+        var name = state.ToString();
+        var sb = new StringBuilder(name.Length + 4);
+        for (var i = 0; i < name.Length; i++)
+        {
+            if (i > 0 && char.IsUpper(name[i]))
+            {
+                sb.Append('_');
+            }
+            sb.Append(char.ToLowerInvariant(name[i]));
+        }
+        return sb.ToString();
+    }
 
     /// <summary>Emits plan_progress as each plan item materializes.</summary>
     public Task PlanProgressAsync(PlanItem item)

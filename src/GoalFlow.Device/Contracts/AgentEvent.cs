@@ -67,6 +67,19 @@ public static class AgentEventKinds
 
     /// <summary>Payload: { "item": {...} } — a plan item just materialized.</summary>
     public const string PlanProgress = "plan_progress";
+
+    /// <summary>
+    /// Payload: { task_id, title, state, depends_on, progress_pct, pending_tasks,
+    /// next_step, retry_count, failure_reason } — one task changed state (v3-M6).
+    ///
+    /// <para>
+    /// The task DAG lives on the DEVICE (only it can ground a decomposition), so this
+    /// is how the cloud learns what a goal is made of and how far along it is. Agent
+    /// Board's progress %, next step and pending count are folded from these — derived
+    /// from real task state rather than guessed from plan-day vs the clock.
+    /// </para>
+    /// </summary>
+    public const string TaskUpdate = "task_update";
 }
 
 /// <summary>Typed payload helpers (serialized into <see cref="AgentEvent.Payload"/>).</summary>
