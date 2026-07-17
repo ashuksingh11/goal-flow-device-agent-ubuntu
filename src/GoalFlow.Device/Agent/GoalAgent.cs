@@ -347,7 +347,28 @@ public sealed class GoalAgent
             history.AddSystemMessage(DecomposeSystemPrompt);
             history.AddUserMessage(BuildDecomposeInstruction(dispatch));
 
-            var content = await GetComposeContentAsync(chat, history, ct);
+            // RETRY transient provider errors, like every other LLM call here.
+            // Fail-soft is the LAST resort, not the first response to a known-flaky
+            // provider: OpenRouter regularly returns finish_reason=error mid-stream
+            // ("Unknown ChatFinishReason value"), and without this a single hiccup
+            // permanently collapsed the goal to one task — the board would show 1
+            // step instead of 7 at random. Retrying is safe: decompose has no tools
+            // and no side effects.
+            string content = "";
+            for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
+            {
+                try
+                {
+                    content = await GetComposeContentAsync(chat, history, ct);
+                    break;
+                }
+                catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
+                {
+                    _logger.LogWarning("decompose_transient attempt {Attempt}/{Max}: {Message}; retrying", attempt, MaxComposeAttempts, ex.Message);
+                    await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+                }
+            }
+
             var json = ExtractJson(content);
             if (json is null)
             {

@@ -63,7 +63,6 @@ services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
 services.AddSingleton<MonitorAdapt>();
-services.AddSingleton<TaskManager>();
 services.AddSingleton<PrecheckEngine>();
 
 await using var provider = services.BuildServiceProvider();
@@ -90,6 +89,17 @@ Func<AgentEvent, Task> emit = evt =>
     return Task.CompletedTask;
 };
 var trace = new Trace(loggerFactory.CreateLogger<Trace>(), emit);
+// Every accepted task transition streams a task_update. The cloud folds these into
+// Agent Board's progress/next-step — the task DAG lives here, so this is the only
+// way it can know. Wired here rather than in the DI block because the ledger and
+// the trace sink are built at different times and this is where both exist.
+var tasks = new TaskManager(
+    loggerFactory.CreateLogger<TaskManager>(),
+    (goal, task) => trace.TaskUpdateAsync(
+        task,
+        goal.ProgressPercent,
+        goal.PendingTasks,
+        tasksNextStep(goal)));
 var agent = new GoalAgent(
     kernel,
     trace,
@@ -98,7 +108,7 @@ var agent = new GoalAgent(
     provider.GetRequiredService<ApprovalCoordinator>(),
     provider.GetRequiredService<MonitorAdapt>(),
     provider.GetRequiredService<CapabilityManager>(),
-    provider.GetRequiredService<TaskManager>(),
+    tasks,
     provider.GetRequiredService<PrecheckEngine>(),
     provider.GetRequiredService<IClock>(),
     loggerFactory.CreateLogger<GoalAgent>());
@@ -141,6 +151,11 @@ if (options.VerifyGrades)
     Environment.ExitCode = ProgramHelpers.VerifyGrades(provider);
     return;
 }
+
+// The goal's next step: the frontier task's title — what Agent Board shows as
+// "Next Step". Null once nothing is left to do.
+static string? tasksNextStep(GoalRecord goal)
+    => goal.Tasks.FirstOrDefault(t => !t.IsTerminal && t.State != TaskState.Monitoring)?.Title;
 
 if (options.VerifyTaskLifecycle)
 {
