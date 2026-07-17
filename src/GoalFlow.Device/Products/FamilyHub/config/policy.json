@@ -1,0 +1,62 @@
+{
+  "$comment": [
+    "FAMILY HUB SAFETY POLICY. The harness implements the rule KINDS; this file says",
+    "which of THIS product's calls they apply to, and with what vocabulary. Everything",
+    "here used to be hardcoded inside SafetyFilter, which is why the generic core knew",
+    "what a shopping list was.",
+    "",
+    "grades.overrides may only make a grade STRICTER than the [SideEffect] attribute on",
+    "the method (A0 < A1 < A2 < AX). Loosening one throws at startup — see the ratchet in",
+    "SafetyPolicy.GradeFor. That is why this file can be edited without fear: the worst a",
+    "mistake here can do is demand MORE consent than the code intends.",
+    "",
+    "Rules read constraints.hard and nothing else. Soft preferences never gate."
+  ],
+
+  "grades": {
+    "overrides": {}
+  },
+
+  "rules": [
+    {
+      "$comment": "Allergens/diet/medical. No module binding: a forbidden ingredient is forbidden wherever it appears.",
+      "kind": "blocked_terms",
+      "constraints": ["allergens", "dietary", "medical"],
+      "scan_args": ["items", "ingredients", "name", "item", "message", "title"],
+      "groups": {
+        "dairy": ["milk", "yogurt", "paneer", "cheese"],
+        "gluten": ["bread", "toast", "pasta", "tortilla wraps"],
+        "pork": ["pork", "bacon", "ham"],
+        "nuts": ["peanut", "almond", "cashew", "walnut", "pistachio", "hazelnut"]
+      }
+    },
+    {
+      "$comment": "Screen recipe RESULTS too, so a forbidden dish never reaches the model as a candidate. Recipes tag themselves with the same vocabulary (contains: [dairy, gluten]).",
+      "kind": "result_screen",
+      "modules": ["Recipes"],
+      "constraints": ["allergens", "dietary", "medical"],
+      "scan_args": [],
+      "groups": {
+        "dairy": ["milk", "yogurt", "paneer", "cheese"],
+        "gluten": ["bread", "toast", "pasta", "tortilla wraps"],
+        "pork": ["pork", "bacon", "ham"],
+        "nuts": ["peanut", "almond", "cashew", "walnut", "pistachio", "hazelnut"]
+      }
+    },
+    {
+      "$comment": "The budget guardrail: only the call that actually spends money.",
+      "kind": "numeric_cap",
+      "modules": ["ShoppingList"],
+      "functions": ["PlaceOrder"],
+      "constraint": "budget_cap",
+      "args": ["estimatedTotal", "estimated_total"]
+    },
+    {
+      "$comment": "Quiet hours: things that make noise in the house.",
+      "kind": "time_window_block",
+      "modules": ["Appliance", "Notify"],
+      "constraint": "quiet_hours",
+      "args": ["time", "atTime"]
+    }
+  ]
+}

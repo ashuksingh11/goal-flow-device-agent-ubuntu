@@ -26,4 +26,15 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="*" />
   </ItemGroup>
 
+  <!-- Product-pack config (safety policy, …): read-only and code-adjacent, so it
+       ships WITH the app, unlike data/ which is the mutable runtime world the
+       data flag points at. On Tizen this lands in the read-only resource bundle, which is
+       exactly right for it and exactly wrong for data/. Keep in sync with the
+       same item in the repo-root wrapper csproj. -->
+  <ItemGroup>
+    <Content Include="Products/**/config/*.json"
+             Link="Products/%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

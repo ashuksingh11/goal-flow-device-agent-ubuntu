@@ -5,6 +5,7 @@ using GoalFlow.Device.Products.FamilyHub;
 using GoalFlow.Device.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
@@ -114,6 +115,27 @@ if (options.DumpCapabilities)
         Console.Out.WriteLine($"{fn.PluginName}.{fn.Name}");
     }
 
+    return;
+}
+
+// M1 VERIFICATION GATE (dev tool): prove two concurrent goals cannot see each
+// other's safety policy. Deterministic, no LLM — it drives the filter's real
+// scope lookup, the same one the kernel pipeline uses.
+if (options.VerifyPolicyIsolation)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyPolicyIsolationAsync(provider.GetRequiredService<SafetyFilter>());
+    return;
+}
+
+if (options.VerifySafetyRules)
+{
+    Environment.ExitCode = ProgramHelpers.VerifySafetyRules(provider.GetRequiredService<SafetyFilter>());
+    return;
+}
+
+if (options.VerifyGrades)
+{
+    Environment.ExitCode = ProgramHelpers.VerifyGrades(provider);
     return;
 }
 
@@ -229,6 +251,15 @@ internal sealed record CliOptions
     /// <summary>--dump-capabilities — print the kernel's deterministic surface and exit (M0 gate; see verify/m0/).</summary>
     public bool DumpCapabilities { get; init; }
 
+    /// <summary>--verify-policy-isolation — assert two concurrent goals cannot see each other's safety policy (M1 gate).</summary>
+    public bool VerifyPolicyIsolation { get; init; }
+
+    /// <summary>--verify-safety-rules — assert the declarative rules block/allow the right things (M1 gate).</summary>
+    public bool VerifySafetyRules { get; init; }
+
+    /// <summary>--verify-grades — assert the grade ratchet holds and AX is unproposable (M1 gate).</summary>
+    public bool VerifyGrades { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -268,6 +299,9 @@ internal sealed record CliOptions
                 "--simulate-week" => options with { SimulateWeek = true, Domain = "meal_plan" },
                 "--simulate-guest" => options with { SimulateGuest = true, Domain = "guest_dinner" },
                 "--dump-capabilities" => options with { DumpCapabilities = true },
+                "--verify-policy-isolation" => options with { VerifyPolicyIsolation = true },
+                "--verify-safety-rules" => options with { VerifySafetyRules = true },
+                "--verify-grades" => options with { VerifyGrades = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -301,6 +335,207 @@ internal static class DotEnv
 
 internal static class ProgramHelpers
 {
+/// <summary>
+/// M1 GATE: automation grades — the ratchet, and AX.
+///
+/// <para>
+/// AX has no natural subject in this product yet (nothing the Family Hub does is
+/// prohibited; the first one is the smart lock, in M7), so it is exercised here
+/// through a throwaway policy rather than left as a mechanism nobody runs until
+/// the demo. The ratchet is checked in BOTH directions, because a one-way check
+/// would pass on a rule that rejects everything.
+/// </para>
+/// </summary>
+public static int VerifyGrades(IServiceProvider provider)
+{
+    var descriptors = FamilyHubProduct.CreateDescriptors(provider);
+    var failures = new List<string>();
+
+    SafetyPolicy Policy(string overridesJson) => SafetyPolicy.Parse(
+        JsonNode.Parse("{\"grades\":{\"overrides\":{" + overridesJson + "}},\"rules\":[]}")!.AsObject(), "<test>");
+
+    // Intrinsic grades come from [SideEffect] with no config at all.
+    var plain = new CapabilityManager(descriptors, Policy(""));
+    void Expect(string module, string function, AutomationGrade? want, CapabilityManager mgr, string why)
+    {
+        var got = mgr.GradeOf(module, function);
+        if (got != want) failures.Add($"{why}: {module}.{function} graded {got?.ToString() ?? "null"}, expected {want?.ToString() ?? "null"}");
+    }
+
+    Expect("ShoppingList", "PlaceOrder", AutomationGrade.A2, plain, "firm -> A2");
+    Expect("ShoppingList", "Add", AutomationGrade.A1, plain, "light -> A1");
+    Expect("Reminders", "Create", AutomationGrade.A0, plain, "auto -> A0");
+    Expect("Inventory", "ListItems", null, plain, "a read is not an action");
+
+    // TIGHTENING is allowed.
+    var tightened = new CapabilityManager(descriptors, Policy("\"ShoppingList.Add\":\"A2\""));
+    Expect("ShoppingList", "Add", AutomationGrade.A2, tightened, "policy may tighten A1 -> A2");
+
+    // WEAKENING must throw, at construction, not at the call that matters.
+    try
+    {
+        _ = new CapabilityManager(descriptors, Policy("\"ShoppingList.PlaceOrder\":\"A0\""));
+        failures.Add("THE RATCHET DID NOT HOLD: policy weakened PlaceOrder A2 -> A0 and nothing threw");
+    }
+    catch (InvalidOperationException)
+    {
+        // expected
+    }
+
+    // AX: prohibited actions are never offered to the planner.
+    var prohibited = new CapabilityManager(descriptors, Policy("\"ShoppingList.PlaceOrder\":\"AX\""));
+    Expect("ShoppingList", "PlaceOrder", AutomationGrade.AX, prohibited, "policy may tighten A2 -> AX");
+    if (prohibited.IsProposable("ShoppingList", "PlaceOrder")) failures.Add("an AX action must never be a proposal target");
+    if (!prohibited.IsProposable("ShoppingList", "Add")) failures.Add("a non-AX action must stay proposable");
+    if (plain.IsProposable("Budget", "GetBudgetStatus")) failures.Add("an unavailable plugin's function must not be proposable");
+    if (plain.IsProposable("Inventory", "ListItems")) failures.Add("a read is not an action and must not be proposable");
+
+    foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
+    Console.Out.WriteLine(failures.Count == 0 ? "gate 7 (grades: ratchet + AX): PASS" : $"gate 7 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// M1 GATE: the declarative safety rules block what they must and — just as
+/// important — allow what they must not block.
+///
+/// <para>
+/// The false-positive rows are the point. A naive contains() check is easy to
+/// "strengthen" until a nut allergy blocks coconut and butternut squash, at which
+/// point the family turns the agent off, so the over-blocking rows guard the fix
+/// as much as the under-blocking ones do. The "peanut butter" row is the bug this
+/// milestone fixed: an allergen of "peanuts" did not block it, because the plural
+/// term is not a substring of the singular phrase.
+/// </para>
+/// </summary>
+public static int VerifySafetyRules(SafetyFilter safety)
+{
+    var allergyNuts = new JsonObject { ["allergens"] = new JsonArray("nuts") };
+    var allergyPeanuts = new JsonObject { ["allergens"] = new JsonArray("peanuts") };
+    var noDairy = new JsonObject { ["dietary"] = new JsonArray("dairy") };
+    var noPork = new JsonObject { ["dietary"] = new JsonArray("no_pork") };
+    var budget = new JsonObject { ["budget_cap"] = 120.0 };
+    var quiet = new JsonObject { ["quiet_hours"] = new JsonObject { ["start"] = "21:30", ["end"] = "07:00" } };
+
+    (string Label, JsonObject Hard, string Module, string Function, KernelArguments Args, bool ShouldBlock)[] cases =
+    [
+        // The fix: singular/plural and compound phrases.
+        ("peanuts blocks 'peanut butter'",   allergyPeanuts, "ShoppingList", "Add", Items("peanut butter"), true),
+        ("peanuts blocks 'peanuts'",         allergyPeanuts, "ShoppingList", "Add", Items("peanuts"), true),
+        ("peanuts blocks 'roasted peanuts'", allergyPeanuts, "ShoppingList", "Add", Items("roasted peanuts"), true),
+        ("nuts blocks 'cashews' (group)",    allergyNuts,    "ShoppingList", "Add", Items("cashews"), true),
+        ("nuts blocks 'almond flour'",       allergyNuts,    "ShoppingList", "Add", Items("almond flour"), true),
+
+        // The other half: not over-blocking. A "nuts" allergy must not veto these.
+        ("nuts ALLOWS 'coconut milk'",       allergyNuts,    "ShoppingList", "Add", Items("coconut milk"), false),
+        ("nuts ALLOWS 'butternut squash'",   allergyNuts,    "ShoppingList", "Add", Items("butternut squash"), false),
+        ("nuts ALLOWS 'nutmeg'",             allergyNuts,    "ShoppingList", "Add", Items("nutmeg"), false),
+
+        // Unchanged v2 behaviour, ported 1:1.
+        ("dairy blocks 'whole milk'",        noDairy,        "ShoppingList", "Add", Items("whole milk"), true),
+        ("dairy ALLOWS 'oat drink'",         noDairy,        "ShoppingList", "Add", Items("oat drink"), false),
+        ("no_pork blocks 'bacon'",           noPork,         "ShoppingList", "Add", Items("bacon"), true),
+        ("budget_cap blocks an over-spend",  budget,         "ShoppingList", "PlaceOrder", new KernelArguments { ["estimatedTotal"] = 130.0 }, true),
+        ("budget_cap allows an under-spend", budget,         "ShoppingList", "PlaceOrder", new KernelArguments { ["estimatedTotal"] = 110.0 }, false),
+        ("quiet_hours blocks a 22:00 run",   quiet,          "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = "22:00" }, true),
+        ("quiet_hours allows an 18:00 run",  quiet,          "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = "18:00" }, false),
+        // Rule bindings come from policy.json: the cap is bound to ShoppingList only.
+        ("budget rule is NOT bound to Reminders", budget,    "Reminders",    "Create", new KernelArguments { ["estimatedTotal"] = 130.0 }, false),
+    ];
+
+    var failures = 0;
+    foreach (var (label, hard, module, function, args, shouldBlock) in cases)
+    {
+        var violation = safety.Check(hard, module, function, args);
+        var blocked = violation is not null;
+        if (blocked != shouldBlock)
+        {
+            failures++;
+            Console.Error.WriteLine(shouldBlock
+                ? $"  FAIL {label}: expected BLOCK, was allowed"
+                : $"  FAIL {label}: expected ALLOW, was blocked ({violation})");
+        }
+    }
+
+    Console.Out.WriteLine(failures == 0
+        ? $"gate 6 (safety rules, {cases.Length} cases): PASS"
+        : $"gate 6 FAIL: {failures}/{cases.Length} cases");
+    return failures == 0 ? 0 : 1;
+
+    static KernelArguments Items(params string[] items) => new() { ["items"] = items };
+}
+
+/// <summary>
+/// M1 GATE: two goals with DIFFERENT hard constraints, running concurrently,
+/// must each be checked against their own — and only their own.
+///
+/// <para>
+/// This is the regression test for a live safety bug: the armed policy was one
+/// field on a singleton filter, so goal B's dispatch overwrote goal A's
+/// constraints mid-plan and the gate then enforced the wrong family's allergens.
+/// The two goals here interleave deliberately (awaits inside both scopes, a
+/// barrier between arming and checking) so that a shared field cannot pass:
+/// whichever armed last would win both assertions.
+/// </para>
+///
+/// <para>Deterministic and offline — it drives <c>SafetyFilter.CheckCurrent</c>,
+/// the same scope lookup the kernel pipeline uses, with no LLM involved.</para>
+/// </summary>
+public static async Task<int> VerifyPolicyIsolationAsync(SafetyFilter safety)
+{
+    // Goal A cannot have peanuts; goal B cannot have dairy (which the policy
+    // expands to milk/yogurt/paneer/cheese).
+    var goalA = new JsonObject { ["allergens"] = new JsonArray("peanuts") };
+    var goalB = new JsonObject { ["allergens"] = new JsonArray(), ["dietary"] = new JsonArray("dairy") };
+
+    var armed = new TaskCompletionSource();
+    var failures = new List<string>();
+
+    async Task RunGoal(string goalId, JsonObject hard, string mustBlock, string mustAllow)
+    {
+        using var scope = safety.BeginGoal(goalId, hard);
+
+        // Both goals are now armed before either checks — a shared field would
+        // hold only the second one's constraints from here on.
+        if (goalId == "goal-a") { armed.SetResult(); }
+        await armed.Task;
+        await Task.Yield();
+
+        var blocked = safety.CheckCurrent("ShoppingList", "Add", new KernelArguments { ["items"] = new[] { mustBlock } });
+        if (blocked is null)
+        {
+            failures.Add($"{goalId}: '{mustBlock}' should have been BLOCKED by its own constraints, but passed");
+        }
+
+        var allowed = safety.CheckCurrent("ShoppingList", "Add", new KernelArguments { ["items"] = new[] { mustAllow } });
+        if (allowed is not null)
+        {
+            failures.Add($"{goalId}: '{mustAllow}' should have been ALLOWED ({goalId} has no such constraint), but was blocked: {allowed}");
+        }
+    }
+
+    // NB: terms are matched as literal substrings, so the probes use terms the
+    // current checker actually recognises ("peanuts", not "peanut butter").
+    // This gate is about ISOLATION between goals, not about match quality.
+    await Task.WhenAll(
+        Task.Run(() => RunGoal("goal-a", goalA, mustBlock: "peanuts", mustAllow: "milk")),
+        Task.Run(() => RunGoal("goal-b", goalB, mustBlock: "milk", mustAllow: "peanuts")));
+
+    // Each goal's verdict must be its own, after the fact too.
+    if (safety.GateFor("goal-a") != SafetyGates.Passed) failures.Add("goal-a gate should be 'passed' (CheckCurrent records nothing)");
+    if (safety.GateFor("unknown-goal") != SafetyGates.Passed) failures.Add("an unknown goal should report a clean gate, not throw");
+
+    foreach (var failure in failures)
+    {
+        Console.Error.WriteLine($"  FAIL {failure}");
+    }
+
+    Console.Out.WriteLine(failures.Count == 0
+        ? "gate 5 (per-goal policy isolation): PASS"
+        : $"gate 5 FAIL: {failures.Count} assertion(s) — two goals are seeing each other's safety policy");
+    return failures.Count == 0 ? 0 : 1;
+}
+
 /// <summary>
 /// Ensure a mock-world dir has its seed JSONs. Running a SECOND agent with its own
 /// <c>--data ./data-b</c> (so two instances don't clobber each other's world) would

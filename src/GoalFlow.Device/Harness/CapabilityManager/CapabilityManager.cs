@@ -26,14 +26,60 @@ namespace GoalFlow.Device.Harness;
 public sealed class CapabilityManager
 {
     private readonly Dictionary<string, CapabilityDescriptor> _byName;
+    private readonly SafetyPolicy _policy;
 
     /// <summary>The registered capabilities, IN THE PRODUCT PACK'S ORDER (significant — see the descriptor).</summary>
     public IReadOnlyList<CapabilityDescriptor> Descriptors { get; }
 
-    public CapabilityManager(IReadOnlyList<CapabilityDescriptor> descriptors)
+    public CapabilityManager(IReadOnlyList<CapabilityDescriptor> descriptors, SafetyPolicy policy)
     {
         Descriptors = descriptors;
+        _policy = policy;
         _byName = descriptors.ToDictionary(d => d.Name, StringComparer.Ordinal);
+
+        // Fail at STARTUP, not at the moment a prohibited action is proposed.
+        // Every override is resolved here so a policy typo cannot lie dormant
+        // until the one run where it matters.
+        foreach (var descriptor in descriptors)
+        {
+            foreach (var method in descriptor.Instance.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
+            {
+                _ = GradeOf(descriptor.Name, method.Name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The automation grade of a function: what the code intrinsically declares
+    /// via <see cref="SideEffectAttribute"/>, possibly made STRICTER by the
+    /// product's policy. Null for read-only functions — they are not actions.
+    /// Throws if policy tries to weaken it (the ratchet; see SafetyPolicy.GradeFor).
+    /// </summary>
+    public AutomationGrade? GradeOf(string module, string function)
+        => _policy.GradeFor(module, function, Grades.FromTier(GetSideEffectTier(module, function)));
+
+    /// <summary>
+    /// Actions the planner may legitimately propose: side-effecting, available,
+    /// and NOT prohibited.
+    ///
+    /// <para>
+    /// This is the first of AX's two enforcement points. A prohibited capability
+    /// is never offered as a proposal target, and the filter also blocks it
+    /// unconditionally at invocation — belt and braces, because the two answer
+    /// different questions ("should the model be told it may do this?" vs "is it
+    /// about to actually happen?") and only the second one is load-bearing if the
+    /// model improvises.
+    /// </para>
+    /// </summary>
+    public bool IsProposable(string module, string function)
+    {
+        if (!_byName.TryGetValue(module, out var descriptor) || !descriptor.Available)
+        {
+            return false;
+        }
+
+        var grade = GradeOf(module, function);
+        return grade is not null && grade != AutomationGrade.AX;
     }
 
     /// <summary>
