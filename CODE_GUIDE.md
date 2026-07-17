@@ -65,7 +65,7 @@ src/GoalFlow.Device/
       ReminderPlugin.cs GuestsPlugin.cs ApplianceControlPlugin.cs
       FamilyProfilesPlugin.cs BudgetPlugin.cs NotifyPlugin.cs   # ← the 3 [Unavailable] stubs
   Transport/WsClient.cs              # one outbound BCL ClientWebSocket to the cloud hub
-verify/m0/ … verify/m3/            # the gates — run the LATEST milestone's check.sh before every commit
+verify/m0/ … verify/m5/            # the gates — run the LATEST milestone's check.sh before every commit
 ```
 
 **The split is the point.** `Harness/` is domain- and product-agnostic; `Products/`

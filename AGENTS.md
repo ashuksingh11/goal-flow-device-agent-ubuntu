@@ -120,7 +120,8 @@ wired separately in each host.
     harness/plugins may touch of the world. A real Tizen/SmartThings port implements
     THIS and changes nothing else.
   - `Approval/` `Grounding/` `Clock/` (`IClock`/`SystemClock`/`SimulatedClock` — NEVER
-    call wall-clock, read the clock) `Trace/`.
+    call wall-clock, read the clock) `Trace/` (scopes are PER GOAL on an AsyncLocal —
+    a shared seq counter silently stole one goal's frames for another, v3-M5).
   - `PrecheckEngine/` — IS THE WORLD READY? (v3-M3). The third gate, and it asks a
     different question from the other two: safety says "never", approval says
     "waiting on a person", a precheck says "not YET" — something is unplugged and
