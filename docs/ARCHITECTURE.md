@@ -74,7 +74,7 @@ sequenceDiagram
     WsClient->>GoalAgent: RunAsync(dispatch)
     GoalAgent->>Trace: phase: grounding
     Trace-->>Cloud: agent_event (streamed)
-    Note over GoalAgent: Grounding assembles world context;<br/>SafetyFilter.SetPolicy(constraints.hard)
+    Note over GoalAgent: Grounding assembles world context;<br/>SafetyFilter.BeginGoal(goal_id, constraints.hard)
     GoalAgent->>Trace: phase: planning
     GoalAgent->>LLM: chat + tool schemas (FunctionChoiceBehavior.Auto)
     loop auto function-calling

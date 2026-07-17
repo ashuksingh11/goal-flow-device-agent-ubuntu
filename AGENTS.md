@@ -97,9 +97,17 @@ wired separately in each host.
     builds the `capabilities` message; **derives the planner's tool set** (there is no
     hand-written whitelist, and no name→Type switch: reflection reads the live
     registered instance).
-  - `SafetyPolicyEngine/SafetyFilter.cs` — an `IFunctionInvocationFilter`,
-    deterministic, enforces `constraints.hard` only — the safety gate, SEPARATE from
-    the planner. *(Still hardcodes module names → `PRODUCT-DEBT(M1)`.)*
+  - `SafetyPolicyEngine/` — the safety gate, SEPARATE from the planner.
+    `SafetyFilter` is still the `IFunctionInvocationFilter` seam (every tool call
+    passes through it), but since v3-M1: the policy is **per goal**
+    (`BeginGoal`/`EnterGoal` + an `AsyncLocal`; a singleton field made the gate
+    unsound with two goals — see the M1 commits), the checks are **declarative**
+    (`Products/FamilyHub/config/policy.json` binds harness rule KINDS to this
+    product's calls), grades are **A0/A1/A2/AX** with a **ratchet** (config may
+    only tighten; weakening is fatal at startup), and term matching is
+    token/stem-based (`allergens:["peanuts"]` blocks "peanut butter" — v2's
+    substring check did not — while still allowing coconut under a nut allergy).
+    `constraints.hard` remains its only input.
   - `TaskManager/` — `MonitorAdapt` + `MaterialityPolicy` (sustain tick → monitoring
     status, material change → proactive adaptation). *(Still switches on
     `meal_plan`/`guest_dinner` → `PRODUCT-DEBT(M2)`.)*

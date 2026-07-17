@@ -113,7 +113,7 @@ public sealed class GoalAgent
 
     /// <summary>
     /// Runs one dispatch to a plan, STREAMING agent_events throughout:
-    ///   phase(grounding)  → Grounding.AssembleAsync; SafetyFilter.SetPolicy(constraints.hard)
+    ///   phase(grounding)  → Grounding.AssembleAsync; SafetyFilter.BeginGoal(goal, constraints.hard)
     ///   phase(planning)   → compose the final JSON plan without tools;
     ///                       thinking/tool_call/tool_result/plan_progress events still flow
     ///   phase(checking)   → collect SafetyFilter verdict + freeze side-effects into

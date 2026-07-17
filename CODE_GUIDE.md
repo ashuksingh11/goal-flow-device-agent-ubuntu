@@ -33,7 +33,11 @@ src/GoalFlow.Device/
       SideEffectAttribute.cs         #     a function's intrinsic risk, declared where it lives
       UnavailableAttribute.cs        #     "declared but not built" → withheld from the planner
     SafetyPolicyEngine/
-      SafetyFilter.cs                # [2] SK IFunctionInvocationFilter — the safety gate
+      SafetyFilter.cs                # [2] SK IFunctionInvocationFilter — the safety gate; policy is PER GOAL
+      SafetyPolicy.cs                #     loads policy.json; the grade ratchet (config may only tighten)
+      SafetyRule.cs                  #     the rule KINDS (blocked_terms, numeric_cap, time_window_block, …)
+      TermMatcher.cs                 #     token/stem matching: "peanuts" blocks "peanut butter", not "coconut"
+      AutomationGrade.cs             #     A0/A1/A2/AX + the v2 tier mapping
     TaskManager/
       MonitorAdapt.cs                # [4] sustain loop: WorldChange + MaterialityPolicy + adaptations
     ProductApiAdapter/
@@ -46,12 +50,13 @@ src/GoalFlow.Device/
   Products/FamilyHub/                # THE PRODUCT PACK — everything fridge-specific
     FamilyHubProduct.cs              # the manifest: THE single declaration of the plugin catalog
     Adapter/MockFamilyHubAdapter.cs  # the mock world; resolves day offsets against IClock at read time
+    config/policy.json               # THIS product's safety rules: which kinds bind to which calls
     Plugins/                         # SK plugins — the LLM's tools
       InventoryPlugin.cs CalendarPlugin.cs RecipePlugin.cs ShoppingListPlugin.cs
       ReminderPlugin.cs GuestsPlugin.cs ApplianceControlPlugin.cs
       FamilyProfilesPlugin.cs BudgetPlugin.cs NotifyPlugin.cs   # ← the 3 [Unavailable] stubs
   Transport/WsClient.cs              # one outbound BCL ClientWebSocket to the cloud hub
-verify/m0/check.sh                   # the M0 gate — run it before every commit in this milestone
+verify/m0/ verify/m1/               # the gates — run the LATEST milestone's check.sh before every commit
 ```
 
 **The split is the point.** `Harness/` is domain- and product-agnostic; `Products/`
@@ -91,14 +96,15 @@ die on a missing `calendar.json`); in `--connect` mode,
 One dispatch becomes one `plan_ready`, with `agent_event` frames streamed the
 whole way (via `Trace`; over the WebSocket when connected, stderr otherwise):
 
-1. **`phase: grounding`** — `SafetyFilter.SetPolicy(constraints.hard)` arms
+1. **`phase: grounding`** — `SafetyFilter.BeginGoal(goal_id, constraints.hard)` arms
    the gate; `Grounding.AssembleAsync` resolves *today* and the contract's
    time window against the generic clock and renders the system prompt
    (hard constraints **verbatim** — the model sees the same truth the filter
    enforces). Then a **streaming** chat call runs with
-   `FunctionChoiceBehavior.Auto` scoped to a **read-only** function subset
-   (`ReadOnlyPlanningFunctions`: Inventory/Calendar/Recipes/ShoppingList/
-   Reminders/Guests/Appliance reads). The LLM grounds itself by *calling*
+   `FunctionChoiceBehavior.Auto` scoped to the **read-only** function subset
+   DERIVED by `CapabilityManager.GetGroundingFunctions` (every non-side-effecting
+   function of every available plugin, in the pack's order — no hand-written
+   whitelist; `verify/m0` gate 2 pins the result). The LLM grounds itself by *calling*
    those `[KernelFunction]`s; every call passes through the `SafetyFilter`,
    which also emits the `tool_call`/`tool_result` events. Model text streams
    as `thinking` events.
@@ -138,15 +144,28 @@ different classes:
 - The **`SafetyFilter`** (`Harness/SafetyPolicyEngine/SafetyFilter.cs`) is an SK
   `IFunctionInvocationFilter` sitting in the kernel's invocation pipeline, so
   *every* function call — grounding reads and approved actuations alike —
-  passes through `OnFunctionInvocationAsync` first. It checks the pending
-  call against `constraints.hard` (its ONLY input): allergen/dietary/medical
-  ingredient screens (with group expansion, e.g. dairy → milk/paneer/cheese),
-  `budget_cap` on `ShoppingList.PlaceOrder`, `quiet_hours` on scheduled
-  Appliance/Notify actions; it also screens `Recipes` *results* so blocked
-  ingredients never reach the model as candidates. On violation it does not
+  passes through `OnFunctionInvocationAsync` first. On violation it does not
   call `next` — the plugin never runs, `context.Result` becomes a structured
   refusal (so the model sees why and re-plans), and the violation lands in
   the `plan_ready` safety verdict.
+  - **The policy is PER GOAL** (`BeginGoal` on the plan path, `EnterGoal` on the
+    approval/control paths; the ambient goal rides an `AsyncLocal`). It was one
+    field on a singleton until v3-M1, which made the gate unsound as soon as two
+    goals overlapped — and Program has always dispatched frames concurrently.
+    A call outside any scope enforces nothing and says so loudly
+    (`safety_unscoped`); it no longer inherits a stranger's policy.
+  - **The checks are declarative** (`Products/FamilyHub/config/policy.json`). The
+    harness implements rule KINDS — `blocked_terms`, `numeric_cap`,
+    `time_window_block`, `result_screen` — and the product pack says which of its
+    calls each applies to, plus its ingredient vocabulary (dairy → milk/paneer/…).
+    Before v3 this was a chain of hardcoded `module == "ShoppingList"` comparisons
+    inside the filter.
+  - **Term matching is token/stem-based** (`TermMatcher.cs`), so `allergens:
+    ["peanuts"]` blocks "peanut butter" — v2's substring check did not — while
+    still allowing coconut, butternut squash and nutmeg under a "nuts" allergy.
+    Over-blocking is a real failure mode, not a safe default: an agent that
+    vetoes coconut gets switched off.
+  - **`constraints.hard` remains its ONLY input.** Soft preferences never gate.
 - The **approval gate** is the user: `[SideEffect]`-tagged functions surface
   as tiered proposals (`auto` = cheap/reversible, `light` = batched into the
   plan approval, `firm` = spends money / irreversible — never executes before
