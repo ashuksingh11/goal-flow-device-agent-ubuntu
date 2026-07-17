@@ -33,17 +33,22 @@ if ! diff -u verify/m0/capabilities.golden.json <(head -1 /tmp/m0-dump.txt); the
 fi
 echo "gate 1 (capabilities frame): PASS"
 
-# GATE 2 — the grounding tool set is byte-identical, SAME ORDER, exactly 13.
+# GATE 2 — the grounding tool set is byte-identical, SAME ORDER, exactly 18.
 # Order matters: this list IS the tools array handed to the model.
-# 13 = the read functions of the 7 IMPLEMENTED plugins. A naive "all
-# non-side-effecting functions" rule yields 17 — FamilyProfiles and Budget are
-# reads too, they just throw — so [Unavailable] stub exclusion is load-bearing.
+# Was 13 through M6 (the read functions of the 7 implemented plugins). M7 grew it:
+#   +4  implemented the FamilyProfiles and Budget stubs (GetProfiles, GetMember,
+#       GetBudgetStatus, EstimateCost — reads that used to throw)
+#   +1  the new Security plugin's GetSecurityStatus read
+# so 13 -> 18. Notify was also implemented but its functions are side-effecting, so
+# they are proposable actions, not grounding tools. The stub-exclusion mechanism is
+# still load-bearing for anything that stays [Unavailable]; this golden IS the
+# reviewable record of the catalog change.
 if ! diff -u verify/m0/grounding.golden.txt <(tail -n +2 /tmp/m0-dump.txt); then
   echo "gate 2 FAIL: the planner's tool set changed (content or ORDER)." >&2
   exit 1
 fi
-test "$(wc -l < verify/m0/grounding.golden.txt)" -eq 13
-echo "gate 2 (grounding set, 13 fns in order): PASS"
+test "$(wc -l < verify/m0/grounding.golden.txt)" -eq 18
+echo "gate 2 (grounding set, 18 fns in order): PASS"
 
 # GATE 3 — product-string debt inside Harness/ can only shrink.
 # The "Harness/ has zero product strings" invariant is FALSE on day one by

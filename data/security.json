@@ -1,0 +1,22 @@
+{
+  "comment": [
+    "HOME SECURITY STATE — doors, cameras, alarm. SmartThings/SmartThings-Security",
+    "stand-in, read and mutated by the Security plugin through IProductApiAdapter.",
+    "State, not schedule: no dates, so the day-offset rule doesn't apply.",
+    "Seeded in the normal at-home posture (unlocked, disarmed); the vacation-prep",
+    "goal is what locks up and arms it."
+  ],
+  "doors": [
+    { "id": "front", "name": "front door", "locked": false },
+    { "id": "back", "name": "back door", "locked": false },
+    { "id": "garage", "name": "garage door", "locked": false }
+  ],
+  "cameras": [
+    { "id": "cam-front", "location": "front porch", "armed": false },
+    { "id": "cam-back", "location": "back yard", "armed": false }
+  ],
+  "alarm": {
+    "armed": false,
+    "mode": "home"
+  }
+}

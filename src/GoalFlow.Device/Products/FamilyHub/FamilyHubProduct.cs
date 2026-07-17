@@ -70,6 +70,7 @@ public static class FamilyHubProduct
         services.AddSingleton<FamilyProfilesPlugin>();
         services.AddSingleton<BudgetPlugin>();
         services.AddSingleton<NotifyPlugin>();
+        services.AddSingleton<SecurityPlugin>();
 
         services.AddSingleton(sp => new CapabilityManager(
             CreateDescriptors(sp),
@@ -82,6 +83,8 @@ public static class FamilyHubProduct
         // judgement is product knowledge and lives here.
         services.AddSingleton<IDomainObserver, MealPlanObserver>();
         services.AddSingleton<IDomainObserver, GuestDinnerObserver>();
+        services.AddSingleton<IDomainObserver, VacationPrepObserver>();
+        services.AddSingleton<IDomainObserver, BirthdayPartyObserver>();
 
         // Pre-checks: which of this product's runtime conditions matter, and how to
         // ask. Only the Family Hub knows it has an oven and a Samsung account.
@@ -122,5 +125,6 @@ public static class FamilyHubProduct
         CapabilityDescriptor.From("FamilyProfiles", sp.GetRequiredService<FamilyProfilesPlugin>()),
         CapabilityDescriptor.From("Budget",         sp.GetRequiredService<BudgetPlugin>()),
         CapabilityDescriptor.From("Notify",         sp.GetRequiredService<NotifyPlugin>()),
+        CapabilityDescriptor.From("Security",       sp.GetRequiredService<SecurityPlugin>()),
     ];
 }

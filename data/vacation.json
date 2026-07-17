@@ -1,0 +1,22 @@
+{
+  "comment": [
+    "VACATION-PREP domain slice: the away window plus changes that land while the",
+    "family is gone. Dates are day_offsets from IClock.Today (generic-clock rule).",
+    "pending_updates mirrors the guests.json shape: each carries an",
+    "activation_day_offset and surfaces when the simulated week reaches it.",
+    "Seeded with one believable material change — a delivery arriving to an empty",
+    "house — so vacation prep has an adaptation beat, not just a static plan."
+  ],
+  "away": {
+    "depart_day_offset": 1,
+    "return_day_offset": 8
+  },
+  "pending_updates": [
+    {
+      "id": "vac-upd-001",
+      "kind": "delivery.scheduled_while_away",
+      "activation_day_offset": 2,
+      "description": "A parcel delivery is scheduled while the house is empty"
+    }
+  ]
+}

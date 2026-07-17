@@ -11,3 +11,8 @@ Guests.GetEvent
 Guests.GetGuests
 Guests.GetDietaryConstraints
 Appliance.ListAppliances
+FamilyProfiles.GetProfiles
+FamilyProfiles.GetMember
+Budget.GetBudgetStatus
+Budget.EstimateCost
+Security.GetSecurityStatus

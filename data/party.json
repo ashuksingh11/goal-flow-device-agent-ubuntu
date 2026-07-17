@@ -1,0 +1,28 @@
+{
+  "comment": [
+    "BIRTHDAY-PARTY domain slice: the event plus RSVP changes that land after the",
+    "plan is made. Dates are day_offsets from IClock.Today (generic-clock rule).",
+    "pending_updates mirrors the guests.json shape. Seeded with one material change —",
+    "three more children RSVP — so the cake/supplies plan has an adaptation beat.",
+    "The party guest list is distinct from guests.json, which is the dinner-party set."
+  ],
+  "event": {
+    "id": "party-001",
+    "title": "Aarav's birthday party",
+    "child_name": "Aarav",
+    "turning_age": 10,
+    "day_offset": 3,
+    "start": "15:00",
+    "end": "18:00",
+    "headcount": 20
+  },
+  "pending_updates": [
+    {
+      "id": "party-upd-001",
+      "kind": "party.headcount_added",
+      "activation_day_offset": 1,
+      "delta": 3,
+      "description": "Three more children RSVP'd yes — headcount is now 23"
+    }
+  ]
+}
