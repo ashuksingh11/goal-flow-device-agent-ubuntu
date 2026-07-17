@@ -41,11 +41,6 @@ public sealed class ApprovalCoordinator
         return proposal;
     }
 
-    /// <summary>Classifies a function's tier from its <see cref="SideEffectAttribute"/> metadata.</summary>
-    public string TierOf(string module, string function)
-        => CapabilityRegistry.GetSideEffectTier(module, function)
-           ?? throw new InvalidOperationException($"{module}.{function} is not marked as side-effecting.");
-
     /// <summary>
     /// Applies an <c>approval</c> frame: each decision flips its proposal to
     /// Approved/Rejected. Returns the proposals now cleared for execution

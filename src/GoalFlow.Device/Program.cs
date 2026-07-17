@@ -52,28 +52,17 @@ services.AddSingleton<IClock>(_ => options.Date is { } start
     ? new SimulatedClock(DateOnly.Parse(start))
     : new SimulatedClock());
 
-// Mock world + capability plugins (meal domain + shared).
-// The world is bound behind IProductApiAdapter: the harness and the plugins only
-// ever see the seam, so a real Tizen/SmartThings adapter drops in right here.
-services.AddSingleton<IProductApiAdapter>(sp => new MockFamilyHubAdapter(options.DataDir, sp.GetRequiredService<IClock>()));
-services.AddSingleton<InventoryPlugin>();
-services.AddSingleton<CalendarPlugin>();
-services.AddSingleton<RecipePlugin>();
-services.AddSingleton<ShoppingListPlugin>();
-services.AddSingleton<ReminderPlugin>();
-services.AddSingleton<GuestsPlugin>();
-services.AddSingleton<ApplianceControlPlugin>();
-services.AddSingleton<FamilyProfilesPlugin>();
-services.AddSingleton<BudgetPlugin>();
-services.AddSingleton<NotifyPlugin>();
+// THE PRODUCT PACK: the mock world (behind IProductApiAdapter), the capability
+// plugins, and the CapabilityManager over them. This is the ONLY line here that
+// knows what product this is — swapping packs is the whole extension story.
+services.AddFamilyHub(options.DataDir);
 
-// Steering modules.
+// Harness components (generic — no product types).
 services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
 services.AddSingleton<MaterialityPolicy>();
 services.AddSingleton<MonitorAdapt>();
-services.AddSingleton<CapabilityRegistry>();
 
 await using var provider = services.BuildServiceProvider();
 
@@ -106,6 +95,7 @@ var agent = new GoalAgent(
     provider.GetRequiredService<SafetyFilter>(),
     provider.GetRequiredService<ApprovalCoordinator>(),
     provider.GetRequiredService<MonitorAdapt>(),
+    provider.GetRequiredService<CapabilityManager>(),
     provider.GetRequiredService<IClock>(),
     loggerFactory.CreateLogger<GoalAgent>());
 
@@ -118,7 +108,7 @@ var agent = new GoalAgent(
 // key: BuildKernel only configures the connector, it never calls out.
 if (options.DumpCapabilities)
 {
-    Console.Out.WriteLine(ContractJson.Serialize(provider.GetRequiredService<CapabilityRegistry>().BuildCapabilitiesMessage(kernel)));
+    Console.Out.WriteLine(ContractJson.Serialize(provider.GetRequiredService<CapabilityManager>().BuildCapabilitiesMessage(kernel)));
     foreach (var fn in agent.GroundingFunctions())
     {
         Console.Out.WriteLine($"{fn.PluginName}.{fn.Name}");
@@ -134,7 +124,7 @@ if (options.ConnectUrl is { } url)
     loggerFactory.CreateLogger("Connect").LogInformation("device_id={DeviceId} device_name={DeviceName}", deviceId, deviceName);
     await using var ws = new WsClient(new Uri(url), loggerFactory.CreateLogger<WsClient>(), deviceId, deviceName);
     liveWs = ws;
-    var capabilities = provider.GetRequiredService<CapabilityRegistry>().BuildCapabilitiesMessage(kernel);
+    var capabilities = provider.GetRequiredService<CapabilityManager>().BuildCapabilitiesMessage(kernel);
     var connectLogger = loggerFactory.CreateLogger("Connect");
     await ws.ConnectAsync(capabilities);
     // Handle each frame on a BACKGROUND task so the receive loop keeps pumping —

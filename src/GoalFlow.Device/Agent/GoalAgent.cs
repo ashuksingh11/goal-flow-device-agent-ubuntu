@@ -44,6 +44,7 @@ public sealed class GoalAgent
     private readonly SafetyFilter _safety;
     private readonly ApprovalCoordinator _approvals;
     private readonly MonitorAdapt _monitor;
+    private readonly CapabilityManager _capabilities;
     private readonly IClock _clock;
     private readonly ILogger<GoalAgent> _logger;
     private readonly Dictionary<string, ActiveGoalContext> _activeGoals = new(StringComparer.Ordinal);
@@ -64,6 +65,7 @@ public sealed class GoalAgent
         SafetyFilter safety,
         ApprovalCoordinator approvals,
         MonitorAdapt monitor,
+        CapabilityManager capabilities,
         IClock clock,
         ILogger<GoalAgent> logger)
     {
@@ -73,6 +75,7 @@ public sealed class GoalAgent
         _safety = safety;
         _approvals = approvals;
         _monitor = monitor;
+        _capabilities = capabilities;
         _clock = clock;
         _logger = logger;
     }
@@ -81,9 +84,9 @@ public sealed class GoalAgent
     /// Builds the device kernel:
     ///   1. OpenRouter chat completion (OpenAI-compatible connector; model
     ///      <see cref="AgentSettings.ModelId"/>, endpoint <see cref="AgentSettings.BaseUrl"/>).
-    ///   2. Capability plugins from DI, each under its advertised module name:
-    ///      Inventory, Calendar, Recipes, ShoppingList, Reminders, Guests, Appliance,
-    ///      FamilyProfiles, Budget, Notify.
+    ///   2. Capability plugins from the CapabilityManager's descriptors — i.e.
+    ///      whatever the product pack registered, in ITS order (which is the
+    ///      order the model sees its tools in). This method names no plugin type.
     ///   3. The <see cref="SafetyFilter"/> as an <see cref="IFunctionInvocationFilter"/>
     ///      service — every auto-invoked function passes through it.
     /// </summary>
@@ -100,16 +103,10 @@ public sealed class GoalAgent
         builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<SafetyFilter>());
         builder.Services.AddSingleton(services.GetRequiredService<IProductApiAdapter>());
 
-        builder.Plugins.AddFromObject(services.GetRequiredService<InventoryPlugin>(), "Inventory");
-        builder.Plugins.AddFromObject(services.GetRequiredService<CalendarPlugin>(), "Calendar");
-        builder.Plugins.AddFromObject(services.GetRequiredService<RecipePlugin>(), "Recipes");
-        builder.Plugins.AddFromObject(services.GetRequiredService<ShoppingListPlugin>(), "ShoppingList");
-        builder.Plugins.AddFromObject(services.GetRequiredService<ReminderPlugin>(), "Reminders");
-        builder.Plugins.AddFromObject(services.GetRequiredService<GuestsPlugin>(), "Guests");
-        builder.Plugins.AddFromObject(services.GetRequiredService<ApplianceControlPlugin>(), "Appliance");
-        builder.Plugins.AddFromObject(services.GetRequiredService<FamilyProfilesPlugin>(), "FamilyProfiles");
-        builder.Plugins.AddFromObject(services.GetRequiredService<BudgetPlugin>(), "Budget");
-        builder.Plugins.AddFromObject(services.GetRequiredService<NotifyPlugin>(), "Notify");
+        foreach (var capability in services.GetRequiredService<CapabilityManager>().Descriptors)
+        {
+            builder.Plugins.AddFromObject(capability.Instance, capability.Name);
+        }
 
         return builder.Build();
     }
@@ -1003,7 +1000,7 @@ public sealed class GoalAgent
 
     private ProposalItem NormalizeProposal(ProposalItem proposal)
     {
-        var tier = CapabilityRegistry.GetSideEffectTier(proposal.Module, proposal.Function) ?? proposal.Tier;
+        var tier = _capabilities.GetSideEffectTier(proposal.Module, proposal.Function) ?? proposal.Tier;
         return proposal with
         {
             Tier = tier,
