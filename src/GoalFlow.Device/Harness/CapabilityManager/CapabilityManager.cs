@@ -89,6 +89,52 @@ public sealed class CapabilityManager
     public bool IsSideEffecting(string module, string function)
         => GetSideEffectTier(module, function) is not null;
 
+    /// <summary>
+    /// THE PLANNER'S TOOL SET: every non-side-effecting function of every
+    /// AVAILABLE capability, in the product pack's registration order. Replaces
+    /// a hand-written 13-entry whitelist that had to be edited by hand whenever
+    /// a plugin gained a read function — a fourth copy of the plugin catalog,
+    /// and the one most likely to rot silently.
+    ///
+    /// <para>
+    /// Two subtleties, both load-bearing (the M0 gate diffs this list against
+    /// what the whitelist produced, byte for byte):
+    /// </para>
+    /// <para>
+    /// 1. AVAILABILITY, not just side-effect-freedom. The stub plugins' reads
+    ///    (FamilyProfiles, Budget) are indistinguishable from real ones by
+    ///    reflection, so "every read" would hand the model 17 tools — 4 of which
+    ///    throw. See <see cref="UnavailableAttribute"/>.
+    /// </para>
+    /// <para>
+    /// 2. ORDER. This is the tools array the model receives, so the order is
+    ///    part of the prompt. It comes from the pack's descriptor order, then
+    ///    each plugin's own metadata order — deliberately NOT sorted, because
+    ///    the capabilities advertisement sorts alphabetically and this does not.
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<KernelFunction> GetGroundingFunctions(Kernel kernel)
+    {
+        var functions = new List<KernelFunction>();
+        foreach (var capability in Descriptors)
+        {
+            if (!capability.Available || !kernel.Plugins.TryGetPlugin(capability.Name, out var plugin) || plugin is null)
+            {
+                continue;
+            }
+
+            foreach (var metadata in plugin.GetFunctionsMetadata())
+            {
+                if (GetSideEffectTier(capability.Name, metadata.Name) is null)
+                {
+                    functions.Add(plugin[metadata.Name]);
+                }
+            }
+        }
+
+        return functions;
+    }
+
     /// <summary>The registered instance's type, or null for an unknown module.</summary>
     private Type? PluginType(string module)
         => _byName.TryGetValue(module, out var descriptor) ? descriptor.Instance.GetType() : null;

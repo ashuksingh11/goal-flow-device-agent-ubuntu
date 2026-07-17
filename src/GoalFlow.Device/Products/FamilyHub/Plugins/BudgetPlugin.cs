@@ -11,6 +11,7 @@ namespace GoalFlow.Device.Products.FamilyHub;
 /// SafetyFilter's job at PlaceOrder time ("LLM plans, code checks").
 /// </summary>
 [Description("Grocery budget status and cost estimation.")]
+[Unavailable("v2-M0 skeleton — every method throws NotImplementedException")]
 public sealed class BudgetPlugin
 {
     private readonly IProductApiAdapter _store;

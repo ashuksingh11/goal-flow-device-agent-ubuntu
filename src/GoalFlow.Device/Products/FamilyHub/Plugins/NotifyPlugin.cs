@@ -12,6 +12,7 @@ namespace GoalFlow.Device.Products.FamilyHub;
 /// against quiet_hours in constraints.hard.
 /// </summary>
 [Description("Sends notifications to family members or announces on the Hub.")]
+[Unavailable("v2-M0 skeleton — every method throws NotImplementedException")]
 public sealed class NotifyPlugin
 {
     private readonly IClock _clock;

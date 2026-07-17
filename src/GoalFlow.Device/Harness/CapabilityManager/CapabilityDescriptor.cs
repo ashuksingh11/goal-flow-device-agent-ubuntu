@@ -1,3 +1,5 @@
+using System.Reflection;
+
 namespace GoalFlow.Device.Harness;
 
 /// <summary>
@@ -27,6 +29,25 @@ public sealed record CapabilityDescriptor
     /// <summary>The live plugin instance; the only thing reflection reads.</summary>
     public required object Instance { get; init; }
 
+    /// <summary>
+    /// False for a declared-but-unimplemented extension point (see
+    /// <see cref="UnavailableAttribute"/>). Still advertised; never offered to
+    /// the planner.
+    /// </summary>
+    public required bool Available { get; init; }
+
+    /// <summary>Why it is unavailable, or null when it is available.</summary>
+    public string? UnavailableReason { get; init; }
+
     public static CapabilityDescriptor From(string name, object instance)
-        => new() { Name = name, Instance = instance };
+    {
+        var unavailable = instance.GetType().GetCustomAttribute<UnavailableAttribute>();
+        return new()
+        {
+            Name = name,
+            Instance = instance,
+            Available = unavailable is null,
+            UnavailableReason = unavailable?.Reason
+        };
+    }
 }

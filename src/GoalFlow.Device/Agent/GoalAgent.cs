@@ -237,7 +237,7 @@ public sealed class GoalAgent
 
         var groundingSettings = new OpenAIPromptExecutionSettings
         {
-            FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(ReadOnlyPlanningFunctions(), autoInvoke: true, options: new FunctionChoiceBehaviorOptions
+            FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(GroundingFunctions(), autoInvoke: true, options: new FunctionChoiceBehaviorOptions
             {
                 AllowConcurrentInvocation = false,
                 AllowParallelCalls = false
@@ -970,33 +970,14 @@ public sealed class GoalAgent
         };
 
     /// <summary>
-    /// The planner's grounding tool set, for the M0 verification gate
-    /// (<c>--dump-capabilities</c>). Both the CONTENT and the ORDER are what the
-    /// LLM receives as its tools array, so the v3 restructure must reproduce
-    /// both exactly — set equality alone would not prove zero behavior change.
+    /// The planner's grounding tool set — DERIVED by the Capability Manager from
+    /// what the product pack registered, not hand-listed here. Both the CONTENT
+    /// and the ORDER are what the LLM receives as its tools array; the M0 gate
+    /// (<c>--dump-capabilities</c>) diffs both against what the old hand-written
+    /// whitelist produced.
     /// </summary>
-    internal IReadOnlyList<KernelFunction> GroundingFunctions() => ReadOnlyPlanningFunctions();
-
-    private IReadOnlyList<KernelFunction> ReadOnlyPlanningFunctions()
-    {
-        var names = new (string Module, string Function)[]
-        {
-            ("Inventory", "ListItems"),
-            ("Inventory", "GetExpiringItems"),
-            ("Inventory", "CheckAvailability"),
-            ("Calendar", "GetEvents"),
-            ("Calendar", "GetBusyEvenings"),
-            ("Recipes", "FindRecipes"),
-            ("Recipes", "GetRecipe"),
-            ("ShoppingList", "GetList"),
-            ("Reminders", "List"),
-            ("Guests", "GetEvent"),
-            ("Guests", "GetGuests"),
-            ("Guests", "GetDietaryConstraints"),
-            ("Appliance", "ListAppliances")
-        };
-        return names.Select(n => _kernel.Plugins.GetFunction(n.Module, n.Function)).ToArray();
-    }
+    internal IReadOnlyList<KernelFunction> GroundingFunctions()
+        => _capabilities.GetGroundingFunctions(_kernel);
 
     private ProposalItem NormalizeProposal(ProposalItem proposal)
     {

@@ -13,6 +13,7 @@ namespace GoalFlow.Device.Products.FamilyHub;
 /// never the safety source of truth.
 /// </summary>
 [Description("Family member profiles: diets, allergies, dislikes, ages.")]
+[Unavailable("v2-M0 skeleton — every method throws NotImplementedException")]
 public sealed class FamilyProfilesPlugin
 {
     private readonly IProductApiAdapter _store;
