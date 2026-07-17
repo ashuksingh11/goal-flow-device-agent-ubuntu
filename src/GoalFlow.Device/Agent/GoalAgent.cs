@@ -160,6 +160,74 @@ public sealed class GoalAgent
         => [new TaskRecord { TaskId = SingleTaskId, GoalId = dispatch.GoalId, Title = dispatch.Objective }];
 
     /// <summary>
+    /// Moves every task currently in <paramref name="from"/> to <paramref name="to"/>.
+    ///
+    /// <para>
+    /// The compose plans the whole goal at once, so its tasks move as a cohort
+    /// rather than one at a time. Filtering on the CURRENT state matters: a task
+    /// that already failed or was cancelled must not be dragged forward, and the
+    /// ledger would refuse the illegal move anyway — this just doesn't ask.
+    /// </para>
+    /// </summary>
+    private async Task AdvanceTasksAsync(string goalId, TaskState from, TaskState to)
+    {
+        var goal = _tasks.GetGoal(goalId);
+        if (goal is null)
+        {
+            return;
+        }
+
+        foreach (var task in goal.Tasks.Where(t => t.State == from).ToArray())
+        {
+            await _tasks.TransitionAsync(goalId, task.TaskId, to);
+        }
+    }
+
+    /// <summary>
+    /// Completes a goal's monitoring tasks once its time window has closed.
+    ///
+    /// <para>
+    /// Without this a goal monitors forever: the board would show a finished meal
+    /// week stuck at "in progress" all year. The end condition is the contract's
+    /// own <c>time_window.end</c> read against the GENERIC clock — not a guess, and
+    /// not the agent deciding for itself that it is finished.
+    /// </para>
+    ///
+    /// <para>Returns true when this call is what completed it.</para>
+    /// </summary>
+    private async Task<bool> CompleteIfWindowPassedAsync(GoalRecord goal, CancellationToken ct)
+    {
+        if (!DateOnly.TryParse(goal.Dispatch.TimeWindow.End, out var end) || _clock.Today <= end)
+        {
+            return false;
+        }
+
+        var monitoring = goal.Tasks.Where(t => t.State == TaskState.Monitoring).ToArray();
+        if (monitoring.Length == 0)
+        {
+            return false;
+        }
+
+        foreach (var task in monitoring)
+        {
+            await _tasks.TransitionAsync(goal.Dispatch.GoalId, task.TaskId, TaskState.Completed);
+        }
+
+        _logger.LogInformation("goal_complete {GoalId} window_end={End} progress={Progress}%",
+            goal.Dispatch.GoalId, goal.Dispatch.TimeWindow.End, goal.ProgressPercent);
+        return true;
+    }
+
+    /// <summary>
+    /// The one-line progress summary — what Agent Board will render as a
+    /// percentage and a next step. Derived from the ledger, never from the clock.
+    /// </summary>
+    private static string ProgressNote(GoalRecord? goal)
+        => goal is null || goal.Tasks.Count <= 1
+            ? ""
+            : $" Goal {goal.ProgressPercent}% ({goal.WorkDone}/{goal.Tasks.Count} steps done).";
+
+    /// <summary>
     /// ALTITUDE ONE of the planner: what are the pieces of this goal?
     ///
     /// <para>
@@ -868,6 +936,9 @@ public sealed class GoalAgent
         using var policy = _safety.EnterGoal(approval.GoalId);
         _safety.SetTrace(_trace);
         await _trace.PhaseAsync("executing");
+        // The human answered, so every task waiting on that answer moves. This is
+        // where a goal stops being 0% — progress is the ledger, not the clock.
+        await AdvanceTasksAsync(approval.GoalId, TaskState.AwaitingApproval, TaskState.Executing);
         var cleared = _approvals.ApplyDecisions(approval);
         var executed = new List<ExecutedEffect>();
         IReadOnlyList<PlanItem>? updatedPlan = null;
@@ -906,6 +977,12 @@ public sealed class GoalAgent
             });
         }
 
+        // Effects are done; the plan now lives in the world and the observers watch
+        // it. Monitoring is not "finished" — a meal week is only complete when its
+        // last day has passed — so tasks rest here, not at Completed.
+        await AdvanceTasksAsync(approval.GoalId, TaskState.Executing, TaskState.Monitoring);
+        var progress = _tasks.GetGoal(approval.GoalId);
+
         return new Status
         {
             GoalId = approval.GoalId,
@@ -918,7 +995,9 @@ public sealed class GoalAgent
                 UpdatedPlan = updatedPlan,
                 ChangedIds = changedIds,
                 ImpactDelta = impactDelta,
-                Note = executed.Count == 0 ? "No new proposals executed; approval may be a replay or rejection." : $"Executed {executed.Count} proposal(s)."
+                Note = executed.Count == 0
+                    ? "No new proposals executed; approval may be a replay or rejection."
+                    : $"Executed {executed.Count} proposal(s).{ProgressNote(progress)}"
             }
         };
     }
@@ -1055,6 +1134,22 @@ public sealed class GoalAgent
             };
             await _trace.ThinkingAsync(noGoalStatus.Payload.Note);
             return (noGoalStatus, null);
+        }
+
+        // A monitored goal has to be able to FINISH, or the board shows it working
+        // forever. It is done when the world moves past what it planned for: the
+        // time window closes. Derived from the clock against the contract — the
+        // agent doesn't decide it's finished, the calendar does.
+        if (await CompleteIfWindowPassedAsync(active, ct))
+        {
+            var doneStatus = BuildMonitoringStatus(
+                control.GoalId,
+                active.Dispatch.CorrelationId,
+                false,
+                $"goal complete — its time window closed on {active.Dispatch.TimeWindow.End}.{ProgressNote(active)}",
+                null);
+            await _trace.ThinkingAsync(doneStatus.Payload.Note ?? "");
+            return (doneStatus with { TaskStatus = TaskStatuses.Done }, null);
         }
 
         var changes = await _monitor.ObserveAsync(active, ct);

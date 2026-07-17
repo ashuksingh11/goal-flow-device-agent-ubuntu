@@ -181,13 +181,40 @@ public sealed class GoalRecord
     /// <summary>
     /// How far along, 0-100 — DERIVED from task state, not guessed from the clock.
     /// This is the number Agent Board shows, and the reason the Task Manager exists.
+    ///
+    /// <para>
+    /// Counts tasks whose WORK THE AGENT HAS DONE: Completed, and Monitoring (the
+    /// agent finished; the world is now playing out and the observers are watching).
+    /// A FAILED task is terminal but is NOT progress — a stuck goal must never drift
+    /// toward 100%.
+    /// </para>
+    ///
+    /// <para>
+    /// KNOWN SHAPE, worth understanding before reading a board: how gradually this
+    /// climbs depends on what a goal's tasks ARE. The meal week decomposes into
+    /// PLANNING steps ("find recipes", "build the shopping list") which all finish
+    /// at the same approval, so it steps 0 → 100 and then monitors for a week. A
+    /// goal whose tasks are multi-day WORK — order the cake, buy decorations, send
+    /// invites — climbs one task at a time, which is the shape Agent Board's mock
+    /// shows ("68%, next step: buy party decorations, 3 pending"). Same formula;
+    /// the meal week is just a goal that is planned once and then merely happens.
+    /// </para>
     /// </summary>
-    public int ProgressPercent => Tasks.Count == 0
-        ? 0
-        : (int)Math.Round(100.0 * Tasks.Count(t => t.State == TaskState.Completed) / Tasks.Count);
+    public int ProgressPercent => Tasks.Count == 0 ? 0 : (int)Math.Round(100.0 * WorkDone / Tasks.Count);
 
-    /// <summary>Tasks not yet finished — Agent Board's "pending".</summary>
-    public int PendingTasks => Tasks.Count(t => !t.IsTerminal);
+    /// <summary>
+    /// Tasks whose work the agent has done. ONE definition, used by everything that
+    /// reports progress — the percentage and the "n/m steps done" line must never
+    /// be able to disagree (they did, briefly: "100% (0/7 steps done)").
+    /// </summary>
+    public int WorkDone => Tasks.Count(t => t.State is TaskState.Completed or TaskState.Monitoring);
+
+    /// <summary>
+    /// Tasks still to do — Agent Board's "pending". The complement of
+    /// <see cref="WorkDone"/> among the non-terminal, so a monitoring task is not
+    /// pending (its work is done) and a failed one is not pending (it is over).
+    /// </summary>
+    public int PendingTasks => Tasks.Count(t => !t.IsTerminal && t.State != TaskState.Monitoring);
 
     /// <summary>True once every task reached a terminal state.</summary>
     public bool IsComplete => Tasks.Count > 0 && Tasks.All(t => t.IsTerminal);

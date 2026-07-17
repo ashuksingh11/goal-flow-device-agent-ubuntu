@@ -411,6 +411,14 @@ public static async Task<int> VerifyTaskLifecycleAsync(ILoggerFactory loggerFact
     Check(goal.Tasks.First(t => t.TaskId == "t3").RetryCount == 1, "Retrying increments the retry count");
     Check(tasks.NextReady(dispatch.GoalId)?.TaskId == "t3", "a retrying task is still the frontier");
 
+    // Monitoring counts as progress — the agent's work on that task is done and the
+    // world is playing out. (t3 is mid-flight here, so this only checks the rule.)
+    Check(goal.ProgressPercent == 50, $"2 of 4 done is 50%, got {goal.ProgressPercent}");
+
+    // The percentage and the "n/m" line must never be able to disagree.
+    Check(goal.WorkDone + goal.PendingTasks + goal.Tasks.Count(t => t.State is TaskState.Failed or TaskState.Cancelled) == goal.Tasks.Count,
+        "WorkDone + Pending + terminal-failures must account for every task");
+
     // A failure reason is kept; failure is terminal and does NOT count as progress.
     await tasks.TransitionAsync(dispatch.GoalId, "t3", TaskState.Failed, "the oven never came back");
     Check(goal.Tasks.First(t => t.TaskId == "t3").FailureReason == "the oven never came back", "a failure keeps its reason");
