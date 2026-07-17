@@ -108,9 +108,14 @@ wired separately in each host.
     token/stem-based (`allergens:["peanuts"]` blocks "peanut butter" — v2's
     substring check did not — while still allowing coconut under a nut allergy).
     `constraints.hard` remains its only input.
-  - `TaskManager/` — `MonitorAdapt` + `MaterialityPolicy` (sustain tick → monitoring
-    status, material change → proactive adaptation). *(Still switches on
-    `meal_plan`/`guest_dinner` → `PRODUCT-DEBT(M2)`.)*
+  - `TaskManager/` — THE GOAL LEDGER (v3-M2). `TaskManager` + `GoalRecord` +
+    `TaskRecord` + `TaskState`: the task DAG, a validated lifecycle (illegal moves
+    are refused, not applied), retries, and **derived** progress — which is what
+    makes Agent Board's %/next-step/pending facts rather than clock heuristics.
+    `TaskDag` sanitizes the planner's decomposition (drops unknown/self deps, caps
+    at 8, breaks cycles) because an LLM suggestion must never corrupt the ledger.
+    `MonitorAdapt` is now pure orchestration: it asks the pack's `IDomainObserver`s
+    what changed, dedups, and proposes. It knows no product.
   - `ProductApiAdapter/IProductApiAdapter.cs` — the product seam: everything the
     harness/plugins may touch of the world. A real Tizen/SmartThings port implements
     THIS and changes nothing else.

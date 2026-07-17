@@ -38,8 +38,12 @@ src/GoalFlow.Device/
       SafetyRule.cs                  #     the rule KINDS (blocked_terms, numeric_cap, time_window_block, …)
       TermMatcher.cs                 #     token/stem matching: "peanuts" blocks "peanut butter", not "coconut"
       AutomationGrade.cs             #     A0/A1/A2/AX + the v2 tier mapping
-    TaskManager/
-      MonitorAdapt.cs                # [4] sustain loop: WorldChange + MaterialityPolicy + adaptations
+    TaskManager/                     # [4] THE GOAL LEDGER — what makes Agent Board honest
+      TaskManager.cs                 #     goals, the DAG, validated transitions, derived progress
+      TaskRecord.cs                  #     TaskState (12) + TaskRecord (deps, retries, failure)
+      TaskDag.cs                     #     sanitizes the LLM's decomposition (cycles, unknown deps, cap)
+      IDomainObserver.cs             #     the seam: the PACK watches the world, decides materiality
+      MonitorAdapt.cs                #     orchestration only: ask observers, dedup, propose
     ProductApiAdapter/
       IProductApiAdapter.cs          # [5] THE PRODUCT SEAM — all the harness may touch of the world
     Approval/ApprovalCoordinator.cs  # tiered proposal ledger (pending → approved → executed)
@@ -49,6 +53,7 @@ src/GoalFlow.Device/
     #  PrecheckEngine/               # [3] arrives in M3
   Products/FamilyHub/                # THE PRODUCT PACK — everything fridge-specific
     FamilyHubProduct.cs              # the manifest: THE single declaration of the plugin catalog
+    Observers/                       # what this product watches: MealPlan (daily feed), GuestDinner (RSVPs)
     Adapter/MockFamilyHubAdapter.cs  # the mock world; resolves day offsets against IClock at read time
     config/policy.json               # THIS product's safety rules: which kinds bind to which calls
     Plugins/                         # SK plugins — the LLM's tools
@@ -56,7 +61,7 @@ src/GoalFlow.Device/
       ReminderPlugin.cs GuestsPlugin.cs ApplianceControlPlugin.cs
       FamilyProfilesPlugin.cs BudgetPlugin.cs NotifyPlugin.cs   # ← the 3 [Unavailable] stubs
   Transport/WsClient.cs              # one outbound BCL ClientWebSocket to the cloud hub
-verify/m0/ verify/m1/               # the gates — run the LATEST milestone's check.sh before every commit
+verify/m0/ verify/m1/ verify/m2/    # the gates — run the LATEST milestone's check.sh before every commit
 ```
 
 **The split is the point.** `Harness/` is domain- and product-agnostic; `Products/`
@@ -94,7 +99,17 @@ die on a missing `calendar.json`); in `--connect` mode,
 ## The plan flow (`Agent/GoalAgent.cs → RunAsync`)
 
 One dispatch becomes one `plan_ready`, with `agent_event` frames streamed the
-whole way (via `Trace`; over the WebSocket when connected, stderr otherwise):
+whole way (via `Trace`; over the WebSocket when connected, stderr otherwise).
+
+**The planner has TWO ALTITUDES** (v3-M2), and the split is deliberate:
+
+0. **decompose** — *what are the pieces of this goal?* A JSON-mode call with NO
+   tools over the advertised capabilities, asking only for structure (titles,
+   dependencies). It must not state world facts — it cannot see the world, and a
+   toolless model asked about the fridge would invent. `TaskDag.Sanitize` then
+   repairs the result (an LLM proposes, code validates — the same division as the
+   safety gate), and any failure **falls soft** to one task so a decomposition
+   problem never costs the user their goal.
 
 1. **`phase: grounding`** — `SafetyFilter.BeginGoal(goal_id, constraints.hard)` arms
    the gate; `Grounding.AssembleAsync` resolves *today* and the contract's
