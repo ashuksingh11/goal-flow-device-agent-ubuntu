@@ -278,9 +278,9 @@ public sealed class GoalAgent
         }
 
         var worldSnapshot = await _monitor.CaptureSnapshotAsync(ct);
-        var demoEvents = dispatch.Domain == "meal_plan"
-            ? _monitor.GetDemoEventsCatalog(worldSnapshot)
-            : null;
+        // Whether this domain has fire-able events is the observer's business, not
+        // a domain name this method has to recognise.
+        var demoEvents = _monitor.DemoEventsFor(dispatch.Domain, worldSnapshot);
 
         var ready = new PlanReady
         {
@@ -828,12 +828,11 @@ public sealed class GoalAgent
                 return (missingStatus, null);
             }
 
-            var ev = activeGoal.WorldSnapshot["daily_events"]?["events"]?.AsArray()
-                .Select(n => n?.AsObject())
-                .OfType<JsonObject>()
-                .FirstOrDefault(e => string.Equals(e["id"]?.GetValue<string>(), eventId, StringComparison.Ordinal));
-
-            if (ev is null)
+            // The goal's domain observer owns the catalog and knows how to turn one
+            // entry into a change; this path just asks. (It used to read
+            // daily_events out of the snapshot itself.)
+            var change = _monitor.TriggerEvent(activeGoal, eventId);
+            if (change is null)
             {
                 var unknownStatus = BuildMonitoringStatus(
                     control.GoalId,
@@ -845,7 +844,6 @@ public sealed class GoalAgent
                 return (unknownStatus, null);
             }
 
-            var change = _monitor.BuildDailyEventChange(activeGoal, ev);
             if (!activeGoal.EmittedMaterialChanges.Add(change.Key))
             {
                 var replayStatus = BuildMonitoringStatus(

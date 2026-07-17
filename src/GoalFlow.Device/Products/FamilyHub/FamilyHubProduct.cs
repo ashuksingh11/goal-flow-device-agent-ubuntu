@@ -61,6 +61,14 @@ public static class FamilyHubProduct
         services.AddSingleton<NotifyPlugin>();
 
         services.AddSingleton(sp => new CapabilityManager(CreateDescriptors(sp), sp.GetRequiredService<SafetyPolicy>()));
+
+        // Domain observers: what this product watches once a plan is live, and
+        // which of its changes are worth waking the family for. The harness owns
+        // the guarantee (material only, exactly once, one scoped re-plan); the
+        // judgement is product knowledge and lives here.
+        services.AddSingleton<IDomainObserver, MealPlanObserver>();
+        services.AddSingleton<IDomainObserver, GuestDinnerObserver>();
+
         return services;
     }
 

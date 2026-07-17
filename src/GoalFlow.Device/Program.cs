@@ -62,7 +62,6 @@ services.AddFamilyHub(options.DataDir);
 services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
-services.AddSingleton<MaterialityPolicy>();
 services.AddSingleton<MonitorAdapt>();
 
 await using var provider = services.BuildServiceProvider();
