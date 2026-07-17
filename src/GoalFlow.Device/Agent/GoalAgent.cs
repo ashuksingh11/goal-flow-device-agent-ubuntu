@@ -98,7 +98,7 @@ public sealed class GoalAgent
 
         builder.Services.AddSingleton(services.GetRequiredService<ILoggerFactory>());
         builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<SafetyFilter>());
-        builder.Services.AddSingleton(services.GetRequiredService<MockWorldStore>());
+        builder.Services.AddSingleton(services.GetRequiredService<IProductApiAdapter>());
 
         builder.Plugins.AddFromObject(services.GetRequiredService<InventoryPlugin>(), "Inventory");
         builder.Plugins.AddFromObject(services.GetRequiredService<CalendarPlugin>(), "Calendar");
@@ -892,7 +892,7 @@ public sealed class GoalAgent
 
         if (control.Command == ControlCommands.Reset)
         {
-            var store = _kernel.Services.GetRequiredService<MockWorldStore>();
+            var store = _kernel.Services.GetRequiredService<IProductApiAdapter>();
             await store.ResetAsync(ct);
             _activeGoals.Remove(control.GoalId);
         }

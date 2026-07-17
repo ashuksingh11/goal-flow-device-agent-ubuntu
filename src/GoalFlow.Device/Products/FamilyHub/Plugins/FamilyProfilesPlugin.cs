@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using GoalFlow.Device.Harness;
 using Microsoft.SemanticKernel;
 
 namespace GoalFlow.Device.Products.FamilyHub;
@@ -14,9 +15,9 @@ namespace GoalFlow.Device.Products.FamilyHub;
 [Description("Family member profiles: diets, allergies, dislikes, ages.")]
 public sealed class FamilyProfilesPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public FamilyProfilesPlugin(MockWorldStore store) => _store = store;
+    public FamilyProfilesPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Lists family members with their dietary preferences, dislikes and ages.")]

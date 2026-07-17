@@ -11,15 +11,15 @@ namespace GoalFlow.Device.Products.FamilyHub;
 /// CAPABILITY MODULE (meal domain): the fridge's interior view.
 /// SK plugin — every method is a [KernelFunction] the LLM calls directly via
 /// auto function-calling. Registered as plugin name "Inventory".
-/// Backed by data/inventory.json through <see cref="MockWorldStore"/>
+/// Backed by data/inventory.json through <see cref="IProductApiAdapter"/>
 /// (expiry stored as expires_in_days offsets, resolved against the clock).
 /// </summary>
 [Description("What food is currently in the fridge/pantry, including expiry.")]
 public sealed class InventoryPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public InventoryPlugin(MockWorldStore store) => _store = store;
+    public InventoryPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Lists every item currently in the fridge/pantry with quantity, unit, category and expiry date.")]

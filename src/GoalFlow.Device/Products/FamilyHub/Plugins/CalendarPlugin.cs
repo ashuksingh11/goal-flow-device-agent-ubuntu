@@ -15,9 +15,9 @@ namespace GoalFlow.Device.Products.FamilyHub;
 [Description("The shared family calendar — who is busy when.")]
 public sealed class CalendarPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public CalendarPlugin(MockWorldStore store) => _store = store;
+    public CalendarPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Lists calendar events between two ISO dates (inclusive), with attendee and start/end times.")]

@@ -53,7 +53,9 @@ services.AddSingleton<IClock>(_ => options.Date is { } start
     : new SimulatedClock());
 
 // Mock world + capability plugins (meal domain + shared).
-services.AddSingleton(sp => new MockWorldStore(options.DataDir, sp.GetRequiredService<IClock>()));
+// The world is bound behind IProductApiAdapter: the harness and the plugins only
+// ever see the seam, so a real Tizen/SmartThings adapter drops in right here.
+services.AddSingleton<IProductApiAdapter>(sp => new MockFamilyHubAdapter(options.DataDir, sp.GetRequiredService<IClock>()));
 services.AddSingleton<InventoryPlugin>();
 services.AddSingleton<CalendarPlugin>();
 services.AddSingleton<RecipePlugin>();

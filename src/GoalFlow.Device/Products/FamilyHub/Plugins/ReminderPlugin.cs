@@ -15,9 +15,9 @@ namespace GoalFlow.Device.Products.FamilyHub;
 [Description("Family reminders and notes shown on the Hub.")]
 public sealed class ReminderPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public ReminderPlugin(MockWorldStore store) => _store = store;
+    public ReminderPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Lists all active reminders with their due date/time.")]

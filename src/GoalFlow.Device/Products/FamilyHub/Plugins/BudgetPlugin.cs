@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using GoalFlow.Device.Harness;
 using Microsoft.SemanticKernel;
 
 namespace GoalFlow.Device.Products.FamilyHub;
@@ -12,9 +13,9 @@ namespace GoalFlow.Device.Products.FamilyHub;
 [Description("Grocery budget status and cost estimation.")]
 public sealed class BudgetPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public BudgetPlugin(MockWorldStore store) => _store = store;
+    public BudgetPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Returns the budget period, cap, and how much has been spent so far.")]

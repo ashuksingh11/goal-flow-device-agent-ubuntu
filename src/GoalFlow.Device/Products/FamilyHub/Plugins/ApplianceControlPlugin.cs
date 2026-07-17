@@ -17,9 +17,9 @@ namespace GoalFlow.Device.Products.FamilyHub;
 [Description("Controls SmartThings appliances: oven, dishwasher, vacuum, lights.")]
 public sealed class ApplianceControlPlugin
 {
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
 
-    public ApplianceControlPlugin(MockWorldStore store) => _store = store;
+    public ApplianceControlPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
     [Description("Lists the appliances SmartThings can reach and their current state.")]

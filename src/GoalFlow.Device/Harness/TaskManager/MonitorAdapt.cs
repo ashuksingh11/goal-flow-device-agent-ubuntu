@@ -1,5 +1,4 @@
 using GoalFlow.Device.Contracts;
-using GoalFlow.Device.Products.FamilyHub;
 using Microsoft.Extensions.Logging;
 using System.Text.Json.Nodes;
 
@@ -17,12 +16,12 @@ namespace GoalFlow.Device.Harness;
 public sealed class MonitorAdapt
 {
     private readonly IClock _clock;
-    private readonly MockWorldStore _store;
+    private readonly IProductApiAdapter _store;
     private readonly MaterialityPolicy _policy;
     private readonly ApprovalCoordinator _approvals;
     private readonly ILogger<MonitorAdapt> _logger;
 
-    public MonitorAdapt(IClock clock, MockWorldStore store, MaterialityPolicy policy, ApprovalCoordinator approvals, ILogger<MonitorAdapt> logger)
+    public MonitorAdapt(IClock clock, IProductApiAdapter store, MaterialityPolicy policy, ApprovalCoordinator approvals, ILogger<MonitorAdapt> logger)
     {
         _clock = clock;
         _store = store;
