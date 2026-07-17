@@ -16,11 +16,17 @@ Siblings under `~/ashu/git/`: `goal-flow-cloud-agent` (Python hub, owns the cano
 (frozen port — see its AGENTS.md). This repo's C# `Contracts/*.cs` MIRROR the cloud's
 `CONTRACT.md`.
 
-**Tizen sync status: IN SYNC** (re-synced 2026-07-16 after the multi-session
-`device_id`/`device_name` change). This repo is the SOURCE OF TRUTH for the portable
-core (`Agent/`, `Contracts/`, `Modules/`, `Transport/`); the tizen repo holds a
-byte-identical copy. Re-sync = plain copy of those four dirs + a `dotnet build`, then
-verify with `diff -rq <dir> ../goal-flow-device-agent-tizen/<dir>` (must be empty).
+**Tizen sync status: OUT OF SYNC since v3-M0** (2026-07-17). `Modules/` no longer
+exists — it split into `Harness/` (generic core) + `Products/FamilyHub/` (product
+pack) — so the old copy recipe names a directory that is gone and the Tizen ports
+will not build against this tree. This is EXPECTED and accepted: both Tizen repos are
+frozen pre-v2 by decision, and v3 re-syncs them ONCE at M9 rather than taxing every
+milestone. Do not attempt a partial re-sync before then.
+
+When M9 comes: this repo is the SOURCE OF TRUTH for the portable core, and the recipe
+becomes a plain copy of `Agent/`, `Contracts/`, `Harness/`, `Products/`, `Transport/`
+(five dirs, was four) + a `dotnet build`, then verify with
+`diff -rq <dir> ../goal-flow-device-agent-tizen/<dir>` (must be empty).
 NEVER copy the host files — each platform owns its own (`Program.cs` here;
 `Program.cs`/`DeviceHost.cs`/`DeviceConfig.cs`/`DlogLogger.cs`/`AssemblyResolver.cs`/
 `UiChannel.cs` there). A core change that needs host wiring (like `device_id`) must be
@@ -69,17 +75,40 @@ wired separately in each host.
   `impact_delta`/`event_id`. Plan items get a **1-based `Day`**; meal plans are
   capped/pinned to EXACTLY 7 dinners (Day 1..7). Adaptation targets the item by its
   event's `Day` index (not by date). Transient-provider-error retry loop wraps LLM calls.
-- `Modules/Capabilities/*Plugin.cs` — 10 SK plugins (KernelFunctions the LLM calls).
-  7 implemented (Inventory, Calendar, ShoppingList, Recipes, Reminders, Guests,
-  ApplianceControl); 3 genuine stubs that throw `NotImplementedException("v2-M0
-  skeleton")`: `FamilyProfilesPlugin`, `BudgetPlugin`, `NotifyPlugin`. (Accurately
-  catalogued in `docs/HARNESSES.md`.)
-- `Modules/Steering/*.cs` — `SafetyFilter` (an `IFunctionInvocationFilter`, deterministic,
-  enforces `constraints.hard` only — the safety gate, SEPARATE from the planner);
-  `ApprovalCoordinator`; `Grounding` (world-state assembler); `Clock` (`IClock` /
-  `SystemClock` / `SimulatedClock` — NEVER call wall-clock, read the clock);
-  `MonitorAdapt` + `MaterialityPolicy` (sustain tick → monitoring status, material
-  change → proactive adaptation); `Trace`; `CapabilityRegistry`.
+- `Products/FamilyHub/**` — THE PRODUCT PACK: everything fridge-specific.
+  - `FamilyHubProduct.cs` — the manifest. **The single place the plugin catalog is
+    declared** (`services.AddFamilyHub(dataDir)`); it used to be hand-listed in four
+    places that could disagree. Adding a plugin = one line here + the plugin file.
+    **Descriptor ORDER is significant** — it is the order the model sees its tools in.
+  - `Plugins/*Plugin.cs` — 10 SK plugins (KernelFunctions the LLM calls). 7 implemented
+    (Inventory, Calendar, ShoppingList, Recipes, Reminders, Guests, ApplianceControl);
+    3 genuine stubs that throw `NotImplementedException`, each marked
+    `[Unavailable(...)]`: `FamilyProfilesPlugin`, `BudgetPlugin`, `NotifyPlugin`. That
+    attribute is **load-bearing, not decoration** — stubs' reads look real to
+    reflection, so without it the planner gets 17 tools instead of 13, four of which
+    throw. Implementing a stub = write the bodies, delete the attribute, same diff.
+  - `Adapter/MockFamilyHubAdapter.cs` — the mock world (`data/*.json`) behind
+    `IProductApiAdapter`. The world stays MOCKED; "generic" is about the harness.
+- `Harness/**` — THE GENERIC CORE. **Contains zero product types and imports the
+  product namespace zero times** (enforced: `verify/m0/check.sh` gate 3 pins the
+  count of product string literals so it can only shrink). The five v3 components plus
+  the v2 harness modules reconciled onto them:
+  - `CapabilityManager/` — discovery over `kernel.Plugins` + the pack's descriptors;
+    builds the `capabilities` message; **derives the planner's tool set** (there is no
+    hand-written whitelist, and no name→Type switch: reflection reads the live
+    registered instance).
+  - `SafetyPolicyEngine/SafetyFilter.cs` — an `IFunctionInvocationFilter`,
+    deterministic, enforces `constraints.hard` only — the safety gate, SEPARATE from
+    the planner. *(Still hardcodes module names → `PRODUCT-DEBT(M1)`.)*
+  - `TaskManager/` — `MonitorAdapt` + `MaterialityPolicy` (sustain tick → monitoring
+    status, material change → proactive adaptation). *(Still switches on
+    `meal_plan`/`guest_dinner` → `PRODUCT-DEBT(M2)`.)*
+  - `ProductApiAdapter/IProductApiAdapter.cs` — the product seam: everything the
+    harness/plugins may touch of the world. A real Tizen/SmartThings port implements
+    THIS and changes nothing else.
+  - `Approval/` `Grounding/` `Clock/` (`IClock`/`SystemClock`/`SimulatedClock` — NEVER
+    call wall-clock, read the clock) `Trace/`.
+  - `PrecheckEngine/` arrives in M3.
 - `Contracts/*.cs` — C# mirror of CONTRACT v2. `PlanReady.cs` has `PlanItem.Day`,
   `DemoEvent {Id,Day,Label,Title,Kind,Order}`, `DemoEvents` catalog. `Control.cs` has
   `EventId` + `TriggerEvent` const. `Status.cs` has `EventId`/`UpdatedPlan`/

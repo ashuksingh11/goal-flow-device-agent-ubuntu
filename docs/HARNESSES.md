@@ -30,20 +30,20 @@ Two kinds of module:
 |---|---|---|---|---|
 | 1 | **Goal Interpreter** | steering (cloud) | LangGraph node + structured output | Cloud repo — the fuzzy goal becomes the generic `dispatch` Task Contract before it ever reaches the device |
 | 2 | **Memory & Constraints** | steering (cloud) | Store + verbatim injection (hard) / retrieval (soft) | Cloud repo — emits `constraints.hard`/`soft` on the dispatch; device consumes, never invents |
-| 3 | **Context Grounding** | steering (device) | Assembler over SK plugins + the generic clock | `Modules/Steering/Grounding.cs` (`Grounding`, `GroundingContext`) |
-| 4 | **Capability Registry** | steering (device) | SK plugin/function discovery (`kernel.Plugins` → `KernelFunctionMetadata` + `[SideEffect]`) | `Modules/Steering/CapabilityRegistry.cs` → the `capabilities` message |
+| 3 | **Context Grounding** | steering (device) | Assembler over SK plugins + the generic clock | `Harness/Grounding/Grounding.cs` (`Grounding`, `GroundingContext`) |
+| 4 | **Capability Registry** | steering (device) | SK plugin/function discovery (`kernel.Plugins` → `KernelFunctionMetadata` + `[SideEffect]`) | `Harness/CapabilityManager/CapabilityManager.cs` → the `capabilities` message |
 | 5 | **Planner** | device kernel host | **SK auto function-calling** (`FunctionChoiceBehavior.Auto` over the capability plugins), LLM-only | `Agent/GoalAgent.cs` (`RunAsync`) |
-| 6 | **Safety & Policy Filter** | steering (device) | **SK `IFunctionInvocationFilter`** — vetoes pending calls vs `constraints.hard`; "LLM plans, code checks" | `Modules/Steering/SafetyFilter.cs` |
-| 7 | **Approval / Consent (HITL)** | steering (split) | Device: tiered proposal ledger. Cloud: LangGraph `interrupt()` holds the durable pause | `Modules/Steering/ApprovalCoordinator.cs` (auto/light/firm; pending → approved → executed) |
+| 6 | **Safety & Policy Filter** | steering (device) | **SK `IFunctionInvocationFilter`** — vetoes pending calls vs `constraints.hard`; "LLM plans, code checks" | `Harness/SafetyPolicyEngine/SafetyFilter.cs` |
+| 7 | **Approval / Consent (HITL)** | steering (split) | Device: tiered proposal ledger. Cloud: LangGraph `interrupt()` holds the durable pause | `Harness/Approval/ApprovalCoordinator.cs` (auto/light/firm; pending → approved → executed) |
 | 8 | **Actuator / Effect Executor** | steering (device) | Idempotent executor invoking approved proposals through the kernel (filter still applies) | `Agent/GoalAgent.cs` (`ApplyApprovalAsync`) + `ApprovalCoordinator.MarkExecuted` |
-| 9 | **Scheduler / Temporal** | steering (device) | Generic clock abstraction — real or simulated, NEVER hardcoded | `Modules/Steering/Clock.cs` (`IClock`, `SystemClock`, `SimulatedClock`) |
-| 10 | **Monitor & Adapt** | steering (device) | Change watcher + deterministic materiality policy → scoped adaptation `proposal` | `Modules/Steering/MonitorAdapt.cs` (`MonitorAdapt`, `MaterialityPolicy`, `WorldChange`) |
-| 11 | **Trace / Explain** | steering (device) | `Microsoft.Extensions.Logging` (structured, correlation-scoped) + streamed `agent_event` frames | `Modules/Steering/Trace.cs` |
+| 9 | **Scheduler / Temporal** | steering (device) | Generic clock abstraction — real or simulated, NEVER hardcoded | `Harness/Clock/Clock.cs` (`IClock`, `SystemClock`, `SimulatedClock`) |
+| 10 | **Monitor & Adapt** | steering (device) | Change watcher + deterministic materiality policy → scoped adaptation `proposal` | `Harness/TaskManager/MonitorAdapt.cs` (`MonitorAdapt`, `MaterialityPolicy`, `WorldChange`) |
+| 11 | **Trace / Explain** | steering (device) | `Microsoft.Extensions.Logging` (structured, correlation-scoped) + streamed `agent_event` frames | `Harness/Trace/Trace.cs` |
 
 Goal-side modules (#1, #2) are cloud-owned; the device sees their *output* in
 the dispatch. Everything else is a real class in this repo, advertised to the
 cloud/UI in the `capabilities` message (`kind: "steering"` entries come from
-`CapabilityRegistry.SteeringModules`).
+`CapabilityManager.SteeringModules`).
 
 ## Device-side harness modules, in depth — what each is & how it helps
 
@@ -53,7 +53,7 @@ capability plugins), they **steer** it — deciding what the LLM sees, what it m
 run, what the user must approve, and how the plan survives a changing world. None
 of them contains an LLM; that is the point ("LLM plans, code checks").
 
-### 3 · Context Grounding — `Modules/Steering/Grounding.cs`
+### 3 · Context Grounding — `Harness/Grounding/Grounding.cs`
 **What it is:** an assembler that builds the planner's opening context from the
 *real* world in two halves — a pre-pass snapshot (the clock's date, the time
 window resolved against it, `constraints.hard`/`soft` verbatim, and a short world
@@ -64,7 +64,7 @@ the plan is about *this* family's real inventory, calendar and constraints — a
 keeps the opening prompt small (a digest, not a data dump) while leaving the
 details a function call away.
 
-### 4 · Capability Registry — `Modules/Steering/CapabilityRegistry.cs`
+### 4 · Capability Registry — `Harness/CapabilityManager/CapabilityManager.cs`
 **What it is:** the toolbox is *discovered*, not hand-listed — this walks
 `kernel.Plugins` (KernelFunction metadata + the `[SideEffect]` attribute) plus the
 fixed steering modules and builds the `capabilities` message sent right after
@@ -81,7 +81,7 @@ fallback. **How it helps:** one generic mechanism plans *any* domain (meal, gues
 dinner, …) by composing whatever plugins the goal needs — generality comes from
 the toolbox, not from planner code.
 
-### 6 · Safety & Policy Filter — `Modules/Steering/SafetyFilter.cs`
+### 6 · Safety & Policy Filter — `Harness/SafetyPolicyEngine/SafetyFilter.cs`
 **What it is:** a Semantic Kernel `IFunctionInvocationFilter` in the kernel's
 invocation pipeline — *every* tool call the LLM makes passes through it BEFORE the
 plugin method runs. It checks the pending call against `constraints.hard` (its only
@@ -91,7 +91,7 @@ doesn't run; instead the model gets a structured refusal (so it re-plans) and th
 violation is recorded for the `plan_ready` safety verdict. The planner can be
 creative because code, not the model, enforces allergens/medical/budget/quiet-hours.
 
-### 7 · Approval / Consent (HITL) — `Modules/Steering/ApprovalCoordinator.cs`
+### 7 · Approval / Consent (HITL) — `Harness/Approval/ApprovalCoordinator.cs`
 **What it is:** the device half of human-in-the-loop — the proposal **ledger**.
 Side-effecting calls the LLM proposes are frozen into `ProposalItem`s by tier:
 `auto` may execute immediately, `light` rides the plan approval, `firm` (spends
@@ -109,7 +109,7 @@ applies), idempotently. **How it helps:** it's the single, guarded path from
 reconnect/replay), and the resulting `status.executed` is what the UI turns into
 "5 items added ✓".
 
-### 9 · Scheduler / Temporal — `Modules/Steering/Clock.cs` (`IClock`/`SystemClock`/`SimulatedClock`)
+### 9 · Scheduler / Temporal — `Harness/Clock/Clock.cs` (`IClock`/`SystemClock`/`SimulatedClock`)
 **What it is:** the generic clock every other module reads. INVARIANT: nothing ever
 hardcodes a date — "today" is the real system date or a simulated date driven by
 `control` frames (`set_date` / `advance_day`); mock-world dates are stored as day
@@ -117,7 +117,7 @@ OFFSETS and resolved against it. **How it helps:** it makes the whole agent
 time-relative, so a demo runs on any calendar date and the presenter can advance
 days to trigger adaptations — without a single date baked into code or data.
 
-### 10 · Monitor & Adapt — `Modules/Steering/MonitorAdapt.cs` (+ `MaterialityPolicy`)
+### 10 · Monitor & Adapt — `Harness/TaskManager/MonitorAdapt.cs` (+ `MaterialityPolicy`)
 **What it is:** after a plan is approved the world keeps moving (a day passes, an
 item expires early, a guest RSVPs an allergy). This compares fresh world state
 against the plan's assumptions, applies the **materiality policy** — deterministic
@@ -127,7 +127,7 @@ helps:** it turns a one-shot plan into a living one that reacts to reality, whil
 the materiality gate prevents noise (4 quiet days, 1 smart adaptation) and the
 scoped re-plan keeps the change cheap and legible.
 
-### 11 · Trace / Explain — `Modules/Steering/Trace.cs`
+### 11 · Trace / Explain — `Harness/Trace/Trace.cs`
 **What it is:** one sink, two audiences — structured logs via
 `Microsoft.Extensions.Logging` (leveled, correlation-id-scoped) AND streamed
 `agent_event` frames over the WebSocket (phase / thinking / tool_call / tool_result
@@ -138,12 +138,12 @@ feed the UI renders.
 
 ## Capability modules (SK plugins — the LLM's tools)
 
-All in `Modules/Capabilities/`, registered in `GoalAgent.BuildKernel`,
+All in `Products/FamilyHub/Plugins/`, registered in `GoalAgent.BuildKernel`,
 advertised with `kind: "capability"` and per-function
 `side_effecting`/`tier` metadata. Mock-world access goes through
-`MockWorldStore` (relative dates; see `data/README.md`).
+`MockFamilyHubAdapter` (relative dates; see `data/README.md`).
 
-**10 capability plugins** (7 implemented + 3 stubs). `MockWorldStore` is shared
+**10 capability plugins** (7 implemented + 3 stubs). `MockFamilyHubAdapter` is shared
 infra, not a plugin.
 
 | Plugin (module name) | Domain | Status | [KernelFunction]s (side-effecting → tier) |

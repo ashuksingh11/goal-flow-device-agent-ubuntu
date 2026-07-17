@@ -23,7 +23,7 @@ namespace GoalFlow.Device.Harness;
 /// </summary>
 public sealed record CapabilityDescriptor
 {
-    /// <summary>The advertised module name — "Inventory", "ShoppingList", … .</summary>
+    /// <summary>The name this capability is advertised and invoked under, chosen by the product pack.</summary>
     public required string Name { get; init; }
 
     /// <summary>The live plugin instance; the only thing reflection reads.</summary>

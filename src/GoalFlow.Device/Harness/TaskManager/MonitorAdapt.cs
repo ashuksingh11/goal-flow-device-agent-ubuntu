@@ -40,6 +40,12 @@ public sealed class MonitorAdapt
 
     public Task<IReadOnlyList<WorldChange>> ObserveAsync(ActiveGoalContext goal, CancellationToken ct = default)
     {
+        // PRODUCT-DEBT(M2): a harness module switching on product domain names.
+        // The observers themselves (ObserveMealChanges / ObserveGuestChanges) are
+        // product knowledge living in the generic core; M2 extracts them behind
+        // IDomainObserver, contributed by the product pack, and this switch
+        // becomes "ask each registered observer". Deferred deliberately — doing
+        // it here would be a behavior change in a commit that must have none.
         var changes = goal.Dispatch.Domain switch
         {
             "meal_plan" => ObserveMealChanges(goal),
