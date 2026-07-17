@@ -43,7 +43,7 @@ public sealed class MealPlanObserver : IDomainObserver
             ["daily_events"] = await LoadFeedAsync(ct)
         };
 
-    public IReadOnlyList<WorldChange> Observe(ActiveGoalContext goal)
+    public IReadOnlyList<WorldChange> Observe(GoalRecord goal)
     {
         var today = _clock.Today.ToString("yyyy-MM-dd");
         var feed = goal.WorldSnapshot["daily_events"]?["events"]?.AsArray() ?? [];
@@ -75,7 +75,7 @@ public sealed class MealPlanObserver : IDomainObserver
             .OrderBy(ev => ev.Order)
             .ToArray();
 
-    public WorldChange? TriggerEvent(ActiveGoalContext goal, string eventId)
+    public WorldChange? TriggerEvent(GoalRecord goal, string eventId)
     {
         var ev = (goal.WorldSnapshot["daily_events"]?["events"]?.AsArray() ?? [])
             .Select(n => n?.AsObject())
@@ -86,7 +86,7 @@ public sealed class MealPlanObserver : IDomainObserver
     }
 
     /// <summary>One feed entry → a change aimed at a specific plan day.</summary>
-    private WorldChange BuildChange(ActiveGoalContext goal, JsonObject ev)
+    private WorldChange BuildChange(GoalRecord goal, JsonObject ev)
     {
         var evDate = ev["date"]?.GetValue<string>();
         var id = ev["id"]?.GetValue<string>() ?? evDate ?? "unknown";

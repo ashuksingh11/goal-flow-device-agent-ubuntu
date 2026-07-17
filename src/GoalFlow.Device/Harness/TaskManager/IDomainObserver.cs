@@ -46,7 +46,7 @@ public interface IDomainObserver
     /// <see cref="WorldChange.Material"/>. Deduplication is the harness's job —
     /// return what you see and use a STABLE <see cref="WorldChange.Key"/>.
     /// </summary>
-    IReadOnlyList<WorldChange> Observe(ActiveGoalContext goal);
+    IReadOnlyList<WorldChange> Observe(GoalRecord goal);
 
     /// <summary>
     /// The presenter's fire-able event catalog for this domain, or null if it has
@@ -59,5 +59,5 @@ public interface IDomainObserver
     /// domain doesn't know that id. Lets the presenter force a change instead of
     /// waiting for the clock.
     /// </summary>
-    WorldChange? TriggerEvent(ActiveGoalContext goal, string eventId) => null;
+    WorldChange? TriggerEvent(GoalRecord goal, string eventId) => null;
 }

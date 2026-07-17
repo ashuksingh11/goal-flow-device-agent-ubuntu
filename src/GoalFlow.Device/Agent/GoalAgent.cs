@@ -47,7 +47,7 @@ public sealed class GoalAgent
     private readonly CapabilityManager _capabilities;
     private readonly IClock _clock;
     private readonly ILogger<GoalAgent> _logger;
-    private readonly Dictionary<string, ActiveGoalContext> _activeGoals = new(StringComparer.Ordinal);
+    private readonly TaskManager _tasks;
 
     /// <summary>Plan patches awaiting approval, keyed by proposal id → (goalId, patch).
     /// Registered when a daily adaptation is proposed; applied in ApplyApproval.</summary>
@@ -66,6 +66,7 @@ public sealed class GoalAgent
         ApprovalCoordinator approvals,
         MonitorAdapt monitor,
         CapabilityManager capabilities,
+        TaskManager tasks,
         IClock clock,
         ILogger<GoalAgent> logger)
     {
@@ -76,6 +77,7 @@ public sealed class GoalAgent
         _approvals = approvals;
         _monitor = monitor;
         _capabilities = capabilities;
+        _tasks = tasks;
         _clock = clock;
         _logger = logger;
     }
@@ -144,6 +146,18 @@ public sealed class GoalAgent
         => HandleControlCoreAsync(control, ct);
 
     private const int MaxComposeAttempts = 3;
+
+    /// <summary>Id of the one task a goal has until the planner decomposes for real (c4).</summary>
+    private const string SingleTaskId = "t1";
+
+    /// <summary>
+    /// One task per goal — the v2 shape, preserved so this commit is bookkeeping
+    /// only. c4 replaces this with a real decomposition pass, and everything the
+    /// Task Manager derives (progress, next step, pending) starts being interesting
+    /// the moment a goal has more than one.
+    /// </summary>
+    private static IReadOnlyList<TaskRecord> SynthesizeTasks(Dispatch dispatch)
+        => [new TaskRecord { TaskId = SingleTaskId, GoalId = dispatch.GoalId, Title = dispatch.Objective }];
 
     /// <summary>The grounding instruction (user message) rendered from the contract.</summary>
     internal static string BuildGroundingInstruction(Dispatch dispatch)
@@ -299,12 +313,14 @@ public sealed class GoalAgent
         };
 
         await _trace.PhaseAsync("awaiting_approval");
-        _activeGoals[dispatch.GoalId] = new ActiveGoalContext
-        {
-            Dispatch = dispatch,
-            Plan = modelPlan.Plan,
-            WorldSnapshot = worldSnapshot
-        };
+        // Register the goal and its tasks in the ledger. The decomposition is the
+        // planner's (c4); until then every goal is one task, which is exactly the
+        // v2 shape — so this commit changes bookkeeping, not behaviour.
+        var goal = _tasks.CreateGoal(dispatch, SynthesizeTasks(dispatch), worldSnapshot);
+        goal.Plan = modelPlan.Plan;
+        await _tasks.TransitionAsync(dispatch.GoalId, SingleTaskId, TaskState.Ready);
+        await _tasks.TransitionAsync(dispatch.GoalId, SingleTaskId, TaskState.Planning);
+        await _tasks.TransitionAsync(dispatch.GoalId, SingleTaskId, TaskState.AwaitingApproval);
         _logger.LogInformation("plan_ready items={ItemCount} proposals={ProposalCount} safety={Safety}", ready.Payload.Plan.Count, ready.Payload.Proposals.Count, ready.Payload.Safety.Gate);
         return ready;
     }
@@ -481,7 +497,7 @@ public sealed class GoalAgent
         use a new id only to ADD a step. Honor the steer.
         """;
 
-    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, ActiveGoalContext active, WorldChange change, CancellationToken ct, string? eventId = null)
+    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, GoalRecord active, WorldChange change, CancellationToken ct, string? eventId = null)
     {
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
         var history = new ChatHistory();
@@ -669,7 +685,8 @@ public sealed class GoalAgent
     private (ExecutedEffect Effect, IReadOnlyList<PlanItem>? Updated, IReadOnlyList<string> ChangedIds, IReadOnlyList<ImpactItem> ImpactDelta) ApplyPendingPatch(string proposalId)
     {
         _approvals.MarkExecuted(proposalId);
-        if (!_pendingPatches.Remove(proposalId, out var pending) || !_activeGoals.TryGetValue(pending.GoalId, out var active))
+        var active = _pendingPatches.Remove(proposalId, out var pending) ? _tasks.GetGoal(pending.GoalId) : null;
+        if (active is null)
         {
             return (new ExecutedEffect { ProposalId = proposalId, Action = $"{PlanPatchModule}.{PlanPatchFunction}", Result = "skipped", Detail = "no pending patch or active goal" }, null, [], []);
         }
@@ -792,9 +809,7 @@ public sealed class GoalAgent
 
     private async Task<(Status Status, Proposal? Adaptation)> HandleControlCoreAsync(Control control, CancellationToken ct)
     {
-        var correlationId = _activeGoals.TryGetValue(control.GoalId, out var activeForScope)
-            ? activeForScope.Dispatch.CorrelationId
-            : null;
+        var correlationId = _tasks.GetGoal(control.GoalId)?.Dispatch.CorrelationId;
         using var scope = _trace.BeginGoalScope(control.GoalId, correlationId);
         // A control tick can re-plan a slice of this goal (trigger_event →
         // ProposeDailyAdaptationAsync), so enter its policy scope too.
@@ -804,7 +819,8 @@ public sealed class GoalAgent
         if (control.Command == ControlCommands.TriggerEvent)
         {
             var eventId = control.Payload?.EventId ?? control.EventId;
-            if (!_activeGoals.TryGetValue(control.GoalId, out var activeGoal))
+            var activeGoal = _tasks.GetGoal(control.GoalId);
+            if (activeGoal is null)
             {
                 var noGoalStatus = BuildMonitoringStatus(
                     control.GoalId,
@@ -901,11 +917,12 @@ public sealed class GoalAgent
         {
             var store = _kernel.Services.GetRequiredService<IProductApiAdapter>();
             await store.ResetAsync(ct);
-            _activeGoals.Remove(control.GoalId);
+            _tasks.RemoveGoal(control.GoalId);
             _safety.RemoveGoal(control.GoalId);
         }
 
-        if (!_activeGoals.TryGetValue(control.GoalId, out var active))
+        var active = _tasks.GetGoal(control.GoalId);
+        if (active is null)
         {
             var noGoalStatus = new Status
             {

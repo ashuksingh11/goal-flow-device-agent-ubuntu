@@ -60,7 +60,7 @@ public sealed class MonitorAdapt
     }
 
     /// <summary>Changes for this goal, as classified by the observers of its domain.</summary>
-    public Task<IReadOnlyList<WorldChange>> ObserveAsync(ActiveGoalContext goal, CancellationToken ct = default)
+    public Task<IReadOnlyList<WorldChange>> ObserveAsync(GoalRecord goal, CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<WorldChange>>(
             For(goal.Dispatch.Domain).SelectMany(o => o.Observe(goal)).ToArray());
 
@@ -69,7 +69,7 @@ public sealed class MonitorAdapt
         => For(domain).Select(o => o.DemoEvents(snapshot)).FirstOrDefault(c => c is { Count: > 0 });
 
     /// <summary>Fire one catalog event on demand (control: trigger_event).</summary>
-    public WorldChange? TriggerEvent(ActiveGoalContext goal, string eventId)
+    public WorldChange? TriggerEvent(GoalRecord goal, string eventId)
         => For(goal.Dispatch.Domain).Select(o => o.TriggerEvent(goal, eventId)).FirstOrDefault(c => c is not null);
 
     /// <summary>
@@ -195,16 +195,3 @@ public sealed record WorldChange
     public string? Steer { get; init; }
 }
 
-/// <summary>One goal the device is actively sustaining.</summary>
-public sealed record ActiveGoalContext
-{
-    public required Dispatch Dispatch { get; init; }
-
-    /// <summary>The live plan — SETTABLE so an approved adaptation can patch it in
-    /// place without recreating the context (which would reset the dedup set).</summary>
-    public required IReadOnlyList<PlanItem> Plan { get; set; }
-
-    public required JsonObject WorldSnapshot { get; init; }
-
-    public HashSet<string> EmittedMaterialChanges { get; } = new(StringComparer.Ordinal);
-}

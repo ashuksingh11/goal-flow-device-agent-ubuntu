@@ -39,7 +39,7 @@ public sealed class GuestDinnerObserver : IDomainObserver
         };
     }
 
-    public IReadOnlyList<WorldChange> Observe(ActiveGoalContext goal)
+    public IReadOnlyList<WorldChange> Observe(GoalRecord goal)
     {
         var today = _clock.Today.ToString("yyyy-MM-dd");
         var updates = goal.WorldSnapshot["guests"]?["pending_updates"]?.AsArray() ?? [];
