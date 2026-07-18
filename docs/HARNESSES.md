@@ -1,167 +1,162 @@
-# Harness Catalog (v2)
+# Harness Catalog (v3)
 
-**Count:** **11 harness modules** (the reusable, domain-agnostic orchestration
-layer — the "star") + **10 capability plugins** (the SK tools the LLM calls).
-The two are different categories: harness modules *steer/orchestrate*; capability
-plugins are the *toolbox*. Of the 11 harness modules, 2 are cloud-side (Goal
-Interpreter, Memory & Constraints) and 9 are device-side. Of the 10 capability
-plugins, 7 are implemented and 3 (FamilyProfiles, Budget, Notify) are named stubs.
+**The harness is the reusable, domain-agnostic orchestration layer — the "star."**
+v3 makes it explicit: **five first-class components**, each its own folder under
+`Harness/`, plus the supporting device-side modules that steer a run. The product
+(fridge specifics) lives entirely in `Products/FamilyHub/`; the harness contains zero
+product types. This page maps each piece to the REAL primitive it is built on and the
+REAL file that implements it — not made-up class names: every type below is one you can
+open, and the SK primitives (`[KernelFunction]`, `FunctionChoiceBehavior.Auto`,
+`IFunctionInvocationFilter`) are framework features.
 
-The reusable star of GoalFlow is the set of **11 domain-agnostic harness
-modules** from the v2 design proposal. This page maps each one to the REAL
-primitive it is built on and the REAL file that implements it in this repo —
-these are not made-up class names: every device-side module below is a
-concrete type you can open, and the SK primitives (`[KernelFunction]`,
-`FunctionChoiceBehavior.Auto`, `IFunctionInvocationFilter`) are framework
-features, not conventions.
+Two kinds of thing:
 
-Two kinds of module:
+- **capability** — a Semantic Kernel *plugin*: a toolbox of `[KernelFunction]`s the LLM
+  calls via auto function-calling. Domain-flavored, and all in the product pack.
+- **steering** — deterministic code that shapes/guards the run: it decides what the LLM
+  sees, what it may execute, what the user must approve, whether the world is even ready,
+  and how the plan survives a changing world. **Steering never contains an LLM** — that
+  is the whole point ("LLM plans, code checks").
 
-- **capability** — a Semantic Kernel *plugin*: a toolbox of `[KernelFunction]`s
-  the LLM calls via auto function-calling. Domain-flavored (Inventory is meal;
-  Calendar is shared).
-- **steering** — deterministic code that shapes/guards the run: it decides
-  what the LLM sees, what it may execute, and what the user must approve.
-  Steering modules never contain an LLM.
+## The five harness components (v3)
 
-## The 11 harness modules → real primitives
+The v3 design elevates five components to first-class folders. They are the generic
+core; a second product would reuse all five unchanged.
 
-| # | Harness module | Kind | Real primitive | Where it lives |
+| # | Component | Folder | Real primitive | What it owns |
 |---|---|---|---|---|
-| 1 | **Goal Interpreter** | steering (cloud) | LangGraph node + structured output | Cloud repo — the fuzzy goal becomes the generic `dispatch` Task Contract before it ever reaches the device |
-| 2 | **Memory & Constraints** | steering (cloud) | Store + verbatim injection (hard) / retrieval (soft) | Cloud repo — emits `constraints.hard`/`soft` on the dispatch; device consumes, never invents |
-| 3 | **Context Grounding** | steering (device) | Assembler over SK plugins + the generic clock | `Harness/Grounding/Grounding.cs` (`Grounding`, `GroundingContext`) |
-| 4 | **Capability Registry** | steering (device) | SK plugin/function discovery (`kernel.Plugins` → `KernelFunctionMetadata` + `[SideEffect]`) | `Harness/CapabilityManager/CapabilityManager.cs` → the `capabilities` message |
-| 5 | **Planner** | device kernel host | **SK auto function-calling** (`FunctionChoiceBehavior.Auto` over the capability plugins), LLM-only | `Agent/GoalAgent.cs` (`RunAsync`) |
-| 6 | **Safety & Policy Filter** | steering (device) | **SK `IFunctionInvocationFilter`** — vetoes pending calls vs `constraints.hard`; "LLM plans, code checks" | `Harness/SafetyPolicyEngine/SafetyFilter.cs` |
-| 7 | **Approval / Consent (HITL)** | steering (split) | Device: tiered proposal ledger. Cloud: LangGraph `interrupt()` holds the durable pause | `Harness/Approval/ApprovalCoordinator.cs` (auto/light/firm; pending → approved → executed) |
-| 8 | **Actuator / Effect Executor** | steering (device) | Idempotent executor invoking approved proposals through the kernel (filter still applies) | `Agent/GoalAgent.cs` (`ApplyApprovalAsync`) + `ApprovalCoordinator.MarkExecuted` |
-| 9 | **Scheduler / Temporal** | steering (device) | Generic clock abstraction — real or simulated, NEVER hardcoded | `Harness/Clock/Clock.cs` (`IClock`, `SystemClock`, `SimulatedClock`) |
-| 10 | **Monitor & Adapt** | steering (device) | Change watcher + deterministic materiality policy → scoped adaptation `proposal` | `Harness/TaskManager/MonitorAdapt.cs` (`MonitorAdapt`, `MaterialityPolicy`, `WorldChange`) |
-| 11 | **Trace / Explain** | steering (device) | `Microsoft.Extensions.Logging` (structured, correlation-scoped) + streamed `agent_event` frames | `Harness/Trace/Trace.cs` |
+| 1 | **Capability Manager** | `Harness/CapabilityManager/` | SK plugin/function discovery (`kernel.Plugins` → `KernelFunctionMetadata` + `[SideEffect]`) | Discovers the toolbox and advertises it (`capabilities` message: modules + per-function side-effect tier + the domain list from the observers). Nothing is hand-listed. |
+| 2 | **Safety Policy Engine** | `Harness/SafetyPolicyEngine/` | SK `IFunctionInvocationFilter` + a **declarative** `policy.json` | The hard guardrail. The harness implements rule KINDS (blocked-terms, numeric-cap, time-window, result-screen); the pack's `policy.json` binds them to this product's calls. Grades A0/A1/A2/AX with a **ratchet** (config may only tighten). |
+| 3 | **Pre-check Engine** | `Harness/PrecheckEngine/` | Probe interface + config bindings, run at phase boundaries (NOT in the SK filter) | The third gate: *"is this POSSIBLE right now?"* — distinct from safety's *"never"* and approval's *"waiting on a person."* Two gates: before planning (can this goal be planned at all?) and before each actuation (can this effect happen now?). A failed effect DEFERS (the approval stands, runs when the world recovers). |
+| 4 | **Task Manager** | `Harness/TaskManager/` | A validated task-DAG ledger + the observer/suggester seams | The goal's ledger: the task DAG, a validated lifecycle, DERIVED progress (`progress_pct`/`pending_tasks`/`next_step` — never inferred from the clock). Also hosts `IDomainObserver` (world-watching + materiality → adaptation) and `ISuggester` (proactive scans), plus `MonitorAdapt`. |
+| 5 | **Product API Adapter** | `Harness/ProductApiAdapter/` | `IProductApiAdapter` — the product seam | The one interface between generic harness and a concrete product. `MockFamilyHubAdapter` implements it over `data/*.json`; making the fridge real means one new implementation, no plugin changes. |
 
-Goal-side modules (#1, #2) are cloud-owned; the device sees their *output* in
-the dispatch. Everything else is a real class in this repo, advertised to the
-cloud/UI in the `capabilities` message (`kind: "steering"` entries come from
-`CapabilityManager.SteeringModules`).
+## Supporting device-side modules
 
-## Device-side harness modules, in depth — what each is & how it helps
+Not "components" but real steering modules the run needs:
 
-These are the **9 device-side harness modules** (#3–#11). They are the reusable,
-domain-agnostic orchestration layer: they don't *do* the domain work (that's the
-capability plugins), they **steer** it — deciding what the LLM sees, what it may
-run, what the user must approve, and how the plan survives a changing world. None
-of them contains an LLM; that is the point ("LLM plans, code checks").
+| Module | Real primitive | Where it lives |
+|---|---|---|
+| **Context Grounding** | Assembler over SK plugins + the generic clock | `Harness/Grounding/Grounding.cs` |
+| **Planner (two-altitude)** | SK auto function-calling, LLM-only, in two passes | `Agent/GoalAgent.cs` (`DecomposeAsync` → per-task planning in `RunAsync`) |
+| **Approval / Consent (HITL)** | Tiered proposal ledger (auto/light/firm) | `Harness/Approval/ApprovalCoordinator.cs` |
+| **Actuator / Effect Executor** | Idempotent executor through the kernel (filter + precheck still apply) | `Agent/GoalAgent.ApplyApprovalAsync` + `ApprovalCoordinator.MarkExecuted` |
+| **Scheduler / Temporal** | Generic clock — real or simulated, NEVER hardcoded | `Harness/Clock/Clock.cs` (`IClock`/`SystemClock`/`SimulatedClock`) |
+| **Trace / Explain** | `Microsoft.Extensions.Logging` + streamed `agent_event` frames | `Harness/Trace/Trace.cs` |
 
-### 3 · Context Grounding — `Harness/Grounding/Grounding.cs`
-**What it is:** an assembler that builds the planner's opening context from the
-*real* world in two halves — a pre-pass snapshot (the clock's date, the time
-window resolved against it, `constraints.hard`/`soft` verbatim, and a short world
-digest) rendered into the system prompt, plus the live half: the capability
-plugins the model calls mid-plan for anything the digest didn't cover.
-**How it helps:** it anchors the LLM to facts instead of hallucinated state, so
-the plan is about *this* family's real inventory, calendar and constraints — and
-keeps the opening prompt small (a digest, not a data dump) while leaving the
-details a function call away.
+The cloud owns two more steering roles the device only sees the *output* of: the **Goal
+Interpreter** (fuzzy goal → the generic `dispatch` contract, and the M4 actionability
+gate that judges a goal against *this device's advertised capabilities*) and **Memory &
+Constraints** (emits `constraints.hard`/`soft`; the device consumes, never invents).
 
-### 4 · Capability Registry — `Harness/CapabilityManager/CapabilityManager.cs`
-**What it is:** the toolbox is *discovered*, not hand-listed — this walks
-`kernel.Plugins` (KernelFunction metadata + the `[SideEffect]` attribute) plus the
-fixed steering modules and builds the `capabilities` message sent right after
-`hello_ack`. **How it helps:** the cloud/UI learn what the device can do (and each
-function's side-effecting/tier metadata) without hard-coding it; add a plugin and
-it advertises itself. It's also the source of truth the SafetyFilter and
-ApprovalCoordinator read to decide which calls must be frozen into proposals.
+## The components, in depth
 
-### 5 · Planner — `Agent/GoalAgent.RunAsync` (SK auto function-calling)
-**What it is:** not a bespoke planner class but the SK kernel host running
-`FunctionChoiceBehavior.Auto` over the capability plugins — the LLM decides which
-tools to call, in what order, to satisfy the objective; LLM-only, no rules/scripted
-fallback. **How it helps:** one generic mechanism plans *any* domain (meal, guest
-dinner, …) by composing whatever plugins the goal needs — generality comes from
-the toolbox, not from planner code.
+### 1 · Capability Manager — `Harness/CapabilityManager/CapabilityManager.cs`
+The toolbox is *discovered*, not hand-listed: it walks `kernel.Plugins` (KernelFunction
+metadata + `[SideEffect]`) plus the fixed steering modules and builds the `capabilities`
+message. It also advertises the **domains** the device understands (derived from the
+registered `IDomainObserver`s), so the cloud interpreter routes a goal to a domain the
+device actually answers to. Add a plugin or an observer and it advertises itself; the
+grounding tool set is derived here too (available reads only — a `[Unavailable]` stub is
+withheld from the planner). **How it helps:** what the assistant can do is a fact about
+the device that is plugged in, discovered, not a hardcoded list.
 
-### 6 · Safety & Policy Filter — `Harness/SafetyPolicyEngine/SafetyFilter.cs`
-**What it is:** a Semantic Kernel `IFunctionInvocationFilter` in the kernel's
-invocation pipeline — *every* tool call the LLM makes passes through it BEFORE the
-plugin method runs. It checks the pending call against `constraints.hard` (its only
-input) and blocks violations deterministically, never consulting the LLM. **How it
-helps:** this is the hard guardrail behind "LLM plans, code checks" — a blocked call
-doesn't run; instead the model gets a structured refusal (so it re-plans) and the
-violation is recorded for the `plan_ready` safety verdict. The planner can be
-creative because code, not the model, enforces allergens/medical/budget/quiet-hours.
+### 2 · Safety Policy Engine — `Harness/SafetyPolicyEngine/SafetyFilter.cs` (+ `policy.json`)
+An `IFunctionInvocationFilter` in the kernel's invocation pipeline — *every* tool call
+passes through it BEFORE the plugin runs. It checks the pending call against
+`constraints.hard` (its only input) and blocks violations deterministically, never
+consulting the LLM. v3 makes it **declarative**: the harness implements rule KINDS, the
+pack's `config/policy.json` says which of THIS product's calls they apply to and with
+what vocabulary. Grades A0/A1/A2/AX unify the tiers, with a **ratchet** — config may only
+make a grade STRICTER; loosening is fatal at startup. Per-goal policy (`AsyncLocal`), so
+two concurrent goals never clobber each other's constraints. **How it helps:** the
+planner can be creative because code — not the model — enforces
+allergens/medical/budget/quiet-hours, and the rules are editable data, not code.
 
-### 7 · Approval / Consent (HITL) — `Harness/Approval/ApprovalCoordinator.cs`
-**What it is:** the device half of human-in-the-loop — the proposal **ledger**.
-Side-effecting calls the LLM proposes are frozen into `ProposalItem`s by tier:
-`auto` may execute immediately, `light` rides the plan approval, `firm` (spends
-money / irreversible) NEVER executes until an explicit approval arrives. Lifecycle:
-pending → approved → executed (or rejected). **How it helps:** it gives the user
-proportionate control — trivial actions don't nag, consequential ones are gated —
-and guarantees nothing irreversible happens without consent. (The durable
-pause/resume itself lives cloud-side in LangGraph `interrupt()`.)
+### 3 · Pre-check Engine — `Harness/PrecheckEngine/PrecheckEngine.cs`
+The third gate, and the one v2 lacked. Safety asks *"is this ALLOWED?"* (never); approval
+asks *"is this CONSENTED?"* (waiting on a person); pre-check asks *"is this POSSIBLE right
+now?"* (not yet). Two gates at phase boundaries — before decompose (a goal that can't be
+planned, e.g. signed out, shouldn't spend a token) and before each actuation (an oven
+online at plan time can be unplugged by the time someone taps Approve). A failed effect
+is **deferred**, not failed: the approval stands and re-applying it once the world
+recovers executes it (the ledger is idempotent). Probes live in the pack
+(`Probes/DeviceStateProbe.cs` + `config/prechecks.json`). **How it helps:** a plan
+blocked by REALITY reads as *Waiting* with a fix ("sign in and this resumes"), distinct
+from blocked-by-safety and blocked-by-approval.
 
-### 8 · Actuator / Effect Executor — `Agent/GoalAgent.ApplyApprovalAsync` (+ `ApprovalCoordinator.MarkExecuted`)
-**What it is:** when an approval frame arrives it flips the ledger decisions and
-invokes the approved proposals *through the kernel* (so the SafetyFilter still
-applies), idempotently. **How it helps:** it's the single, guarded path from
-"approved" to "actually done" — re-applying the same approval is a no-op (safe on
-reconnect/replay), and the resulting `status.executed` is what the UI turns into
-"5 items added ✓".
+### 4 · Task Manager — `Harness/TaskManager/TaskManager.cs`
+A goal is a **task DAG** with a validated lifecycle, not a flat plan. The manager owns the
+ledger and DERIVES the goal-level rollup — `progress_pct`, `pending_tasks`, `next_step` —
+from real task state, never from the clock (v2 had no task model, so any progress bar it
+showed would have been fiction). Every transition streams a `task_update`, which is how
+Agent Board learns what a goal is made of and how far along it is. This folder also hosts
+the two product seams: **`IDomainObserver`** (world-watching + materiality → a scoped
+adaptation `proposal`; `MonitorAdapt` drives it) and **`ISuggester`** (proactive scans of
+local state → `suggestions`). **How it helps:** it turns a one-shot plan into a living,
+measurable one — and it is the honest source of every number the board shows.
 
-### 9 · Scheduler / Temporal — `Harness/Clock/Clock.cs` (`IClock`/`SystemClock`/`SimulatedClock`)
-**What it is:** the generic clock every other module reads. INVARIANT: nothing ever
-hardcodes a date — "today" is the real system date or a simulated date driven by
-`control` frames (`set_date` / `advance_day`); mock-world dates are stored as day
-OFFSETS and resolved against it. **How it helps:** it makes the whole agent
-time-relative, so a demo runs on any calendar date and the presenter can advance
-days to trigger adaptations — without a single date baked into code or data.
+The Task Manager also enables the **two-altitude planner** (`Agent/GoalAgent.cs`):
+altitude one **decomposes** the goal into a task DAG (structure only, no tools; the DAG is
+sanitized in code, fail-soft to a single task); altitude two plans each task grounded in
+the real world via SK auto function-calling. LLM-only at both altitudes.
 
-### 10 · Monitor & Adapt — `Harness/TaskManager/MonitorAdapt.cs` (+ `MaterialityPolicy`)
-**What it is:** after a plan is approved the world keeps moving (a day passes, an
-item expires early, a guest RSVPs an allergy). This compares fresh world state
-against the plan's assumptions, applies the **materiality policy** — deterministic
-code, not the LLM, decides whether a change *matters* — and when it does, produces
-a scoped adaptation `proposal` that re-plans ONLY the affected slice. **How it
-helps:** it turns a one-shot plan into a living one that reacts to reality, while
-the materiality gate prevents noise (4 quiet days, 1 smart adaptation) and the
-scoped re-plan keeps the change cheap and legible.
+### 5 · Product API Adapter — `Harness/ProductApiAdapter/IProductApiAdapter.cs`
+The single interface between the generic harness and a concrete product: the clock, and
+load/save/reset/offset-resolution over the world documents. `MockFamilyHubAdapter`
+implements it over `data/*.json` with the generic-clock rule (dates stored as day
+offsets, resolved at read time). **How it helps:** it is the seam that makes the harness
+product-agnostic — swap the mock for real Tizen/SmartThings calls by writing one new
+implementation; no plugin, no harness code changes.
 
-### 11 · Trace / Explain — `Harness/Trace/Trace.cs`
-**What it is:** one sink, two audiences — structured logs via
-`Microsoft.Extensions.Logging` (leveled, correlation-id-scoped) AND streamed
-`agent_event` frames over the WebSocket (phase / thinking / tool_call / tool_result
-/ plan_progress). Every emit does both; `seq` is monotonic per goal. **How it
-helps:** it makes the agent debuggable *and* demoable from the same events — the
-logs explain a run after the fact, the stream powers the live "watch it think"
-feed the UI renders.
+### Supporting modules, briefly
+- **Grounding** anchors the planner to real facts (a small world digest in the prompt +
+  live plugin calls for the rest), not hallucinated state.
+- **Approval** freezes side-effecting calls into a tiered ledger (auto runs now; light
+  rides the plan approval; firm — money/irreversible — never runs without explicit
+  consent). The durable pause/resume itself is cloud-side (LangGraph `interrupt()`).
+- **Actuator** is the single guarded path from "approved" to "done": it invokes approved
+  proposals *through the kernel* (so safety + precheck still apply), idempotently.
+- **Clock** makes the whole agent time-relative — "today" is real or simulated (`set_date`
+  / `advance_day`), and mock dates are offsets. No date is ever baked into code or data.
+- **Trace** is one sink, two audiences: structured logs AND the streamed `agent_event`
+  frames the UI renders as "watch it think." `seq` is monotonic per goal.
 
-## Capability modules (SK plugins — the LLM's tools)
+## Capability plugins (SK plugins — the LLM's tools)
 
-All in `Products/FamilyHub/Plugins/`, registered in `GoalAgent.BuildKernel`,
-advertised with `kind: "capability"` and per-function
-`side_effecting`/`tier` metadata. Mock-world access goes through
-`MockFamilyHubAdapter` (relative dates; see `data/README.md`).
+All in `Products/FamilyHub/Plugins/`, registered by the one-line pack manifest
+`FamilyHubProduct.AddFamilyHub`, advertised with `kind: "capability"` and per-function
+`side_effecting`/`tier` metadata. World access goes through `IProductApiAdapter`.
 
-**10 capability plugins** (7 implemented + 3 stubs). `MockFamilyHubAdapter` is shared
-infra, not a plugin.
+**11 plugins, all implemented** (the three v2 stubs were implemented in M7; `SecurityPlugin`
+was added in M7).
 
-| Plugin (module name) | Domain | Status | [KernelFunction]s (side-effecting → tier) |
-|---|---|---|---|
-| `InventoryPlugin` (Inventory) | meal | ✅ | `ListItems`, `GetExpiringItems`, `CheckAvailability`, `ConsumeItem`, `MarkConsumed` → auto |
-| `CalendarPlugin` (Calendar) | shared | ✅ | `GetEvents`, `GetBusyEvenings`, `AddEvent` → light |
-| `RecipePlugin` (Recipes) | meal | ✅ | `FindRecipes`, `GetRecipe` |
-| `ShoppingListPlugin` (ShoppingList) | shared | ✅ | `GetList`, `Add` → light, `Remove` → light, `PlaceOrder` → **firm** (spends money) |
-| `ReminderPlugin` (Reminders) | shared | ✅ | `List`, `Create` → auto, `Delete` → auto |
-| `GuestsPlugin` (Guests) | guest_dinner | ✅ | `GetEvent`, `GetGuests`, `GetDietaryConstraints` (read-only; RSVPs + merged allergy/diet constraints) |
-| `ApplianceControlPlugin` (Appliance) | shared (SmartThings) | ✅ | `ListAppliances`, `PreheatOven` → light, `RunProgram` → light, `Defrost` → auto |
-| `FamilyProfilesPlugin` (FamilyProfiles) | shared | 🚧 stub | `GetProfiles`, `GetMember` *(extension point — NotImplementedException)* |
-| `BudgetPlugin` (Budget) | shared | 🚧 stub | `GetBudgetStatus`, `EstimateCost` *(extension point; the cap is enforced by SafetyFilter regardless)* |
-| `NotifyPlugin` (Notify) | shared | 🚧 stub | `SendNotification` → auto, `Announce` → light *(extension point)* |
+| Plugin (module) | Domain | [KernelFunction]s (side-effecting → tier) |
+|---|---|---|
+| `InventoryPlugin` (Inventory) | meal | `ListItems`, `GetExpiringItems`, `CheckAvailability`, `ConsumeItem` → auto |
+| `CalendarPlugin` (Calendar) | shared | `GetEvents`, `GetBusyEvenings`, `AddEvent` → light |
+| `RecipePlugin` (Recipes) | meal | `FindRecipes`, `GetRecipe` |
+| `ShoppingListPlugin` (ShoppingList) | shared | `GetList`, `Add` → light, `Remove` → light, `PlaceOrder` → **firm** (spends money, budget-capped) |
+| `ReminderPlugin` (Reminders) | shared | `List`, `Create` → auto, `Delete` → auto |
+| `GuestsPlugin` (Guests) | guest_dinner | `GetEvent`, `GetGuests`, `GetDietaryConstraints` |
+| `ApplianceControlPlugin` (Appliance) | shared (SmartThings) | `ListAppliances`, `PreheatOven` → light, `RunProgram` → light, `Defrost` → auto |
+| `SecurityPlugin` (Security) | vacation | `GetSecurityStatus`, `LockAllDoors` → auto, `ArmSecurity` → light (camera prechecks) |
+| `FamilyProfilesPlugin` (FamilyProfiles) | shared | `GetProfiles`, `GetMember` |
+| `BudgetPlugin` (Budget) | shared | `GetBudgetStatus`, `EstimateCost` (the cap itself is enforced by the Safety Policy Engine) |
+| `NotifyPlugin` (Notify) | shared | `SendNotification` → auto, `Announce` → light (quiet-hours checked) |
 
-**Generality in one line:** the `guest_dinner` domain (built in v2-M4) adds the
-`GuestsPlugin` and *reuses* Calendar, Reminders, Appliance, ShoppingList and
-Recipes — same 11 steering/harness modules, same protocol, a different toolbox
-subset. Not every goal uses every plugin; the toolbox is composed from the
-registry per goal. Adding a third domain = add its capability plugin(s); the 11
-harness modules don't change.
+## Domain observers, probes, suggester (the product's judgement)
+
+- **Observers** (`Products/FamilyHub/Observers/`): `MealPlanObserver`, `GuestDinnerObserver`,
+  `VacationPrepObserver`, `BirthdayPartyObserver` — one per domain. Registering one IS the
+  domain advertisement the cloud routes on; each captures its slice of the world and
+  decides which changes are material (adaptation).
+- **Probes** (`Products/FamilyHub/Probes/`): `DeviceStateProbe` + `ApplianceOnlineProbe` —
+  the runtime conditions this product's calls need (Samsung account, SmartThings, camera).
+- **Suggester** (`Products/FamilyHub/InventorySuggester.cs`): a deterministic scan of local
+  state → proactive `suggestions` (Expiring Soon, Grocery Restock) the board offers.
+
+**Generality in one line:** four domains (meal, guest, vacation, birthday) run on the same
+five components and the same protocol — a domain is an `IDomainObserver` plus the plugins
+it uses, and the cloud accepts it purely because the device advertises it. Adding a fifth
+domain changes no harness code.
