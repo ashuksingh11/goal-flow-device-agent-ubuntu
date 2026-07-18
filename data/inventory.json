@@ -1,5 +1,5 @@
 {
-  "comment": "GENERIC CLOCK RULE: no absolute dates in mock data. expires_in_days is a day offset from 'today' (IClock.Today — real date, or simulated via control set_date/advance_day). MockWorldStore resolves offsets to ISO dates at read time. null = non-perishable.",
+  "comment": "GENERIC CLOCK RULE: no absolute dates in mock data. expires_in_days is a day offset from 'today' (IClock.Today \u2014 real date, or simulated via control set_date/advance_day). MockWorldStore resolves offsets to ISO dates at read time. null = non-perishable.",
   "items": [
     {
       "id": "inv-001",
@@ -39,7 +39,8 @@
       "quantity": 2,
       "unit": "kg",
       "category": "grain",
-      "expires_in_days": null
+      "expires_in_days": null,
+      "restock_threshold": 3
     },
     {
       "id": "inv-006",
@@ -47,7 +48,8 @@
       "quantity": 500,
       "unit": "g",
       "category": "legume",
-      "expires_in_days": null
+      "expires_in_days": null,
+      "restock_threshold": 600
     },
     {
       "id": "inv-007",
@@ -55,7 +57,8 @@
       "quantity": 8,
       "unit": "pcs",
       "category": "grain",
-      "expires_in_days": 6
+      "expires_in_days": 6,
+      "restock_threshold": 12
     },
     {
       "id": "inv-008",
@@ -63,7 +66,8 @@
       "quantity": 4,
       "unit": "pcs",
       "category": "vegetable",
-      "expires_in_days": 18
+      "expires_in_days": 18,
+      "restock_threshold": 6
     },
     {
       "id": "inv-009",

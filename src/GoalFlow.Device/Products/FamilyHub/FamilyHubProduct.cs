@@ -86,6 +86,11 @@ public static class FamilyHubProduct
         services.AddSingleton<IDomainObserver, VacationPrepObserver>();
         services.AddSingleton<IDomainObserver, BirthdayPartyObserver>();
 
+        // Proactive suggestions (v3-M8): scans of local state that propose goals the
+        // family hasn't asked for. The harness collects every ISuggester; the product
+        // decides what is worth suggesting.
+        services.AddSingleton<ISuggester, InventorySuggester>();
+
         // Pre-checks: which of this product's runtime conditions matter, and how to
         // ask. Only the Family Hub knows it has an oven and a Samsung account.
         services.AddSingleton(_ => PrecheckBindings.Load(PrechecksPath));

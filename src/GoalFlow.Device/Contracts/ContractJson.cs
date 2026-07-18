@@ -57,6 +57,7 @@ public static class MessageTypes
     public const string Proposal = "proposal";
     public const string Status = "status";
     public const string Control = "control";
+    public const string Suggestions = "suggestions";
 }
 
 /// <summary>
