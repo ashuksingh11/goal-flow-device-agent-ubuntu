@@ -58,6 +58,7 @@ public static class MessageTypes
     public const string Status = "status";
     public const string Control = "control";
     public const string Suggestions = "suggestions";
+    public const string DayAdvanced = "day_advanced";
 }
 
 /// <summary>

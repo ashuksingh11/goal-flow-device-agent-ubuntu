@@ -242,9 +242,23 @@ if (options.ConnectUrl is { } url)
                         await ws.SendAsync(await agent.ApplyApprovalAsync(ContractJson.Deserialize<Approval>(raw)));
                         break;
                     case MessageTypes.Control:
-                        var (status, proposal) = await agent.HandleControlAsync(ContractJson.Deserialize<Control>(raw));
-                        await ws.SendAsync(status);
-                        if (proposal is not null) await ws.SendAsync(proposal);
+                        var control = ContractJson.Deserialize<Control>(raw);
+                        if (string.IsNullOrEmpty(control.GoalId) && control.Command != ControlCommands.TriggerEvent)
+                        {
+                            // WORLD-level tick (v3.2): advance the clock once, fan out to
+                            // every active goal, and summarise the day's world events.
+                            var world = await agent.HandleWorldControlAsync(control);
+                            foreach (var s in world.Statuses) await ws.SendAsync(s);
+                            foreach (var p in world.Proposals) await ws.SendAsync(p);
+                            if (world.DayAdvanced is not null) await ws.SendAsync(world.DayAdvanced);
+                        }
+                        else
+                        {
+                            // Per-goal control (a trigger_event) — the older scoped path.
+                            var (status, proposal) = await agent.HandleControlAsync(control);
+                            await ws.SendAsync(status);
+                            if (proposal is not null) await ws.SendAsync(proposal);
+                        }
                         // The world moved (advance_day / reset / set_date) — re-scan so a
                         // suggestion that just came true or went stale is reflected.
                         await EmitSuggestionsAsync();
