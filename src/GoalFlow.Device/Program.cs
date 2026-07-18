@@ -169,6 +169,12 @@ if (options.VerifyPrechecks)
     return;
 }
 
+if (options.VerifySuggestions)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifySuggestionsAsync(provider);
+    return;
+}
+
 if (options.VerifyDeadline)
 {
     Environment.ExitCode = await ProgramHelpers.VerifyDeadlineAsync(loggerFactory);
@@ -191,6 +197,31 @@ if (options.ConnectUrl is { } url)
     var capabilities = provider.GetRequiredService<CapabilityManager>().BuildCapabilitiesMessage(kernel);
     var connectLogger = loggerFactory.CreateLogger("Connect");
     await ws.ConnectAsync(capabilities);
+
+    // Proactive suggestions (v3-M8): scan local state and offer goals the family
+    // hasn't asked for. Emitted on connect (so the board shows them immediately) and
+    // after every control tick — advance_day / reset move the world, which can make
+    // new food expire or a restock no longer needed, so the list is recomputed rather
+    // than left stale.
+    var suggesters = provider.GetServices<ISuggester>().ToArray();
+    async Task EmitSuggestionsAsync()
+    {
+        try
+        {
+            var items = new List<SuggestionItem>();
+            foreach (var suggester in suggesters)
+            {
+                items.AddRange(await suggester.ScanAsync());
+            }
+            await ws.SendAsync(new SuggestionsMessage { Items = items });
+            connectLogger.LogInformation("suggestions emitted count={Count}", items.Count);
+        }
+        catch (Exception ex)
+        {
+            connectLogger.LogError(ex, "suggestion scan failed");
+        }
+    }
+    await EmitSuggestionsAsync();
     // Handle each frame on a BACKGROUND task so the receive loop keeps pumping —
     // planning takes 30-60s of LLM calls, and blocking the loop here means the
     // device can't answer WS pings, so the cloud's keepalive closes the socket
@@ -214,6 +245,9 @@ if (options.ConnectUrl is { } url)
                         var (status, proposal) = await agent.HandleControlAsync(ContractJson.Deserialize<Control>(raw));
                         await ws.SendAsync(status);
                         if (proposal is not null) await ws.SendAsync(proposal);
+                        // The world moved (advance_day / reset / set_date) — re-scan so a
+                        // suggestion that just came true or went stale is reflected.
+                        await EmitSuggestionsAsync();
                         break;
                 }
             }
@@ -308,6 +342,9 @@ internal sealed record CliOptions
     /// <summary>--verify-prechecks — assert the runtime gates pass, block and defer correctly (M3 gate).</summary>
     public bool VerifyPrechecks { get; init; }
 
+    /// <summary>--verify-suggestions — assert the proactive scan is deterministic and well-formed (M8 gate).</summary>
+    public bool VerifySuggestions { get; init; }
+
     /// <summary>--verify-trace-isolation — assert concurrent goals don't collide on goal_id/seq (M5 gate).</summary>
     public bool VerifyTraceIsolation { get; init; }
 
@@ -358,6 +395,7 @@ internal sealed record CliOptions
                 "--verify-grades" => options with { VerifyGrades = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
+                "--verify-suggestions" => options with { VerifySuggestions = true },
                 "--verify-trace-isolation" => options with { VerifyTraceIsolation = true },
                 "--verify-deadline" => options with { VerifyDeadline = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
@@ -488,6 +526,47 @@ public static async Task<int> VerifyTraceIsolationAsync(ILoggerFactory loggerFac
 /// that does nothing does.
 /// </para>
 /// </summary>
+/// <summary>
+/// --verify-suggestions (M8 gate 18): the proactive scan is deterministic and
+/// well-formed. Runs the real ISuggester chain against the seed inventory and asserts
+/// the shape a demo depends on — the same suggestions every run, each acceptable into a
+/// goal. A scan is only useful if it's repeatable; an LLM here would make the board
+/// flicker between runs, which is why the suggester is a scan, and why this can gate it.
+/// </summary>
+public static async Task<int> VerifySuggestionsAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    void Check(bool ok, string what) { if (!ok) { failures.Add(what); Console.WriteLine($"  FAIL {what}"); } }
+
+    var suggesters = provider.GetServices<ISuggester>().ToArray();
+    Check(suggesters.Length > 0, "at least one suggester is registered");
+
+    var items = new List<SuggestionItem>();
+    foreach (var s in suggesters) items.AddRange(await s.ScanAsync());
+
+    // Determinism: two scans of unchanged state produce the identical list.
+    var again = new List<SuggestionItem>();
+    foreach (var s in suggesters) again.AddRange(await s.ScanAsync());
+    Check(items.Count == again.Count && items.Zip(again).All(p => p.First.Id == p.Second.Id),
+        "the scan is deterministic — same suggestions on a repeat with unchanged state");
+
+    var byKind = items.ToDictionary(i => i.Kind, i => i);
+    Check(byKind.ContainsKey("expiring"), "an 'expiring' suggestion is produced from the seed inventory");
+    Check(byKind.ContainsKey("restock"), "a 'restock' suggestion is produced from the seed inventory");
+
+    // Well-formed: every suggestion must be acceptable into a goal, so goal_text and id
+    // are non-empty — an empty goal_text would submit a blank user_goal.
+    foreach (var it in items)
+    {
+        Check(!string.IsNullOrWhiteSpace(it.Id), $"suggestion has an id ({it.Kind})");
+        Check(!string.IsNullOrWhiteSpace(it.GoalText), $"suggestion '{it.Id}' carries a goal_text to submit on accept");
+        Check(!string.IsNullOrWhiteSpace(it.Title), $"suggestion '{it.Id}' has a title");
+    }
+
+    Console.WriteLine(failures.Count == 0 ? "gate 18 (proactive suggestions scan): PASS" : $"gate 18 (proactive suggestions scan): FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
+}
+
 public static async Task<int> VerifyPrechecksAsync(IServiceProvider provider, string dataDir)
 {
     var failures = new List<string>();
