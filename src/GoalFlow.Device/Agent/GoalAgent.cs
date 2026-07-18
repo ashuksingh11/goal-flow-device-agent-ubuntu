@@ -191,6 +191,123 @@ public sealed class GoalAgent
     public Task<(Status Status, Proposal? Adaptation)> HandleControlAsync(Control control, CancellationToken ct = default)
         => HandleControlCoreAsync(control, ct);
 
+    /// <summary>
+    /// A WORLD-level clock command (no goal_id): advance the GLOBAL clock EXACTLY ONCE,
+    /// then fan out over every active goal — observe each, emit its status (+ an
+    /// adaptation proposal when a material change is newly surfaced) — and summarise the
+    /// day's world events as one <see cref="DayAdvanced"/>. The clock is device-wide, so
+    /// one tick moves the whole world; the per-goal machinery (each <see cref="GoalRecord"/>
+    /// owns its snapshot + <c>EmittedMaterialChanges</c> dedup) already exists.
+    /// </summary>
+    public async Task<ControlResult> HandleWorldControlAsync(Control control, CancellationToken ct = default)
+    {
+        // Advance the one global clock exactly once.
+        if (_clock is SimulatedClock sim)
+        {
+            if (control.Command == ControlCommands.SetDate && control.Payload?.Date is { } date)
+                sim.SetDate(date);
+            else if (control.Command == ControlCommands.AdvanceDay)
+                sim.AdvanceDay();
+        }
+
+        if (control.Command == ControlCommands.Reset)
+        {
+            var store = _kernel.Services.GetRequiredService<IProductApiAdapter>();
+            await store.ResetAsync(ct);
+            // A world reset clears every goal for a clean slate.
+            foreach (var g in _tasks.ActiveGoals)
+            {
+                _tasks.RemoveGoal(g.Dispatch.GoalId);
+                _safety.RemoveGoal(g.Dispatch.GoalId);
+            }
+            return new ControlResult(
+                Array.Empty<Status>(),
+                Array.Empty<Proposal>(),
+                new DayAdvanced { SimDate = _clock.Today.ToString("yyyy-MM-dd"), Day = 0, Events = [] });
+        }
+
+        var statuses = new List<Status>();
+        var proposals = new List<Proposal>();
+        var events = new Dictionary<string, DayEvent>(StringComparer.Ordinal);
+
+        foreach (var goal in _tasks.ActiveGoals)
+        {
+            var goalId = goal.Dispatch.GoalId;
+            using var scope = _trace.BeginGoalScope(goalId, goal.Dispatch.CorrelationId);
+            using var policy = _safety.EnterGoal(goalId);
+
+            // A monitored goal finishes when its window closes — the calendar decides, not the agent.
+            if (await CompleteIfWindowPassedAsync(goal, ct))
+            {
+                statuses.Add(BuildMonitoringStatus(goalId, goal.Dispatch.CorrelationId, false,
+                    $"goal complete — its time window closed on {goal.Dispatch.TimeWindow?.End}.{ProgressNote(goal)}", null)
+                    with { TaskStatus = TaskStatuses.Done });
+                continue;
+            }
+
+            var changes = await _monitor.ObserveAsync(goal, ct);
+            var material = changes.FirstOrDefault(c => c.Material && goal.EmittedMaterialChanges.Add(c.Key));
+            if (material is not null)
+            {
+                await _trace.PhaseAsync("adapting");
+                var proposal = material.Steer is not null
+                    ? await ProposeDailyAdaptationAsync(goalId, goal, material, ct)
+                    : await _monitor.ProposeAdaptationAsync(goalId, material, ct);
+                if (proposal is not null)
+                {
+                    proposals.Add(proposal with { CorrelationId = goal.Dispatch.CorrelationId });
+                }
+                statuses.Add(BuildMonitoringStatus(goalId, goal.Dispatch.CorrelationId, true, $"material: {material.Description}"));
+                AddDayEvent(events, material, goalId);
+            }
+            else
+            {
+                var quiet = changes.Any(c => c.Material)
+                    ? "on track; material change already surfaced for approval."
+                    : "on track; no material world changes affect the active plan.";
+                statuses.Add(BuildMonitoringStatus(goalId, goal.Dispatch.CorrelationId, false, quiet));
+            }
+        }
+
+        var summary = new DayAdvanced
+        {
+            SimDate = _clock.Today.ToString("yyyy-MM-dd"),
+            Day = ComputeSimDay(),
+            Events = events.Values.ToArray()
+        };
+        return new ControlResult(statuses, proposals, summary);
+    }
+
+    /// <summary>Record a material world change against the day summary, merging goal_ids across goals.</summary>
+    private static void AddDayEvent(Dictionary<string, DayEvent> events, WorldChange change, string goalId)
+    {
+        if (events.TryGetValue(change.Key, out var existing))
+        {
+            events[change.Key] = existing with { GoalIds = [.. existing.GoalIds, goalId] };
+            return;
+        }
+        events[change.Key] = new DayEvent
+        {
+            Id = change.Key,
+            Title = change.Description,
+            Kind = change.Kind,
+            Summary = change.Description,
+            GoalIds = [goalId]
+        };
+    }
+
+    /// <summary>1-based sim day, measured from the earliest active goal's window start.</summary>
+    private int ComputeSimDay()
+    {
+        var starts = _tasks.ActiveGoals
+            .Select(g => DateOnly.TryParse(g.Dispatch.TimeWindow?.Start, out var s) ? s : (DateOnly?)null)
+            .Where(s => s.HasValue)
+            .Select(s => s!.Value)
+            .ToArray();
+        if (starts.Length == 0) return 0;
+        return Math.Max(1, _clock.Today.DayNumber - starts.Min().DayNumber + 1);
+    }
+
     private const int MaxComposeAttempts = 3;
 
     /// <summary>
