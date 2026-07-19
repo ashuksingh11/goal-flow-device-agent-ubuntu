@@ -423,7 +423,22 @@ public sealed class GoalAgent
     /// </summary>
     private async Task<bool> CompleteIfWindowPassedAsync(GoalRecord goal, CancellationToken ct)
     {
-        if (!DateOnly.TryParse(goal.Dispatch.TimeWindow.End, out var end) || _clock.Today <= end)
+        // A plan is complete once the clock passes its LAST DAY. Derive that from the
+        // plan's OWN day span (Day 1..N, anchored at the dispatch start) rather than the
+        // LLM's dispatch-window end — so completion lines up with the board's day-by-day
+        // progress reaching 100%. Fall back to the dispatch window end when there is no plan.
+        DateOnly lastDay;
+        if (DateOnly.TryParse(goal.Dispatch.TimeWindow?.Start, out var start) && goal.Plan.Count > 0)
+        {
+            var maxDay = Math.Max(1, goal.Plan.Max(p => p.Day));
+            lastDay = start.AddDays(maxDay - 1);
+        }
+        else if (!DateOnly.TryParse(goal.Dispatch.TimeWindow?.End, out lastDay))
+        {
+            return false;
+        }
+
+        if (_clock.Today <= lastDay)
         {
             return false;
         }
@@ -439,8 +454,8 @@ public sealed class GoalAgent
             await _tasks.TransitionAsync(goal.Dispatch.GoalId, task.TaskId, TaskState.Completed);
         }
 
-        _logger.LogInformation("goal_complete {GoalId} window_end={End} progress={Progress}%",
-            goal.Dispatch.GoalId, goal.Dispatch.TimeWindow.End, goal.ProgressPercent);
+        _logger.LogInformation("goal_complete {GoalId} last_day={LastDay} progress={Progress}%",
+            goal.Dispatch.GoalId, lastDay, goal.ProgressPercent);
         return true;
     }
 
@@ -1265,8 +1280,8 @@ public sealed class GoalAgent
         }
 
         // Effects are done; the plan now lives in the world and the observers watch
-        // it. Monitoring is not "finished" — a meal week is only complete when its
-        // last day has passed — so tasks rest here, not at Completed.
+        // it. Monitoring is not "finished" — a plan is only complete when its last day
+        // has passed — so tasks rest here, not at Completed.
         await AdvanceTasksAsync(approval.GoalId, TaskState.Executing, TaskState.Monitoring);
         var progress = _tasks.GetGoal(approval.GoalId);
 
@@ -1274,7 +1289,10 @@ public sealed class GoalAgent
         {
             GoalId = approval.GoalId,
             CorrelationId = approval.CorrelationId,
-            TaskStatus = TaskStatuses.Done,
+            // The goal is now MONITORING day by day, NOT done — reporting Done here made
+            // the board jump to "completed, 100%" the instant a plan was approved. It
+            // finishes only when its window/plan passes (CompleteIfWindowPassedAsync).
+            TaskStatus = TaskStatuses.Monitoring,
             Payload = new StatusPayload
             {
                 SimDate = _clock.Today.ToString("yyyy-MM-dd"),
