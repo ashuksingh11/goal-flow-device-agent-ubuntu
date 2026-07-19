@@ -13,7 +13,12 @@
     "",
     "watchlist = the staples this goal tracks (typical price + weekly burn), so the planner can",
     "reason about buy-ahead vs defer. pending_updates is the week's script, staggered against",
-    "the other domains: an offer on day 2, a stock-out on day 4, a price rise on day 7."
+    "the other domains: an offer on day 2, a stock-out on day 4, a price rise on day 6.",
+    "",
+    "KEEP EVENTS AT day <= 6. A 7-item plan COMPLETES on day 7 (the clock passes the plan's",
+    "last day), and a completing goal skips observation that tick — so an event authored on",
+    "day 7 can never fire. Day 6 deliberately carries this AND energy's standby event, so one",
+    "Advance day visibly moves two different goals."
   ],
   "watchlist": [
     { "item": "milk",   "typical_price": 3.20, "unit": "L",     "weekly_use": 4 },
@@ -58,7 +63,7 @@
     {
       "id": "gro-upd-003",
       "kind": "grocery.price_rose",
-      "activation_day_offset": 7,
+      "activation_day_offset": 6,
       "item": "rice",
       "was": 3.50,
       "now": 4.13,
