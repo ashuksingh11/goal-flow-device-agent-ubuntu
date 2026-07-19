@@ -101,9 +101,13 @@ plan = p["payload"]["plan"]
 assert len(plan) == 7, f"expected 7 dinners, got {len(plan)}"
 assert [i["day"] for i in plan] == [1,2,3,4,5,6,7], [i["day"] for i in plan]
 assert p["payload"]["safety"]["gate"] == "passed", p["payload"]["safety"]
+# The COMPLETE set of [SideEffect] functions across the FamilyHub plugins (14). Kept in
+# sync with the proposal catalog in GoalAgent.BuildPlanningInstruction — the gate proves
+# the planner never invents a target outside what the device can actually execute.
 known = {"ShoppingList.Add","ShoppingList.Remove","ShoppingList.PlaceOrder","Appliance.PreheatOven",
          "Appliance.RunProgram","Appliance.Defrost","Reminders.Create","Reminders.Delete",
-         "Calendar.AddEvent","Inventory.ConsumeItem"}
+         "Calendar.AddEvent","Inventory.ConsumeItem","Security.LockAllDoors","Security.ArmSecurity",
+         "Notify.SendNotification","Notify.Announce"}
 got = {x["module"] + "." + x["function"] for x in p["payload"]["proposals"]}
 assert got <= known, f"unknown proposal targets: {got - known}"
 print("gate 4 (simulate-week shape): PASS")'

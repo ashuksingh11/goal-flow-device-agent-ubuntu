@@ -603,9 +603,14 @@ public sealed class GoalAgent
 
         Grounding rules:
         - This is LLM-only planning. Use Semantic Kernel read-only tools for grounding; do not invent inventory, calendar, recipe, reminder, or shopping-list facts.
-        - Call these read tools when relevant: Inventory.ListItems, Inventory.GetExpiringItems, Calendar.GetBusyEvenings, Calendar.GetEvents, Recipes.FindRecipes, ShoppingList.GetList, Reminders.List, Guests.GetEvent, Guests.GetGuests, Guests.GetDietaryConstraints, Appliance.ListAppliances.
+        - Call these read tools when relevant: Inventory.ListItems, Inventory.GetExpiringItems, Inventory.CheckAvailability, Calendar.GetEvents, Calendar.GetBusyEvenings, Recipes.FindRecipes, Recipes.GetRecipe, ShoppingList.GetList, Reminders.List, Guests.GetEvent, Guests.GetGuests, Guests.GetDietaryConstraints, Appliance.ListAppliances, FamilyProfiles.GetProfiles, FamilyProfiles.GetMember, Budget.GetBudgetStatus, Budget.EstimateCost, Security.GetSecurityStatus.
+        - Ground what THIS contract's domain needs — not what a meal week would need.
         - Guest tools are relevant only when the contract domain/objective/scope/context mentions guests, hosting, RSVPs, or a dinner party. Do not use guest data for an ordinary meal_plan goal.
         - For domain guest_dinner, ground guests, dietary constraints, appliance state, recipes, inventory, calendar, shopping list, and reminders; Appliance.ListAppliances is the read-only source for oven/dishwasher/fridge availability.
+        - For domain vacation_prep, ground Security.GetSecurityStatus, Appliance.ListAppliances, Calendar.GetEvents for the departure and return, and Inventory.GetExpiringItems for perishables that would spoil while the house is empty.
+        - For domain grocery_cost, ground Inventory.ListItems, ShoppingList.GetList, Budget.GetBudgetStatus and Budget.EstimateCost — the basket has to be priced, not guessed.
+        - For domain energy_saving, ground Appliance.ListAppliances (each appliance carries its energy draw) and Calendar.GetBusyEvenings for when the household actually needs them.
+        - For domain birthday_party, ground FamilyProfiles, Budget.GetBudgetStatus, Calendar.GetEvents and Guests where a guest list exists.
         - During planning side effects are intentionally not exposed as tools.
         - Do not produce the final plan yet.
         - Return a concise grounding summary of the facts, constraints, candidate recipes, missing items, and scheduling context that the final plan must use.
@@ -621,16 +626,31 @@ public sealed class GoalAgent
         - Use the grounded facts and tool results already present in this conversation. Do not call tools in this step.
         - During planning side effects are intentionally not exposed as tools. Propose mutations in the final JSON instead.
         - Proposal module/function/args must match real side-effecting functions exactly.
-        - Valid side-effecting guest-dinner proposal functions include:
+        - Valid side-effecting proposal functions — ALL domains draw from this one list, with these exact arg shapes:
           ShoppingList.Add args {"items":["..."],"reason":"..."}
+          ShoppingList.Remove args {"items":["..."]}
           ShoppingList.PlaceOrder args {"estimatedTotal":42.50}
           Appliance.PreheatOven args {"targetC":180,"atTime":"YYYY-MM-DDTHH:mm"}
           Appliance.RunProgram args {"appliance":"dishwasher","program":"eco","atTime":"YYYY-MM-DDTHH:mm"}
           Appliance.Defrost args {"item":"...","atTime":"YYYY-MM-DDTHH:mm"}
           Reminders.Create args {"title":"...","date":"YYYY-MM-DD","time":"HH:mm"}
+          Reminders.Delete args {"id":"rem-001"}
+          Calendar.AddEvent args {"title":"...","date":"YYYY-MM-DD","start":"HH:mm","end":"HH:mm"}
+          Inventory.ConsumeItem args {"name":"spinach","quantity":1}
+          Security.LockAllDoors args {}
+          Security.ArmSecurity args {"mode":"away"}
+          Notify.SendNotification args {"member":"Priya","message":"..."}
+          Notify.Announce args {"message":"...","date":"YYYY-MM-DD","time":"HH:mm"}
         - Do not invent proposal functions such as Appliance.Preheat, Reminders.Add, or Reminder.Create.
-        - For meal_plan goals, produce EXACTLY 7 dinner plan items for a one-week plan — Day 1 through Day 7 — no more and no fewer. Do not tie the count to any dates.
-        - For guest_dinner, include a menu that honors guest dietary constraints, a prep timeline whose plan item "when" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders.
+        - PLAN SHAPE — take the shape from the contract's DOMAIN. Only meal_plan is a week of
+          dinners; NEVER fall back to a dinner list for any other domain:
+          meal_plan      produce EXACTLY 7 dinner plan items for a one-week plan — Day 1 through Day 7 — no more and no fewer. Do not tie the count to any dates.
+          guest_dinner   a menu that honors guest dietary constraints, plus a prep timeline whose plan item "when" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders.
+          vacation_prep  a pre-departure checklist, NOT meals: finish or freeze the perishables that would spoil while the house is empty, clear the shopping list of standing orders, set appliances to eco or off, run the dishwasher before leaving, then lock up and arm security for the away period. Security.LockAllDoors and Security.ArmSecurity belong here.
+          birthday_party invitations and headcount, cake and supplies costed inside the budget cap, and a day-of schedule.
+          grocery_cost   a restock and spend plan: what to buy now, what to defer, what to substitute cheaper — priced against the budget cap, not guessed.
+          energy_saving  a scheduling plan against the savings target: shift heavy appliance runs into the off-peak window, prefer eco programs, and cut standby waste.
+          For any other domain, infer the shape from the objective: a checklist of concrete steps toward THAT outcome. The number of items follows the work, not a fixed count.
         - For guest_dinner appliance prep, prefer concrete proposals when grounded appliances support them: Appliance.PreheatOven before an oven-warmed dish, Appliance.RunProgram for dishwasher cleanup before quiet_hours, and Appliance.Defrost only when a frozen item needs thawing.
         - Do not propose ingredients or recipes that violate hard constraints.
         - Propose AT MOST 5 side-effecting actions. NEVER emit duplicate proposals. Consolidate a
