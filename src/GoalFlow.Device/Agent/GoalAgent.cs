@@ -745,7 +745,7 @@ public sealed class GoalAgent
 
         await _trace.PhaseAsync("planning");
         var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
-        modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan) };
+        modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan, dispatch.Domain) };
 
         await _trace.PhaseAsync("checking");
         // Collapse duplicate proposals the model sometimes emits (e.g. the same
@@ -1221,8 +1221,73 @@ public sealed class GoalAgent
         return (ordered, changed);
     }
 
-    private static IReadOnlyList<PlanItem> AssignPlanDays(IReadOnlyList<PlanItem> plan)
-        => plan.Take(7).Select((item, index) => item with { Day = index + 1 }).ToArray();
+    /// <summary>
+    /// Stamps each plan item's 1-based <see cref="PlanItem.Day"/>.
+    ///
+    /// <para>
+    /// Day is NOT cosmetic: the device completes a goal at <c>Plan.Max(p =&gt; p.Day)</c> and
+    /// the cloud sizes the progress window from the same span, so a fabricated day count
+    /// stretches a goal across days it does not occupy.
+    /// </para>
+    ///
+    /// <para>
+    /// This used to be <c>plan.Take(7).Select((item, i) =&gt; item with { Day = i + 1 })</c>
+    /// for EVERY domain, which did two wrong things off the meal path: it silently dropped
+    /// items past the seventh, and it renumbered by POSITION. A vacation checklist whose
+    /// five steps all happen on departure evening (08:00, 19:00, 20:00, 20:05) became a
+    /// five-DAY goal creeping at 20%/day, still unfinished after the family had left.
+    /// </para>
+    ///
+    /// <para>
+    /// So: meal_plan keeps the ordinal — a dinner week IS one item per day by construction,
+    /// and the compose prompt asks for exactly seven. Every other domain derives the day
+    /// from the item's own <c>when</c> date relative to the earliest item, so same-day work
+    /// shares a day and the span reflects the real calendar.
+    /// </para>
+    /// </summary>
+    private static IReadOnlyList<PlanItem> AssignPlanDays(IReadOnlyList<PlanItem> plan, string domain)
+    {
+        if (plan.Count == 0)
+        {
+            return plan;
+        }
+
+        if (string.Equals(domain, "meal_plan", StringComparison.Ordinal))
+        {
+            return plan.Take(7).Select((item, index) => item with { Day = index + 1 }).ToArray();
+        }
+
+        var dates = plan.Select(item => ParseWhenDate(item.When)).ToArray();
+        var anchor = dates.Where(d => d.HasValue).Select(d => d!.Value).DefaultIfEmpty().Min();
+
+        // No item carried a usable date — fall back to the old ordinal so Day stays 1-based
+        // and monotonic rather than collapsing the whole plan onto day 0.
+        if (anchor == default)
+        {
+            return plan.Select((item, index) => item with { Day = index + 1 }).ToArray();
+        }
+
+        return plan
+            .Select((item, index) => item with
+            {
+                // An undated item among dated ones is scheduled "whenever" — anchor it to
+                // day 1 so it surfaces first rather than inventing a day for it.
+                Day = dates[index] is { } d ? d.DayNumber - anchor.DayNumber + 1 : 1
+            })
+            .ToArray();
+    }
+
+    /// <summary>Date half of an ISO "YYYY-MM-DD" or "YYYY-MM-DDTHH:mm" plan item time.</summary>
+    private static DateOnly? ParseWhenDate(string? when)
+    {
+        if (string.IsNullOrWhiteSpace(when))
+        {
+            return null;
+        }
+
+        var datePart = when.Split('T')[0];
+        return DateOnly.TryParse(datePart, out var parsed) ? parsed : null;
+    }
 
     private async Task<Status> ApplyApprovalCoreAsync(Approval approval, CancellationToken ct)
     {
