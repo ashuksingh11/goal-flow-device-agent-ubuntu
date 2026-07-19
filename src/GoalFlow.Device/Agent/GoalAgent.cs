@@ -616,6 +616,40 @@ public sealed class GoalAgent
         - Return a concise grounding summary of the facts, constraints, candidate recipes, missing items, and scheduling context that the final plan must use.
         """;
 
+    /// <summary>
+    /// The plan shape for ONE domain — the only one injected into the compose prompt.
+    ///
+    /// <para>
+    /// v3.5 first shipped this as a table of all six shapes in the prompt. That worked,
+    /// but it sent five irrelevant shapes on every call: ~1.7k extra characters, and
+    /// more branching for the model to reason through before it could start writing.
+    /// On a reasoning model that inflates REASONING tokens, which is the slow half of
+    /// the call, and pushes a 90s compose toward its deadline (see
+    /// <see cref="LlmCallBudget"/>) or an empty response under json response_format.
+    /// The contract names exactly one domain, so only that shape is worth sending —
+    /// shorter AND sharper, since the meal shape is no longer in front of a model
+    /// planning a vacation. That bleed was the original bug.
+    /// </para>
+    /// </summary>
+    internal static string PlanShapeRule(string domain) => domain switch
+    {
+        "meal_plan" =>
+            "produce EXACTLY 7 dinner plan items for a one-week plan — Day 1 through Day 7 — no more and no fewer. Do not tie the count to any dates.",
+        "guest_dinner" =>
+            "a menu that honors guest dietary constraints, plus a prep timeline whose plan item \"when\" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders. "
+            + "Prefer concrete appliance proposals when the grounded appliances support them: Appliance.PreheatOven before an oven-warmed dish, Appliance.RunProgram for dishwasher cleanup before quiet_hours, and Appliance.Defrost only when a frozen item needs thawing.",
+        "vacation_prep" =>
+            "a pre-departure checklist, NOT meals: finish or freeze the perishables that would spoil while the house is empty, clear the shopping list of standing orders, set appliances to eco or off, run the dishwasher before leaving, then lock up and arm security for the away period. Security.LockAllDoors and Security.ArmSecurity belong here.",
+        "birthday_party" =>
+            "invitations and headcount, cake and supplies costed inside the budget cap, and a day-of schedule.",
+        "grocery_cost" =>
+            "a restock and spend plan: what to buy now, what to defer, what to substitute cheaper — priced against the budget cap, not guessed.",
+        "energy_saving" =>
+            "a scheduling plan against the savings target: shift heavy appliance runs into the off-peak window, prefer eco programs, and cut standby waste.",
+        _ =>
+            "infer the shape from the objective: a checklist of concrete steps toward THAT outcome. The number of items follows the work, not a fixed count. Do not produce a week of dinners unless the goal is genuinely about planning meals.",
+    };
+
     /// <summary>The final no-tools compose instruction rendered from the contract.</summary>
     internal static string BuildPlanningInstruction(Dispatch dispatch)
         => $$"""
@@ -642,16 +676,7 @@ public sealed class GoalAgent
           Notify.SendNotification args {"member":"Priya","message":"..."}
           Notify.Announce args {"message":"...","date":"YYYY-MM-DD","time":"HH:mm"}
         - Do not invent proposal functions such as Appliance.Preheat, Reminders.Add, or Reminder.Create.
-        - PLAN SHAPE — take the shape from the contract's DOMAIN. Only meal_plan is a week of
-          dinners; NEVER fall back to a dinner list for any other domain:
-          meal_plan      produce EXACTLY 7 dinner plan items for a one-week plan — Day 1 through Day 7 — no more and no fewer. Do not tie the count to any dates.
-          guest_dinner   a menu that honors guest dietary constraints, plus a prep timeline whose plan item "when" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders.
-          vacation_prep  a pre-departure checklist, NOT meals: finish or freeze the perishables that would spoil while the house is empty, clear the shopping list of standing orders, set appliances to eco or off, run the dishwasher before leaving, then lock up and arm security for the away period. Security.LockAllDoors and Security.ArmSecurity belong here.
-          birthday_party invitations and headcount, cake and supplies costed inside the budget cap, and a day-of schedule.
-          grocery_cost   a restock and spend plan: what to buy now, what to defer, what to substitute cheaper — priced against the budget cap, not guessed.
-          energy_saving  a scheduling plan against the savings target: shift heavy appliance runs into the off-peak window, prefer eco programs, and cut standby waste.
-          For any other domain, infer the shape from the objective: a checklist of concrete steps toward THAT outcome. The number of items follows the work, not a fixed count.
-        - For guest_dinner appliance prep, prefer concrete proposals when grounded appliances support them: Appliance.PreheatOven before an oven-warmed dish, Appliance.RunProgram for dishwasher cleanup before quiet_hours, and Appliance.Defrost only when a frozen item needs thawing.
+        - PLAN SHAPE for this goal's domain ({{dispatch.Domain}}) — {{PlanShapeRule(dispatch.Domain)}}
         - Do not propose ingredients or recipes that violate hard constraints.
         - Propose AT MOST 5 side-effecting actions. NEVER emit duplicate proposals. Consolidate a
           recurring action (e.g. a nightly dishwasher run) into ONE proposal, not one per night. Keep
