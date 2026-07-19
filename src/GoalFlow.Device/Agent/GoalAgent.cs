@@ -603,9 +603,14 @@ public sealed class GoalAgent
 
         Grounding rules:
         - This is LLM-only planning. Use Semantic Kernel read-only tools for grounding; do not invent inventory, calendar, recipe, reminder, or shopping-list facts.
-        - Call these read tools when relevant: Inventory.ListItems, Inventory.GetExpiringItems, Calendar.GetBusyEvenings, Calendar.GetEvents, Recipes.FindRecipes, ShoppingList.GetList, Reminders.List, Guests.GetEvent, Guests.GetGuests, Guests.GetDietaryConstraints, Appliance.ListAppliances.
+        - Call these read tools when relevant: Inventory.ListItems, Inventory.GetExpiringItems, Inventory.CheckAvailability, Calendar.GetEvents, Calendar.GetBusyEvenings, Recipes.FindRecipes, Recipes.GetRecipe, ShoppingList.GetList, Reminders.List, Guests.GetEvent, Guests.GetGuests, Guests.GetDietaryConstraints, Appliance.ListAppliances, FamilyProfiles.GetProfiles, FamilyProfiles.GetMember, Budget.GetBudgetStatus, Budget.EstimateCost, Security.GetSecurityStatus.
+        - Ground what THIS contract's domain needs — not what a meal week would need.
         - Guest tools are relevant only when the contract domain/objective/scope/context mentions guests, hosting, RSVPs, or a dinner party. Do not use guest data for an ordinary meal_plan goal.
         - For domain guest_dinner, ground guests, dietary constraints, appliance state, recipes, inventory, calendar, shopping list, and reminders; Appliance.ListAppliances is the read-only source for oven/dishwasher/fridge availability.
+        - For domain vacation_prep, ground Security.GetSecurityStatus, Appliance.ListAppliances, Calendar.GetEvents for the departure and return, and Inventory.GetExpiringItems for perishables that would spoil while the house is empty.
+        - For domain grocery_cost, ground Inventory.ListItems, ShoppingList.GetList, Budget.GetBudgetStatus and Budget.EstimateCost — the basket has to be priced, not guessed.
+        - For domain energy_saving, ground Appliance.ListAppliances (each appliance carries its energy draw) and Calendar.GetBusyEvenings for when the household actually needs them.
+        - For domain birthday_party, ground FamilyProfiles, Budget.GetBudgetStatus, Calendar.GetEvents and Guests where a guest list exists.
         - During planning side effects are intentionally not exposed as tools.
         - Do not produce the final plan yet.
         - Return a concise grounding summary of the facts, constraints, candidate recipes, missing items, and scheduling context that the final plan must use.
@@ -621,16 +626,31 @@ public sealed class GoalAgent
         - Use the grounded facts and tool results already present in this conversation. Do not call tools in this step.
         - During planning side effects are intentionally not exposed as tools. Propose mutations in the final JSON instead.
         - Proposal module/function/args must match real side-effecting functions exactly.
-        - Valid side-effecting guest-dinner proposal functions include:
+        - Valid side-effecting proposal functions — ALL domains draw from this one list, with these exact arg shapes:
           ShoppingList.Add args {"items":["..."],"reason":"..."}
+          ShoppingList.Remove args {"items":["..."]}
           ShoppingList.PlaceOrder args {"estimatedTotal":42.50}
           Appliance.PreheatOven args {"targetC":180,"atTime":"YYYY-MM-DDTHH:mm"}
           Appliance.RunProgram args {"appliance":"dishwasher","program":"eco","atTime":"YYYY-MM-DDTHH:mm"}
           Appliance.Defrost args {"item":"...","atTime":"YYYY-MM-DDTHH:mm"}
           Reminders.Create args {"title":"...","date":"YYYY-MM-DD","time":"HH:mm"}
+          Reminders.Delete args {"id":"rem-001"}
+          Calendar.AddEvent args {"title":"...","date":"YYYY-MM-DD","start":"HH:mm","end":"HH:mm"}
+          Inventory.ConsumeItem args {"name":"spinach","quantity":1}
+          Security.LockAllDoors args {}
+          Security.ArmSecurity args {"mode":"away"}
+          Notify.SendNotification args {"member":"Priya","message":"..."}
+          Notify.Announce args {"message":"...","date":"YYYY-MM-DD","time":"HH:mm"}
         - Do not invent proposal functions such as Appliance.Preheat, Reminders.Add, or Reminder.Create.
-        - For meal_plan goals, produce EXACTLY 7 dinner plan items for a one-week plan — Day 1 through Day 7 — no more and no fewer. Do not tie the count to any dates.
-        - For guest_dinner, include a menu that honors guest dietary constraints, a prep timeline whose plan item "when" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders.
+        - PLAN SHAPE — take the shape from the contract's DOMAIN. Only meal_plan is a week of
+          dinners; NEVER fall back to a dinner list for any other domain:
+          meal_plan      produce EXACTLY 7 dinner plan items for a one-week plan — Day 1 through Day 7 — no more and no fewer. Do not tie the count to any dates.
+          guest_dinner   a menu that honors guest dietary constraints, plus a prep timeline whose plan item "when" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders.
+          vacation_prep  a pre-departure checklist, NOT meals: finish or freeze the perishables that would spoil while the house is empty, clear the shopping list of standing orders, set appliances to eco or off, run the dishwasher before leaving, then lock up and arm security for the away period. Security.LockAllDoors and Security.ArmSecurity belong here.
+          birthday_party invitations and headcount, cake and supplies costed inside the budget cap, and a day-of schedule.
+          grocery_cost   a restock and spend plan: what to buy now, what to defer, what to substitute cheaper — priced against the budget cap, not guessed.
+          energy_saving  a scheduling plan against the savings target: shift heavy appliance runs into the off-peak window, prefer eco programs, and cut standby waste.
+          For any other domain, infer the shape from the objective: a checklist of concrete steps toward THAT outcome. The number of items follows the work, not a fixed count.
         - For guest_dinner appliance prep, prefer concrete proposals when grounded appliances support them: Appliance.PreheatOven before an oven-warmed dish, Appliance.RunProgram for dishwasher cleanup before quiet_hours, and Appliance.Defrost only when a frozen item needs thawing.
         - Do not propose ingredients or recipes that violate hard constraints.
         - Propose AT MOST 5 side-effecting actions. NEVER emit duplicate proposals. Consolidate a
@@ -725,7 +745,7 @@ public sealed class GoalAgent
 
         await _trace.PhaseAsync("planning");
         var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
-        modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan) };
+        modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan, dispatch.Domain) };
 
         await _trace.PhaseAsync("checking");
         // Collapse duplicate proposals the model sometimes emits (e.g. the same
@@ -1201,8 +1221,73 @@ public sealed class GoalAgent
         return (ordered, changed);
     }
 
-    private static IReadOnlyList<PlanItem> AssignPlanDays(IReadOnlyList<PlanItem> plan)
-        => plan.Take(7).Select((item, index) => item with { Day = index + 1 }).ToArray();
+    /// <summary>
+    /// Stamps each plan item's 1-based <see cref="PlanItem.Day"/>.
+    ///
+    /// <para>
+    /// Day is NOT cosmetic: the device completes a goal at <c>Plan.Max(p =&gt; p.Day)</c> and
+    /// the cloud sizes the progress window from the same span, so a fabricated day count
+    /// stretches a goal across days it does not occupy.
+    /// </para>
+    ///
+    /// <para>
+    /// This used to be <c>plan.Take(7).Select((item, i) =&gt; item with { Day = i + 1 })</c>
+    /// for EVERY domain, which did two wrong things off the meal path: it silently dropped
+    /// items past the seventh, and it renumbered by POSITION. A vacation checklist whose
+    /// five steps all happen on departure evening (08:00, 19:00, 20:00, 20:05) became a
+    /// five-DAY goal creeping at 20%/day, still unfinished after the family had left.
+    /// </para>
+    ///
+    /// <para>
+    /// So: meal_plan keeps the ordinal — a dinner week IS one item per day by construction,
+    /// and the compose prompt asks for exactly seven. Every other domain derives the day
+    /// from the item's own <c>when</c> date relative to the earliest item, so same-day work
+    /// shares a day and the span reflects the real calendar.
+    /// </para>
+    /// </summary>
+    private static IReadOnlyList<PlanItem> AssignPlanDays(IReadOnlyList<PlanItem> plan, string domain)
+    {
+        if (plan.Count == 0)
+        {
+            return plan;
+        }
+
+        if (string.Equals(domain, "meal_plan", StringComparison.Ordinal))
+        {
+            return plan.Take(7).Select((item, index) => item with { Day = index + 1 }).ToArray();
+        }
+
+        var dates = plan.Select(item => ParseWhenDate(item.When)).ToArray();
+        var anchor = dates.Where(d => d.HasValue).Select(d => d!.Value).DefaultIfEmpty().Min();
+
+        // No item carried a usable date — fall back to the old ordinal so Day stays 1-based
+        // and monotonic rather than collapsing the whole plan onto day 0.
+        if (anchor == default)
+        {
+            return plan.Select((item, index) => item with { Day = index + 1 }).ToArray();
+        }
+
+        return plan
+            .Select((item, index) => item with
+            {
+                // An undated item among dated ones is scheduled "whenever" — anchor it to
+                // day 1 so it surfaces first rather than inventing a day for it.
+                Day = dates[index] is { } d ? d.DayNumber - anchor.DayNumber + 1 : 1
+            })
+            .ToArray();
+    }
+
+    /// <summary>Date half of an ISO "YYYY-MM-DD" or "YYYY-MM-DDTHH:mm" plan item time.</summary>
+    private static DateOnly? ParseWhenDate(string? when)
+    {
+        if (string.IsNullOrWhiteSpace(when))
+        {
+            return null;
+        }
+
+        var datePart = when.Split('T')[0];
+        return DateOnly.TryParse(datePart, out var parsed) ? parsed : null;
+    }
 
     private async Task<Status> ApplyApprovalCoreAsync(Approval approval, CancellationToken ct)
     {

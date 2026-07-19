@@ -1171,17 +1171,59 @@ internal sealed class StderrLogger : ILogger
     }
 }
 
+/// <summary>
+/// The contract used by the standalone <c>--goal --domain</c> CLI path (no cloud).
+///
+/// <para>
+/// This MUST vary by domain. It used to hardcode a meal contract — "weekday dinners
+/// planned", scope <c>{meal: dinner, days: Mon..Fri}</c> — for EVERY domain, so asking
+/// for a vacation goal handed the planner a meal contract wearing a vacation label, and
+/// the planner faithfully produced a week of dinners. The success criteria and scope are
+/// the strongest shape signal the planner gets; a wrong one beats any prompt wording.
+/// The meal_plan branch is kept byte-identical to the original so the gates don't move.
+/// </para>
+/// </summary>
 public static Dispatch BuildLocalDispatch(string goal, string domain, IClock clock)
 {
     var start = clock.Today.AddDays(1).ToString("yyyy-MM-dd");
     var end = clock.Today.AddDays(5).ToString("yyyy-MM-dd");
+
+    var (criteria, scope, prefer) = domain switch
+    {
+        "guest_dinner" => (
+            new[] { "menu honours every guest's dietary constraints", "prep timeline scheduled", "shopping proposals tiered" },
+            new JsonObject { ["meal"] = "dinner", ["hosting"] = true },
+            new JsonArray("more_vegetables")),
+        "vacation_prep" => (
+            new[] { "perishables used or frozen before departure", "appliances set to eco or off", "house locked and security armed" },
+            new JsonObject { ["trip"] = "away_from_home", ["covers"] = new JsonArray("food", "appliances", "security", "deliveries") },
+            new JsonArray("less_waste")),
+        "birthday_party" => (
+            new[] { "guests invited and headcount known", "cake and supplies within budget", "day-of schedule set" },
+            new JsonObject { ["event"] = "birthday_party", ["covers"] = new JsonArray("guests", "cake", "supplies", "schedule") },
+            new JsonArray("stay_under_budget")),
+        "grocery_cost" => (
+            new[] { "kitchen restocked to threshold", "basket priced under the budget cap", "cheaper substitutions taken where sensible" },
+            new JsonObject { ["focus"] = "grocery_spend", ["covers"] = new JsonArray("stock", "offers", "prices") },
+            new JsonArray("stay_under_budget", "less_waste")),
+        "energy_saving" => (
+            new[] { "heavy appliance runs shifted off-peak", "eco programs preferred", "standby waste cut" },
+            new JsonObject { ["focus"] = "electricity_use", ["covers"] = new JsonArray("appliances", "tariff_windows", "standby") },
+            new JsonArray("keep_comfort")),
+        // meal_plan and anything unrecognised keep the original meal contract.
+        _ => (
+            new[] { "weekday dinners planned", "expiring inventory used", "shopping proposals tiered" },
+            new JsonObject { ["meal"] = "dinner", ["days"] = new JsonArray("Mon", "Tue", "Wed", "Thu", "Fri") },
+            new JsonArray("more_vegetables", "more_protein")),
+    };
+
     return new Dispatch
     {
         GoalId = $"local-{Guid.NewGuid():N}",
         CorrelationId = $"local-{Guid.NewGuid():N}",
         Domain = domain,
         Objective = goal,
-        SuccessCriteria = ["weekday dinners planned", "expiring inventory used", "shopping proposals tiered"],
+        SuccessCriteria = criteria,
         Constraints = new TaskConstraints
         {
             Hard = new JsonObject
@@ -1191,9 +1233,9 @@ public static Dispatch BuildLocalDispatch(string goal, string domain, IClock clo
                 ["medical"] = new JsonArray(),
                 ["budget_cap"] = 60.0
             },
-            Soft = new JsonObject { ["prefer"] = new JsonArray("more_vegetables", "more_protein") }
+            Soft = new JsonObject { ["prefer"] = prefer }
         },
-        Scope = new JsonObject { ["meal"] = "dinner", ["days"] = new JsonArray("Mon", "Tue", "Wed", "Thu", "Fri") },
+        Scope = scope,
         TimeWindow = new TimeWindow { Start = start, End = end },
         Context = new JsonObject { ["notes"] = "standalone CLI dispatch" }
     };
