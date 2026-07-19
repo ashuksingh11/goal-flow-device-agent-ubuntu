@@ -1,81 +1,33 @@
 {
-  "comment": "GENERIC CLOCK RULE: no absolute dates in mock data. expires_in_days is a day offset from 'today' (IClock.Today \u2014 real date, or simulated via control set_date/advance_day). MockWorldStore resolves offsets to ISO dates at read time. null = non-perishable.",
+  "comment": [
+    "GENERIC CLOCK RULE: no absolute dates in mock data. expires_in_days is a day offset from",
+    "'today' (IClock.Today — real date, or simulated via control set_date/advance_day). The",
+    "adapter resolves offsets to ISO dates at read time. null = non-perishable.",
+    "",
+    "v3.4: this one file feeds three of the five demo goals, so the numbers are chosen to make",
+    "each one true at the same time —",
+    "  meal_plan / waste : spinach, yogurt, bread and chicken expire within 3 days, so a week",
+    "                      of dinners genuinely has something to rescue.",
+    "  grocery_cost      : milk sits BELOW its restock_threshold (0.5 of 1 L) and eggs are at",
+    "                      theirs, which is what grocery.json's day-4 stock-out refers to.",
+    "  vacation_prep     : the same short-dated perishables are what must be eaten or frozen",
+    "                      before the family leaves.",
+    "restock_threshold must be in the SAME UNIT as quantity — InventorySuggester compares them",
+    "raw, so a threshold in grams against a quantity in kg would fire nonsense."
+  ],
   "items": [
-    {
-      "id": "inv-001",
-      "name": "spinach",
-      "quantity": 300,
-      "unit": "g",
-      "category": "vegetable",
-      "expires_in_days": 2
-    },
-    {
-      "id": "inv-002",
-      "name": "yogurt",
-      "quantity": 500,
-      "unit": "g",
-      "category": "dairy",
-      "expires_in_days": 3
-    },
-    {
-      "id": "inv-003",
-      "name": "carrots",
-      "quantity": 6,
-      "unit": "pcs",
-      "category": "vegetable",
-      "expires_in_days": 10
-    },
-    {
-      "id": "inv-004",
-      "name": "paneer",
-      "quantity": 250,
-      "unit": "g",
-      "category": "dairy",
-      "expires_in_days": 5
-    },
-    {
-      "id": "inv-005",
-      "name": "rice",
-      "quantity": 2,
-      "unit": "kg",
-      "category": "grain",
-      "expires_in_days": null,
-      "restock_threshold": 3
-    },
-    {
-      "id": "inv-006",
-      "name": "toor dal",
-      "quantity": 500,
-      "unit": "g",
-      "category": "legume",
-      "expires_in_days": null,
-      "restock_threshold": 600
-    },
-    {
-      "id": "inv-007",
-      "name": "tortilla wraps",
-      "quantity": 8,
-      "unit": "pcs",
-      "category": "grain",
-      "expires_in_days": 6,
-      "restock_threshold": 12
-    },
-    {
-      "id": "inv-008",
-      "name": "onions",
-      "quantity": 4,
-      "unit": "pcs",
-      "category": "vegetable",
-      "expires_in_days": 18,
-      "restock_threshold": 6
-    },
-    {
-      "id": "inv-009",
-      "name": "tomatoes",
-      "quantity": 5,
-      "unit": "pcs",
-      "category": "vegetable",
-      "expires_in_days": 4
-    }
+    { "id": "inv-001", "name": "spinach",        "quantity": 300, "unit": "g",    "category": "vegetable", "expires_in_days": 2 },
+    { "id": "inv-002", "name": "yogurt",         "quantity": 500, "unit": "g",    "category": "dairy",     "expires_in_days": 3 },
+    { "id": "inv-003", "name": "carrots",        "quantity": 6,   "unit": "pcs",  "category": "vegetable", "expires_in_days": 10 },
+    { "id": "inv-004", "name": "paneer",         "quantity": 250, "unit": "g",    "category": "dairy",     "expires_in_days": 5 },
+    { "id": "inv-005", "name": "rice",           "quantity": 2,   "unit": "kg",   "category": "grain",     "expires_in_days": null, "restock_threshold": 3 },
+    { "id": "inv-006", "name": "toor dal",       "quantity": 500, "unit": "g",    "category": "legume",    "expires_in_days": null, "restock_threshold": 600 },
+    { "id": "inv-007", "name": "tortilla wraps", "quantity": 8,   "unit": "pcs",  "category": "grain",     "expires_in_days": 6,    "restock_threshold": 12 },
+    { "id": "inv-008", "name": "onions",         "quantity": 4,   "unit": "pcs",  "category": "vegetable", "expires_in_days": 18,   "restock_threshold": 6 },
+    { "id": "inv-009", "name": "tomatoes",       "quantity": 5,   "unit": "pcs",  "category": "vegetable", "expires_in_days": 4 },
+    { "id": "inv-010", "name": "milk",           "quantity": 0.5, "unit": "L",    "category": "dairy",     "expires_in_days": 4,    "restock_threshold": 1 },
+    { "id": "inv-011", "name": "eggs",           "quantity": 10,  "unit": "pcs",  "category": "dairy",     "expires_in_days": 12,   "restock_threshold": 6 },
+    { "id": "inv-012", "name": "bread",          "quantity": 1,   "unit": "loaf", "category": "grain",     "expires_in_days": 3 },
+    { "id": "inv-013", "name": "chicken breast", "quantity": 400, "unit": "g",    "category": "meat",      "expires_in_days": 3 }
   ]
 }
