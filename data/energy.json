@@ -1,0 +1,71 @@
+{
+  "comment": [
+    "ENERGY-SAVING domain slice: the household's electricity picture (domain energy_saving).",
+    "GENERIC CLOCK RULE: no absolute dates. day_offset / activation_day_offset are offsets",
+    "from IClock.Today; the adapter injects the resolved ISO date at read time. Times of day",
+    "(tariff windows) are plain HH:mm strings — they are not dates.",
+    "",
+    "This domain deliberately has NO plugin of its own. It expresses itself through tools that",
+    "already exist: Appliance.RunProgram shifts a heavy run into an off-peak window on an eco",
+    "program, Reminders.Create nudges a habit, Notify reports the saving. The per-appliance",
+    "draw lives on appliances.json (Appliance.ListAppliances returns it to the planner), and",
+    "the baseline/target/tariff below are what make the % progress concrete.",
+    "",
+    "pending_updates is the week's script, staggered against the other domains (meal fills",
+    "days 1-6): a spike on day 3, a peak-tariff window on day 5, standby waste on day 6."
+  ],
+  "baseline": {
+    "daily_kwh": 18.4,
+    "monthly_kwh": 552,
+    "currency": "USD",
+    "note": "Rolling 30-day average before this goal started — the number the target is measured against."
+  },
+  "target": {
+    "reduce_percent": 15,
+    "horizon_day_offset": 30,
+    "note": "Cut the bill 15% within the month WITHOUT hurting comfort — comfort is the constraint that makes this interesting."
+  },
+  "tariff": {
+    "currency": "USD",
+    "peak": { "from": "18:00", "to": "22:00", "unit_cost": 0.28 },
+    "off_peak": { "from": "22:00", "to": "06:00", "unit_cost": 0.11 },
+    "standard": { "unit_cost": 0.18 },
+    "note": "A heavy run moved from peak to off-peak costs roughly 60% less."
+  },
+  "recent_days": [
+    { "day_offset": -4, "kwh": 18.1 },
+    { "day_offset": -3, "kwh": 18.9 },
+    { "day_offset": -2, "kwh": 17.6 },
+    { "day_offset": -1, "kwh": 18.8 }
+  ],
+  "pending_updates": [
+    {
+      "id": "eng-upd-001",
+      "kind": "energy.usage_spike",
+      "activation_day_offset": 3,
+      "appliance": "dishwasher",
+      "observed_kwh": 22.6,
+      "above_baseline_percent": 23,
+      "description": "Yesterday drew 22.6 kWh — 23% above the 18.4 kWh baseline, with the dishwasher and the oven both running inside the peak window"
+    },
+    {
+      "id": "eng-upd-002",
+      "kind": "energy.peak_tariff",
+      "activation_day_offset": 5,
+      "appliance": "dishwasher",
+      "window": "18:00-22:00",
+      "peak_unit_cost": 0.28,
+      "off_peak_unit_cost": 0.11,
+      "description": "Tonight is a peak-tariff window (18:00-22:00 at $0.28/kWh) — a heavy run now costs about 2.5x the off-peak rate"
+    },
+    {
+      "id": "eng-upd-003",
+      "kind": "energy.standby_waste",
+      "activation_day_offset": 6,
+      "appliance": "living-room TV",
+      "standby_w": 12,
+      "nights": 5,
+      "description": "The living-room TV has drawn 12 W on standby overnight for five nights running"
+    }
+  ]
+}

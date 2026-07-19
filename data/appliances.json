@@ -1,5 +1,14 @@
 {
-  "comment": "SmartThings-style mock appliance state. Scheduled actions use ISO local date-time strings supplied by proposals; appliance inventory itself is date-free.",
+  "comment": [
+    "SmartThings-style mock appliance state. Scheduled actions use ISO local date-time strings",
+    "supplied by proposals; the appliance inventory itself is date-free.",
+    "",
+    "v3.4: each appliance carries an `energy` block. Appliance.ListAppliances returns this",
+    "array VERBATIM, so the planner sees the real draw without a new plugin or tool — that is",
+    "what lets the energy_saving goal reason about shifting a heavy run to an eco program in an",
+    "off-peak window (see energy.json for the baseline, target and tariff windows).",
+    "kwh_per_run is a typical cycle; eco_kwh_per_run is the same cycle on its eco program."
+  ],
   "appliances": [
     {
       "id": "oven",
@@ -8,7 +17,8 @@
       "state": "idle",
       "location": "kitchen",
       "supports": ["preheat"],
-      "max_temperature_c": 250
+      "max_temperature_c": 250,
+      "energy": { "kwh_per_run": 1.2, "standby_w": 3 }
     },
     {
       "id": "dishwasher",
@@ -16,7 +26,17 @@
       "type": "dishwasher",
       "state": "idle",
       "location": "kitchen",
-      "programs": ["eco", "quick", "heavy"]
+      "programs": ["eco", "quick", "heavy"],
+      "energy": { "kwh_per_run": 1.05, "eco_kwh_per_run": 0.72, "standby_w": 1 }
+    },
+    {
+      "id": "washer",
+      "name": "washing machine",
+      "type": "washer",
+      "state": "idle",
+      "location": "utility",
+      "programs": ["eco", "cotton", "quick"],
+      "energy": { "kwh_per_run": 0.95, "eco_kwh_per_run": 0.60, "standby_w": 1 }
     },
     {
       "id": "fridge",
@@ -24,7 +44,17 @@
       "type": "fridge",
       "state": "online",
       "location": "kitchen",
-      "supports": ["defrost_reminder", "thaw_zone"]
+      "supports": ["defrost_reminder", "thaw_zone"],
+      "energy": { "kwh_per_day": 1.4, "always_on": true }
+    },
+    {
+      "id": "tv",
+      "name": "living-room TV",
+      "type": "tv",
+      "state": "standby",
+      "location": "living room",
+      "supports": ["slideshow"],
+      "energy": { "kwh_per_hour": 0.09, "standby_w": 12 }
     }
   ],
   "scheduled_actions": []

@@ -1,0 +1,69 @@
+{
+  "comment": [
+    "GROCERY-COST domain slice: keeping the kitchen stocked while minimising the bill",
+    "(domain grocery_cost).",
+    "GENERIC CLOCK RULE: no absolute dates. activation_day_offset / day_offset are offsets",
+    "from IClock.Today; the adapter injects the resolved ISO date at read time.",
+    "",
+    "This domain needs NO new plugin — the teeth already exist: Budget.EstimateCost prices a",
+    "basket against budget.json's price book, Inventory.GetExpiringItems finds waste-rescue",
+    "candidates, and ShoppingList.PlaceOrder is FIRM-tier and BLOCKED by the numeric_cap",
+    "safety rule when the basket exceeds the dispatch's budget_cap. So 'cheaper' is enforced,",
+    "not merely suggested.",
+    "",
+    "watchlist = the staples this goal tracks (typical price + weekly burn), so the planner can",
+    "reason about buy-ahead vs defer. pending_updates is the week's script, staggered against",
+    "the other domains: an offer on day 2, a stock-out on day 4, a price rise on day 7."
+  ],
+  "watchlist": [
+    { "item": "milk",   "typical_price": 3.20, "unit": "L",     "weekly_use": 4 },
+    { "item": "eggs",   "typical_price": 4.00, "unit": "dozen", "weekly_use": 1 },
+    { "item": "rice",   "typical_price": 3.50, "unit": "kg",    "weekly_use": 1 },
+    { "item": "bread",  "typical_price": 2.50, "unit": "loaf",  "weekly_use": 3 },
+    { "item": "onions", "typical_price": 2.00, "unit": "kg",    "weekly_use": 1 }
+  ],
+  "offers": [
+    {
+      "item": "eggs",
+      "was": 4.00,
+      "now": 2.80,
+      "discount_percent": 30,
+      "starts_day_offset": 2,
+      "ends_day_offset": 3,
+      "note": "Short window — worth buying ahead only if the family will actually use them."
+    }
+  ],
+  "pending_updates": [
+    {
+      "id": "gro-upd-001",
+      "kind": "grocery.offer_available",
+      "activation_day_offset": 2,
+      "item": "eggs",
+      "was": 4.00,
+      "now": 2.80,
+      "discount_percent": 30,
+      "ends_day_offset": 3,
+      "description": "Eggs are 30% off today ($4.00 to $2.80) and the offer ends tomorrow"
+    },
+    {
+      "id": "gro-upd-002",
+      "kind": "grocery.stock_low",
+      "activation_day_offset": 4,
+      "item": "milk",
+      "remaining": 0.5,
+      "unit": "L",
+      "threshold": 1,
+      "description": "Milk is down to 0.5 L, below the 1 L restock threshold"
+    },
+    {
+      "id": "gro-upd-003",
+      "kind": "grocery.price_rose",
+      "activation_day_offset": 7,
+      "item": "rice",
+      "was": 3.50,
+      "now": 4.13,
+      "increase_percent": 18,
+      "description": "Rice went up 18% this week ($3.50 to $4.13) — the usual 5 kg bag now pushes the weekly basket over its line"
+    }
+  ]
+}

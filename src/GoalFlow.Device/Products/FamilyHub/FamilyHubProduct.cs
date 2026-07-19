@@ -85,6 +85,8 @@ public static class FamilyHubProduct
         services.AddSingleton<IDomainObserver, GuestDinnerObserver>();
         services.AddSingleton<IDomainObserver, VacationPrepObserver>();
         services.AddSingleton<IDomainObserver, BirthdayPartyObserver>();
+        services.AddSingleton<IDomainObserver, GroceryCostObserver>();
+        services.AddSingleton<IDomainObserver, EnergySavingObserver>();
 
         // Proactive suggestions (v3-M8): scans of local state that propose goals the
         // family hasn't asked for. The harness collects every ISuggester; the product

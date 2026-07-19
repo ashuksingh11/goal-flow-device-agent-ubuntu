@@ -36,12 +36,18 @@ import json, sys
 
 frame = json.load(open(sys.argv[1]))
 
-expected_domains = {"birthday_party", "guest_dinner", "meal_plan", "vacation_prep"}
+# v3.4 added grocery_cost + energy_saving — the five headline demo use cases plus
+# guest_dinner. Set equality on purpose: a domain that stops being advertised is a
+# use case that silently stops routing.
+expected_domains = {
+    "birthday_party", "energy_saving", "grocery_cost",
+    "guest_dinner", "meal_plan", "vacation_prep",
+}
 got_domains = {d["id"] for d in frame.get("domains", [])}
 if got_domains != expected_domains:
     print(f"  FAIL domains advertised {sorted(got_domains)} != expected {sorted(expected_domains)}")
     sys.exit(1)
-print(f"  ok   four domains route: {sorted(got_domains)}")
+print(f"  ok   six domains route: {sorted(got_domains)}")
 
 # The plugins M7 needs must be present AS CAPABILITIES (not steering) — meaning
 # available, since an [Unavailable] plugin still lists in the frame but its reads are

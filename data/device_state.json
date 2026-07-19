@@ -27,6 +27,8 @@
   "appliances_online": {
     "oven": true,
     "dishwasher": true,
-    "fridge": true
+    "fridge": true,
+    "washer": true,
+    "tv": true
   }
 }
