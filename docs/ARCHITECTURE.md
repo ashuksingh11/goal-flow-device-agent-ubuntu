@@ -1,13 +1,13 @@
-# Device Agent Architecture (v2 — Semantic Kernel)
+# Device Agent Architecture (v3 — Semantic Kernel)
 
 The GoalFlow device agent is the on-device half of a two-tier goal-agent
 system for the Samsung Family Hub. The cloud agent owns the conversation and
 memory, decomposes the fuzzy user goal into the **generic Task Contract**
-(the `dispatch` message of CONTRACT v2 — canonical in the cloud repo;
+(the `dispatch` message of CONTRACT v3 — canonical in the cloud repo;
 `src/GoalFlow.Device/Contracts/` is its exact C# mirror), and relays every
 message (UI and device never talk directly).
 
-**v2 core idea: the device IS a Semantic Kernel agent.** Device capabilities
+**Core idea: the device IS a Semantic Kernel agent.** Device capabilities
 are SK **plugins** whose methods are `[KernelFunction]`s the LLM *calls* via
 **auto function-calling** (`FunctionChoiceBehavior.Auto`). Safety is an SK
 **`IFunctionInvocationFilter`** that inspects every pending call against
@@ -15,22 +15,27 @@ are SK **plugins** whose methods are `[KernelFunction]`s the LLM *calls* via
 code checks."** As the kernel works, the device **streams `agent_event`
 frames** (phase / thinking / tool_call / tool_result / plan_progress) that
 drive the live UI. Planning is **LLM-only**: there is no rules or scripted
-planner in v2.
+planner.
 
-The agent is **general**: `meal_plan` is one domain, `guest_dinner` another.
-The protocol, the steering modules, and the kernel host are domain-agnostic;
-domains differ only in which capability plugins the planner leans on and what
-rides in the free-form `scope`/`context` objects.
+The agent is **general**: six domains ship — `meal_plan`, `guest_dinner`,
+`vacation_prep`, `birthday_party`, `grocery_cost` and `energy_saving`. The
+protocol, the harness components, and the kernel host are domain-agnostic;
+domains differ only in which capability plugins the planner leans on, which
+`IDomainObserver` watches them, and what rides in the free-form
+`scope`/`context` objects.
 
 ## Layout
 
 ```
 src/GoalFlow.Device/
-  Contracts/              C# mirror of every CONTRACT v2 message (snake_case JSON)
+  Contracts/              C# mirror of every CONTRACT v3 message (snake_case JSON)
   Agent/GoalAgent.cs      the SK kernel host: build kernel, plan, actuate, adapt
-  Modules/
-    Capabilities/         SK plugins — the LLM's tools ([KernelFunction]s)
-    Steering/             harness modules that shape/guard the run (no LLM inside)
+  Harness/                THE GENERIC CORE — five first-class components
+                          (CapabilityManager, SafetyPolicyEngine, PrecheckEngine,
+                          TaskManager, ProductApiAdapter) + supporting modules
+                          (Approval, Grounding, Clock, Trace); no product types, no LLM
+  Products/FamilyHub/     THE PRODUCT PACK — 11 plugins (the LLM's tools), the six
+                          IDomainObservers, pre-check probes, the mock-world adapter, config
   Transport/WsClient.cs   one outbound BCL ClientWebSocket to the cloud hub
   Program.cs              CLI entry: --goal | --contract | --connect [--date]
 data/                     mock world; ALL dates stored as offsets from today
@@ -44,19 +49,37 @@ data/                     mock world; ALL dates stored as offsets from today
    `AddOpenAIChatCompletion(modelId: OPENROUTER_MODEL /* default
    openai/gpt-oss-120b */, endpoint: OPENROUTER_BASE_URL, apiKey:
    OPENROUTER_API_KEY)`. Config comes from `.env`; never hardcoded.
-2. **Capability plugins** — registered under their advertised module names:
-   `Inventory`, `Calendar`, `Recipes`, `ShoppingList`, `Reminders`,
-   `Appliance`, `FamilyProfiles`, `Budget`, `Notify`. Registration IS the
-   action space: the planner can only call what the Hub can actually do.
+2. **Capability plugins** — the 11 SK plugins registered under their advertised
+   module names: `Inventory`, `Calendar`, `Recipes`, `ShoppingList`,
+   `Reminders`, `Guests`, `Appliance`, `FamilyProfiles`, `Budget`, `Notify`,
+   `Security`. Registration IS the action space: the planner can only call what
+   the Hub can actually do.
 3. **The SafetyFilter** — added as an `IFunctionInvocationFilter` service, so
    it sits in the kernel's invocation pipeline for *every* function call.
 
-`GoalAgent.RunAsync(dispatch)` is one streaming chat invocation with
-`FunctionChoiceBehavior.Auto()`: the model reads the grounded context, decides
-which `[KernelFunction]`s to call, the kernel invokes them (through the
-filter), results feed back into the model, and the loop continues until the
-model emits its structured plan. Throughout, `Trace` narrates each step as an
-`agent_event` frame.
+`GoalAgent.RunAsync(dispatch)` is **not** one chat invocation — the planner has
+**two altitudes**, and the split is deliberate (a toolless model asked about the
+fridge would invent facts; a tool-happy model asked to plan would half-execute):
+
+1. **decompose** — a JSON-mode call with **no tools** asks only for the goal's
+   structure (task titles + dependencies). `TaskDag.Sanitize` repairs the result
+   and falls soft to a single task, so a decomposition problem never costs the
+   user their goal.
+2. **grounding** — a **streaming** chat call with
+   `FunctionChoiceBehavior.Auto()` scoped to the **read-only** function subset
+   (`CapabilityManager.GetGroundingFunctions` — every non-side-effecting function
+   of every available plugin, in the pack's order). The model grounds itself by
+   *calling* those `[KernelFunction]`s; the kernel invokes them through the
+   filter and the results feed back.
+3. **compose** — a second, **no-tools** call with `ResponseFormat =
+   "json_object"` returns the final plan as one structured JSON object (plan +
+   proposals). Side effects are deliberately *not* tools here: the model must
+   *propose* mutations naming real side-effecting functions. The compose prompt
+   injects only the **active domain's** `PlanShapeRule`, and `AssignPlanDays`
+   then stamps each item's `Day` afterward.
+
+Throughout, `Trace` narrates each step (`phase` / `thinking` / `tool_call` /
+`tool_result` / `plan_progress`) as an `agent_event` frame.
 
 ## Invoke / filter / stream flow
 
@@ -72,12 +95,15 @@ sequenceDiagram
 
     Cloud->>WsClient: dispatch (Task Contract)
     WsClient->>GoalAgent: RunAsync(dispatch)
+    Note over GoalAgent,LLM: ALTITUDE 1 — decompose (no tools, JSON)
+    GoalAgent->>LLM: decompose: goal → tasks + deps
+    LLM-->>GoalAgent: task list (TaskDag.Sanitize; falls soft to 1)
     GoalAgent->>Trace: phase: grounding
     Trace-->>Cloud: agent_event (streamed)
     Note over GoalAgent: Grounding assembles world context;<br/>SafetyFilter.BeginGoal(goal_id, constraints.hard)
-    GoalAgent->>Trace: phase: planning
-    GoalAgent->>LLM: chat + tool schemas (FunctionChoiceBehavior.Auto)
-    loop auto function-calling
+    Note over GoalAgent,Plugin: ALTITUDE 2a — grounding (streaming, read-only tools)
+    GoalAgent->>LLM: chat + READ tool schemas (FunctionChoiceBehavior.Auto)
+    loop auto function-calling (read-only)
         LLM-->>GoalAgent: function call {module, function, args}
         GoalAgent->>Trace: tool_call event
         Trace-->>Cloud: agent_event
@@ -86,14 +112,18 @@ sequenceDiagram
             Filter-->>GoalAgent: BLOCKED (result = refusal; plugin never runs)
             Note over Filter: violation recorded for the<br/>plan_ready safety verdict
         else allowed
-            Filter->>Plugin: next(context) — method executes
+            Filter->>Plugin: next(context) — read executes
             Plugin-->>GoalAgent: result
         end
         GoalAgent->>Trace: tool_result event
         Trace-->>Cloud: agent_event
         GoalAgent->>LLM: tool result appended
     end
-    LLM-->>GoalAgent: final structured plan
+    GoalAgent->>Trace: phase: planning
+    Note over GoalAgent,LLM: ALTITUDE 2b — compose (NO tools, JSON; active domain's PlanShapeRule)
+    GoalAgent->>LLM: compose: final plan + proposals as one JSON object
+    LLM-->>GoalAgent: structured plan (plan + proposals)
+    Note over GoalAgent: AssignPlanDays stamps each item's Day
     GoalAgent->>Trace: phase: checking
     Note over GoalAgent: side-effecting calls frozen into<br/>tiered proposals (ApprovalCoordinator)
     GoalAgent->>WsClient: plan_ready (plan + proposals + safety verdict)
@@ -164,10 +194,12 @@ approval → actuation path as the sustain loop.
 
 `CapabilityManager` builds the `capabilities` advertisement by *discovery*:
 it walks `kernel.Plugins` (function names + `Description` attributes from
-`KernelFunctionMetadata`, `side_effecting`/`tier` from `[SideEffect]`) and
-appends the fixed steering-module descriptors. Sent right after `hello_ack`.
-Adding a new domain = registering new plugins; advertisement, planner action
-space, and UI module view all update automatically.
+`KernelFunctionMetadata`, `side_effecting`/`tier` from `[SideEffect]`), appends
+the fixed steering-module descriptors, and lists the domains from the registered
+`IDomainObserver`s (`Domain` + `Hint`). Sent right after `hello_ack`. Adding a
+domain = registering an `IDomainObserver` (and whatever plugins it needs);
+advertisement, planner action space, the domain list, and the UI module view all
+update automatically.
 
 ## agent_event streaming & structured logging
 

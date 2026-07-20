@@ -36,3 +36,7 @@ Thumbs.db
 
 # Per-instance mock-world dirs (multi-agent testing; seeded from ./data)
 data-*/
+
+# Runtime-generated pairing id in the seed data dir (a self-generated UUID persisted
+# on first run) — never a seed artifact, so it must not be committed.
+data/device_id

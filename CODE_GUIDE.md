@@ -1,14 +1,14 @@
-# Code Guide — goal-flow-device-agent-ubuntu (v2)
+# Code Guide — goal-flow-device-agent-ubuntu (v3)
 
 The on-device agent is a .NET 8 process where **the device IS a Semantic
 Kernel agent**: device capabilities are SK **plugins** the LLM calls via auto
 function-calling, and every harness module is either one of those plugins
 ("capability") or deterministic code that shapes/guards the run ("steering").
 Planning is **LLM-only** — there is no rules or scripted planner anywhere in
-v2. Built Linux-first; the Tizen port swaps plugin internals, never the agent.
+the agent. Built Linux-first; the Tizen port swaps plugin internals, never the agent.
 
 Companion docs: `docs/ARCHITECTURE.md` (kernel/filter/stream design),
-`docs/HARNESSES.md` (the 11 harness modules → real primitives),
+`docs/HARNESSES.md` (the five harness components → real primitives),
 `../goal-flow-agents/docs/V2_DESIGN_PROPOSAL.md` (the framing).
 
 ## File map
@@ -17,7 +17,9 @@ Companion docs: `docs/ARCHITECTURE.md` (kernel/filter/stream design),
 GoalFlow.Device.sln / GoalFlow.Device.csproj   # sln builds src/; root csproj lets `dotnet run` work from the repo root
 data/                                # mock world — ALL dates are day offsets (data/README.md)
   inventory.json calendar.json recipes.json shopping_list.json reminders.json
-  guests.json appliances.json
+  guests.json appliances.json family.json budget.json notifications.json
+  security.json party.json vacation.json grocery.json energy.json   # grocery/energy are the v3.4 additions
+  device_state.json                  # runtime flags the pre-check probes read (appliance_online, samsung_account, …)
   daily_events.json                  # presenter-fired event catalog for control: trigger_event
   sample-contract.json               # meal_plan dispatch (${today+N} tokens)
   sample-contract-guest.json         # guest_dinner dispatch
@@ -25,7 +27,7 @@ data/                                # mock world — ALL dates are day offsets 
 src/GoalFlow.Device/
   Program.cs                         # CLI + DI composition root                ← start here
   Agent/GoalAgent.cs                 # SK kernel host: BuildKernel / RunAsync / ApplyApprovalAsync / HandleControlAsync
-  Contracts/                         # C# mirror of CONTRACT v2 (Dispatch, PlanReady, Proposal, Approval, Status, Control, AgentEvent, Capabilities, …)
+  Contracts/                         # C# mirror of CONTRACT v3 (Dispatch, PlanReady, Proposal, Approval, Status, Control, AgentEvent, Capabilities, …)
   Harness/                           # THE GENERIC CORE — no product types, no LLM inside
     CapabilityManager/               # [1] the toolbox: discovery, advertisement, the planner's tool set
       CapabilityManager.cs           #     discovery over kernel.Plugins + the pack's descriptors
@@ -55,15 +57,18 @@ src/GoalFlow.Device/
       PrecheckEngine.cs              #     two gates (before planning, before actuating) + bindings
   Products/FamilyHub/                # THE PRODUCT PACK — everything fridge-specific
     FamilyHubProduct.cs              # the manifest: THE single declaration of the plugin catalog
-    Observers/                       # what this product watches: MealPlan (daily feed), GuestDinner (RSVPs)
+    Observers/                       # the six IDomainObservers (one per domain): MealPlan (daily feed),
+                                     #   GuestDinner (RSVPs), VacationPrep, BirthdayParty, GroceryCost, EnergySaving
     Probes/                          # what this product can check: device flags, appliance_online:<id>
     config/prechecks.json            # which of THIS product's calls need which checks
     Adapter/MockFamilyHubAdapter.cs  # the mock world; resolves day offsets against IClock at read time
     config/policy.json               # THIS product's safety rules: which kinds bind to which calls
-    Plugins/                         # SK plugins — the LLM's tools
+    Plugins/                         # 11 SK plugins — the LLM's tools (ALL implemented; no stubs)
       InventoryPlugin.cs CalendarPlugin.cs RecipePlugin.cs ShoppingListPlugin.cs
       ReminderPlugin.cs GuestsPlugin.cs ApplianceControlPlugin.cs
-      FamilyProfilesPlugin.cs BudgetPlugin.cs NotifyPlugin.cs   # ← the 3 [Unavailable] stubs
+      FamilyProfilesPlugin.cs BudgetPlugin.cs NotifyPlugin.cs SecurityPlugin.cs
+      # 18 grounded READ tools + 14 [SideEffect] proposable functions across the 11
+      # (FamilyProfiles/Budget/Notify were [Unavailable] stubs in early v3; M7 filled them in)
   Transport/WsClient.cs              # one outbound BCL ClientWebSocket to the cloud hub
 verify/m0/ … verify/m5/            # the gates — run the LATEST milestone's check.sh before every commit
 ```
@@ -80,9 +85,9 @@ Parses CLI options, loads `.env`, then builds the composition root with
 `Microsoft.Extensions.DependencyInjection`: the `IClock` (real `SystemClock`
 by default; `SimulatedClock` when `--date` or a simulation mode is used), then
 **`services.AddFamilyHub(dataDir)`** — the one line that knows what product this
-is, registering the adapter, the ten plugins and the `CapabilityManager` over
-them — and finally the harness components (`SafetyFilter`, `ApprovalCoordinator`,
-`Grounding`, `MaterialityPolicy`, `MonitorAdapt`).
+is, registering the adapter, the eleven plugins, the six domain observers and
+the `CapabilityManager` over them — and finally the harness components (`SafetyFilter`, `ApprovalCoordinator`,
+`Grounding`, `MonitorAdapt`).
 `GoalAgent.BuildKernel` then assembles the SK kernel from that provider, looping
 the pack's descriptors — it names no plugin type.
 `ProgramHelpers.EnsureDataDir` runs first and auto-seeds a `--data` dir with
@@ -127,15 +132,26 @@ whole way (via `Trace`; over the WebSocket when connected, stderr otherwise).
    those `[KernelFunction]`s; every call passes through the `SafetyFilter`,
    which also emits the `tool_call`/`tool_result` events. Model text streams
    as `thinking` events.
-2. **`phase: planning`** — the **two-phase compose**: a second, **no-tools**
-   chat call with `ResponseFormat = "json_object"` asks for the final plan as
-   one JSON object (`plan[]`, `proposals[]`, `impact[]`, `explanation`).
+2. **`phase: planning`** — the **two-phase compose** (`ComposeModelPlanAsync`):
+   a second, **no-tools** chat call with `ResponseFormat = "json_object"` asks
+   for the final plan as one JSON object (`plan[]`, `proposals[]`, `impact[]`,
+   `explanation`). The compose prompt (`BuildPlanningInstruction`) injects
+   `PlanShapeRule(dispatch.Domain)` — **only the active domain's** plan shape,
+   not a hardcoded "7 dinners" (that bleed, a vacation planned as a week of
+   meals, was the v3.5 bug this fixed; only `meal_plan` asks for exactly seven).
    Side effects are deliberately *not* exposed as tools during planning — the
    model must *propose* mutations as `{module, function, args, tier}` entries
-   naming real side-effecting functions. Robustness: up to 2 compose attempts
-   with a parser-error retry prompt; if the provider rejects/ignores
-   `response_format`, it falls back to a strict-JSON prompt; code-fence
-   stripping + brace-matched extraction before `JsonSerializer`.
+   naming real side-effecting functions, drawn from the **one proposal catalog**
+   of all 14 `[SideEffect]` functions the prompt lists for every domain.
+   Robustness: up to 2 compose attempts with a parser-error retry prompt; if the
+   provider rejects/ignores `response_format`, it falls back to a strict-JSON
+   prompt; code-fence stripping + brace-matched extraction before
+   `JsonSerializer`. Then `AssignPlanDays(plan, domain)` stamps each item's
+   1-based `Day`: `meal_plan` keeps the ordinal Day 1..7, every OTHER domain
+   derives Day from the item's own `when` date (`ParseWhenDate`, relative to the
+   earliest item) so same-day work shares a day. Day is not cosmetic — the
+   device completes a goal at `Plan.Max(p => p.Day)` and the cloud sizes its
+   progress window from the same span.
 3. **`phase: checking`** — each proposal is normalized (tier overridden from
    the function's `[SideEffect]` attribute via
    `CapabilityManager.GetSideEffectTier`; `requires_approval = true`; id
@@ -209,15 +225,18 @@ After a plan is out, `control: advance_day` (or `set_date`) frames drive
 
 1. The `SimulatedClock` steps; `control: reset` restores the pristine mock
    seeds instead.
-2. `MonitorAdapt.ObserveAsync` diffs the active goal's world snapshot against
-   the new *today* — per domain: **meal_plan** looks for a calendar event
-   (the football night) overlapping a planned dinner's prep window;
-   **guest_dinner** looks for guest `pending_updates` activating today (an
-   RSVP allergy added, a late arrival).
-3. `MaterialityPolicy` — deterministic code, not the LLM — decides whether
-   each `WorldChange` is material (does it invalidate plan items?). Quiet
-   days return `material: false` status frames; each material change fires
-   once (deduped via `EmittedMaterialChanges`).
+2. `MonitorAdapt.ObserveAsync` asks each registered `IDomainObserver` (the
+   product pack, `Products/FamilyHub/Observers/`) to diff its slice of the
+   active goal's world snapshot against the new *today* — e.g.
+   **MealPlanObserver** looks for a calendar event (the football night)
+   overlapping a planned dinner's prep window; **GuestDinnerObserver** looks
+   for guest `pending_updates` activating today (an RSVP allergy added, a late
+   arrival); the other four domains watch their own documents.
+3. Each `WorldChange` arrives already classified `material` **by the observer** —
+   deterministic code, not the LLM (materiality is product knowledge: only the
+   domain knows a guest's nut allergy matters and a restocked staple does not).
+   Quiet days return `material: false` status frames; each material change
+   fires once (deduped by the harness via `EmittedMaterialChanges`).
 4. On a material change, `ProposeAdaptationAsync` registers a scoped,
    `adapt`-tier proposal in the same ledger (e.g. a night-before prep
    reminder, or nut-free backup shopping items) — it rides the same approval
@@ -255,13 +274,14 @@ type here or a real SK feature (full table in `docs/HARNESSES.md`):
 - **Capability modules** = SK plugins in `Products/FamilyHub/Plugins/`, registered
   in `GoalAgent.BuildKernel` under their advertised names (`Inventory`,
   `Calendar`, `Recipes`, `ShoppingList`, `Reminders`, `Guests`, `Appliance`,
-  `FamilyProfiles`, `Budget`, `Notify`). Registration IS the action space.
+  `FamilyProfiles`, `Budget`, `Notify`, `Security`). Registration IS the action space.
   Side-effecting methods carry `[SideEffect(tier)]`; all world access goes
   through `MockFamilyHubAdapter` (writes persist to `data/*.json`).
 - **Steering modules** = the deterministic classes in `Harness/`:
   Planner host (`GoalAgent` + SK auto function-calling), Safety
   (`IFunctionInvocationFilter`), Approval (ledger), Grounding, Scheduler
-  (`IClock`), MonitorAdapt (+ `MaterialityPolicy`), Trace, and
+  (`IClock`), MonitorAdapt (delegating materiality to the product's
+  `IDomainObserver`s), Trace, and
   `CapabilityManager` — which builds the `capabilities` advertisement by
   *discovery* (walking `kernel.Plugins` metadata + `[SideEffect]` reflection),
   sent right after `hello_ack` in `--connect` mode.
@@ -317,10 +337,12 @@ whitelist — any of which you could forget. Those are gone; `verify/m0/check.sh
 gate 2 pins the derivation.)*
 
 **Add a domain:** write a dispatch with the new `domain` + `scope`/`context`,
-add whatever plugins the domain needs (above), and — if it should adapt over
-time — teach `MonitorAdapt.ObserveAsync` its change signatures and
-`MaterialityPolicy` when they matter. The kernel host, safety filter,
-approval ledger, clock, trace, and protocol need no changes.
+add whatever plugins the domain needs (above), add its `PlanShapeRule` arm, and —
+if it should adapt over time — register an `IDomainObserver` in
+`FamilyHubProduct` that captures its slice of the world and classifies its
+changes' materiality (that registration IS the domain the cloud routes on; the
+six shipped observers live in `Products/FamilyHub/Observers/`). The kernel host,
+safety filter, approval ledger, clock, trace, and protocol need no changes.
 
 **Real actuators (Tizen):** keep every plugin's `[KernelFunction]` signature
 and replace its `MockFamilyHubAdapter` internals with real Tizen/SmartThings calls.

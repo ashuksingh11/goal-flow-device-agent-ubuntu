@@ -1,4 +1,4 @@
-# GoalFlow Device Agent (Ubuntu / .NET 8) — v2
+# GoalFlow Device Agent (Ubuntu / .NET 8) — v3
 
 The **on-device agent** for GoalFlow — the **executor tier of a general
 goal agent** for the Samsung Family Hub. The cloud agent owns the conversation
@@ -10,7 +10,7 @@ Ethos: *"fake the world; make the mechanism real."* The world is mock JSON;
 the agent mechanics — SK auto function-calling, a deterministic safety filter,
 tiered approvals, a sustain loop — are real.
 
-**v2 core idea: the device IS a Semantic Kernel agent.** There is no
+**Core idea: the device IS a Semantic Kernel agent.** There is no
 hand-rolled pipeline and no rules/scripted planner. Device capabilities are SK
 **plugins** whose methods are `[KernelFunction]`s the LLM *calls* via **auto
 function-calling** (`FunctionChoiceBehavior.Auto`); safety is a deterministic
@@ -27,10 +27,12 @@ Key invariants:
   checks"*). The **approval gate** is the user: side-effecting calls are
   frozen into **tiered proposals** (`auto` / `light` / `firm`) and nothing
   irreversible executes before an `approval` frame comes back.
-- **General agent, not a meal app.** Two domains ship — `meal_plan` and
-  `guest_dinner` — running through the *same* kernel host, steering modules,
+- **General agent, not a meal app.** Six domains ship — `meal_plan`,
+  `guest_dinner`, `vacation_prep`, `birthday_party`, `grocery_cost` and
+  `energy_saving` — running through the *same* kernel host, harness components,
   and protocol. Domains differ only in which capability plugins the planner
-  leans on; adding a domain = registering plugins.
+  leans on and which `IDomainObserver` watches them; adding a domain =
+  registering an observer (that registration IS the domain the cloud routes on).
 - **Generic clock.** Nothing hardcodes a date. `IClock` is the real system
   clock by default, or a `SimulatedClock` driven by `--date` / `control`
   frames (`set_date`, `advance_day`). Mock data stores day *offsets* resolved
@@ -123,19 +125,28 @@ environment:
 
 ```
 src/GoalFlow.Device/
-  Contracts/              C# mirror of every CONTRACT v2 message (snake_case JSON)
+  Contracts/              C# mirror of every CONTRACT v3 message (snake_case JSON)
   Agent/GoalAgent.cs      the SK kernel host: build kernel, plan, actuate, adapt
-  Modules/
-    Capabilities/         SK plugins — the LLM's tools ([KernelFunction] + [SideEffect] tiers)
-    Steering/             deterministic harness modules (safety, approvals, grounding,
-                          clock, monitor/adapt, trace, capability registry)
+  Harness/                THE GENERIC CORE — five first-class components + supporting
+                          modules; no product types, no LLM inside:
+    CapabilityManager/    the toolbox: plugin/function discovery + the capabilities advertisement
+    SafetyPolicyEngine/   the safety gate: an SK IFunctionInvocationFilter over declarative policy.json
+    PrecheckEngine/       "is the world ready?" — gates before planning and before each actuation
+    TaskManager/          the goal ledger: task DAG, derived progress, the observer/suggester seams
+    ProductApiAdapter/    the product seam (IProductApiAdapter)
+    Approval/ Grounding/ Clock/ Trace/   supporting steering modules
+  Products/FamilyHub/     THE PRODUCT PACK — everything fridge-specific:
+    FamilyHubProduct.cs   the manifest: the single plugin + observer catalog
+    Plugins/              11 SK plugins — the LLM's tools ([KernelFunction] + [SideEffect] tiers)
+    Observers/            the six IDomainObservers (one per domain)
+    Probes/ Adapter/ config/   pre-check probes, the mock-world adapter, policy/prechecks JSON
   Transport/WsClient.cs   one outbound BCL ClientWebSocket to the cloud hub
   Program.cs              CLI entry + DI composition root
 data/                     mock world (day-offset dates; see data/README.md) + sample contracts
                           + device_id (persisted self-generated pairing key, first run)
-docs/                     ARCHITECTURE.md (kernel/filter/stream design), HARNESSES.md (module catalog)
+docs/                     ARCHITECTURE.md (kernel/filter/stream design), HARNESSES.md (harness catalog)
 ```
 
 See `CODE_GUIDE.md` for the code walkthrough, `docs/ARCHITECTURE.md` for the
-invoke/filter/stream flow, and `docs/HARNESSES.md` for the mapping of the 11
-harness modules to real SK/framework primitives.
+invoke/filter/stream flow, and `docs/HARNESSES.md` for the mapping of the five
+harness components (and the supporting modules) to real SK/framework primitives.
