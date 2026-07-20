@@ -148,15 +148,17 @@ was added in M7).
 ## Domain observers, probes, suggester (the product's judgement)
 
 - **Observers** (`Products/FamilyHub/Observers/`): `MealPlanObserver`, `GuestDinnerObserver`,
-  `VacationPrepObserver`, `BirthdayPartyObserver` — one per domain. Registering one IS the
-  domain advertisement the cloud routes on; each captures its slice of the world and
-  decides which changes are material (adaptation).
+  `VacationPrepObserver`, `BirthdayPartyObserver`, and (v3.4) `GroceryCostObserver` +
+  `EnergySavingObserver` — one per domain, six in all. Registering one IS the domain
+  advertisement the cloud routes on; each captures its slice of the world and decides which
+  changes are material (adaptation).
 - **Probes** (`Products/FamilyHub/Probes/`): `DeviceStateProbe` + `ApplianceOnlineProbe` —
   the runtime conditions this product's calls need (Samsung account, SmartThings, camera).
 - **Suggester** (`Products/FamilyHub/InventorySuggester.cs`): a deterministic scan of local
   state → proactive `suggestions` (Expiring Soon, Grocery Restock) the board offers.
 
-**Generality in one line:** four domains (meal, guest, vacation, birthday) run on the same
-five components and the same protocol — a domain is an `IDomainObserver` plus the plugins
+**Generality in one line:** six domains (meal, guest, vacation, birthday, grocery_cost,
+energy_saving) run on the same five components and the same protocol — a domain is an
+`IDomainObserver` plus the plugins
 it uses, and the cloud accepts it purely because the device advertises it. Adding a fifth
 domain changes no harness code.

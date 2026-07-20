@@ -72,21 +72,26 @@ wired separately in each host.
   `HandleControlCoreAsync` handle clock controls AND **`trigger_event`** (handled
   first): fire one presenter event → `ProposeDailyAdaptationAsync` (ONE scoped-LLM
   patch, no grounding tool-loop) → status with `updated_plan`/`changed_ids`/
-  `impact_delta`/`event_id`. Plan items get a **1-based `Day`**; meal plans are
-  capped/pinned to EXACTLY 7 dinners (Day 1..7). Adaptation targets the item by its
-  event's `Day` index (not by date). Transient-provider-error retry loop wraps LLM calls.
+  `impact_delta`/`event_id`. Plan-item `Day` (v3.5, `AssignPlanDays`): **`meal_plan`
+  keeps the ordinal — EXACTLY 7 dinners, Day 1..7 — but every OTHER domain derives `Day`
+  from the item's own `when` date** (`ParseWhenDate`), so a checklist that all happens on
+  one evening is one day, not seven. Day is not cosmetic: the device completes at
+  `Plan.Max(p => p.Day)` and the cloud sizes progress from the same span. The compose
+  prompt's plan shape is per-domain too (`PlanShapeRule`, v3.5.1 injects only the active
+  one). Transient-provider-error retry loop wraps LLM calls.
 - `Products/FamilyHub/**` — THE PRODUCT PACK: everything fridge-specific.
   - `FamilyHubProduct.cs` — the manifest. **The single place the plugin catalog is
     declared** (`services.AddFamilyHub(dataDir)`); it used to be hand-listed in four
     places that could disagree. Adding a plugin = one line here + the plugin file.
     **Descriptor ORDER is significant** — it is the order the model sees its tools in.
-  - `Plugins/*Plugin.cs` — 10 SK plugins (KernelFunctions the LLM calls). 7 implemented
-    (Inventory, Calendar, ShoppingList, Recipes, Reminders, Guests, ApplianceControl);
-    3 genuine stubs that throw `NotImplementedException`, each marked
-    `[Unavailable(...)]`: `FamilyProfilesPlugin`, `BudgetPlugin`, `NotifyPlugin`. That
-    attribute is **load-bearing, not decoration** — stubs' reads look real to
-    reflection, so without it the planner gets 17 tools instead of 13, four of which
-    throw. Implementing a stub = write the bodies, delete the attribute, same diff.
+  - `Plugins/*Plugin.cs` — 11 SK plugins (KernelFunctions the LLM calls), ALL implemented:
+    Inventory, Calendar, ShoppingList, Recipes, Reminders, Guests, ApplianceControl,
+    FamilyProfiles, Budget, Notify, Security. (FamilyProfiles/Budget/Notify were once
+    `[Unavailable]` stubs; M7 implemented them. Security landed with vacation_prep.) They
+    expose **18 grounded read tools** and **14 `[SideEffect]` functions** — the compose
+    prompt's single proposal catalog lists exactly those 14. `[Unavailable(...)]`, if you
+    ever re-introduce a stub, is **load-bearing** — a stub's reads look real to reflection,
+    so without it the planner is handed a tool that throws.
   - `Adapter/MockFamilyHubAdapter.cs` — the mock world (`data/*.json`) behind
     `IProductApiAdapter`. The world stays MOCKED; "generic" is about the harness.
 - `Harness/**` — THE GENERIC CORE. **Contains zero product types and imports the
@@ -158,9 +163,11 @@ Sends: `hello` (now with `device_id`/`device_name` — see Stack & run), `capabi
 
 ## Current state
 
-Both domains fully built and verified (headless sims + live). Event-driven meal demo,
-scoped-LLM daily/event adaptation, guest prep-timeline + appliance gating all work.
-Stubs: FamilyProfiles/Budget/Notify plugins.
+**Six domains** built and verified (headless sims + live): `meal_plan`, `guest_dinner`,
+`vacation_prep`, `birthday_party`, and (v3.4) `grocery_cost` + `energy_saving`. Event-driven
+meal demo, scoped-LLM daily/event adaptation, guest prep-timeline + appliance gating, the
+global Advance-day world tick (v3.2), and the v3.5 generic planner (per-domain plan shape,
+date-derived plan days) all work. No plugin stubs remain — all 11 are implemented.
 
 ## Conventions & gotchas
 
@@ -171,5 +178,6 @@ Stubs: FamilyProfiles/Budget/Notify plugins.
   STRUCTURAL file (labels + the 6th event), not just runtime-mutated seed — reverting
   it drops the 6th event. Only reset appliances/shopping_list/inventory/calendar/
   guests/recipes/reminders.json.
-- The device's domain string must match the cloud's canonicalized `meal_plan` /
-  `guest_dinner` exactly, or monitoring/per-day planning won't route.
+- The device's domain string must match the cloud's canonicalized domain slug exactly —
+  one of the six (`meal_plan`, `guest_dinner`, `vacation_prep`, `birthday_party`,
+  `grocery_cost`, `energy_saving`) — or monitoring/per-day planning won't route.
