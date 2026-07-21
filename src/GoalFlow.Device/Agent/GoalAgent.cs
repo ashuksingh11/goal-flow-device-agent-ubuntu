@@ -919,7 +919,9 @@ public sealed class GoalAgent
 
             if (!string.IsNullOrWhiteSpace(raw))
             {
-                await _trace.ThinkingAsync(raw);
+                // Raw plan JSON must NOT hit the thinking wire channel (ugly if
+                // rendered, bloats UI state); genuine prose thinking comes from the
+                // grounding stream. Kept on history for the model's own context only.
                 history.AddAssistantMessage(raw);
             }
 
@@ -1019,7 +1021,9 @@ public sealed class GoalAgent
             var raw = await GetAdaptContentAsync(chat, history, ct);
             if (!string.IsNullOrWhiteSpace(raw))
             {
-                await _trace.ThinkingAsync(raw);
+                // Raw JSON patch must NOT hit the thinking wire channel (ugly if
+                // rendered, bloats UI state). Kept on history for the model's own
+                // context only.
                 history.AddAssistantMessage(raw);
             }
 
