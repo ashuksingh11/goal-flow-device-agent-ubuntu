@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
+using Stopwatch = System.Diagnostics.Stopwatch;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -249,6 +250,8 @@ public sealed class GoalAgent
             var material = changes.FirstOrDefault(c => c.Material && goal.EmittedMaterialChanges.Add(c.Key));
             if (material is not null)
             {
+                _logger.LogInformation("world_change_material goal={GoalId} kind={Kind} target_day={TargetDay} key={Key}",
+                    goalId, material.Kind, material.TargetDay, material.Key);
                 await _trace.PhaseAsync("adapting");
                 var proposal = material.Steer is not null
                     ? await ProposeDailyAdaptationAsync(goalId, goal, material, ct)
@@ -265,6 +268,7 @@ public sealed class GoalAgent
                 var quiet = changes.Any(c => c.Material)
                     ? "on track; material change already surfaced for approval."
                     : "on track; no material world changes affect the active plan.";
+                _logger.LogDebug("world_change_none goal={GoalId} observed={Observed}", goalId, changes.Count);
                 statuses.Add(BuildMonitoringStatus(goalId, goal.Dispatch.CorrelationId, false, quiet));
             }
         }
@@ -275,6 +279,8 @@ public sealed class GoalAgent
             Day = ComputeSimDay(),
             Events = events.Values.ToArray()
         };
+        _logger.LogInformation("world_tick command={Command} sim_date={SimDate} day={Day} goals={Goals} events={Events} proposals={Proposals}",
+            control.Command, summary.SimDate, summary.Day, _tasks.ActiveGoals.Count(), summary.Events.Count, proposals.Count);
         return new ControlResult(statuses, proposals, summary);
     }
 
@@ -744,6 +750,7 @@ public sealed class GoalAgent
         var taskDag = await DecomposeAsync(chat, dispatch, ct);
 
         await _trace.PhaseAsync("grounding");
+        var groundingClock = Stopwatch.StartNew();
         var ground = await _grounding.AssembleAsync(dispatch, _kernel, ct);
 
         var history = new ChatHistory();
@@ -762,6 +769,8 @@ public sealed class GoalAgent
         };
 
         var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
+        _logger.LogInformation("grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars}",
+            dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length);
 
         if (groundingSummary.Length > 0)
         {
@@ -769,7 +778,10 @@ public sealed class GoalAgent
         }
 
         await _trace.PhaseAsync("planning");
+        var composeClock = Stopwatch.StartNew();
         var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
+        _logger.LogInformation("compose_done goal={GoalId} elapsed_ms={Elapsed} items={Items} proposals={Proposals}",
+            dispatch.GoalId, composeClock.ElapsedMilliseconds, modelPlan.Plan.Count, modelPlan.Proposals.Count);
         modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan, dispatch.Domain, _clock.Today) };
 
         await _trace.PhaseAsync("checking");
@@ -1352,6 +1364,9 @@ public sealed class GoalAgent
         // The human answered, so every task waiting on that answer moves. This is
         // where a goal stops being 0% — progress is the ledger, not the clock.
         await AdvanceTasksAsync(approval.GoalId, TaskState.AwaitingApproval, TaskState.Executing);
+        var decisions = approval.Payload?.Decisions ?? [];
+        _logger.LogInformation("approval_received goal={GoalId} decisions={Total} approved={Approved} declined={Declined}",
+            approval.GoalId, decisions.Count, decisions.Count(d => d.Approved), decisions.Count(d => !d.Approved));
         var cleared = _approvals.ApplyDecisions(approval);
         var executed = new List<ExecutedEffect>();
         IReadOnlyList<PlanItem>? updatedPlan = null;
