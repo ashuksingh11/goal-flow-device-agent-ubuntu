@@ -1040,7 +1040,7 @@ public sealed class GoalAgent
         plan — do not rewrite rows the change doesn't touch. Reply with a MINIMAL
         JSON patch and nothing else (no prose, no Markdown, no code fence):
         {
-          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "day": 1, "title": "...", "detail": "...", "when": "YYYY-MM-DD", "why": ["short reason"] } ],
+          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "day": 1, "title": "...", "detail": "...", "why": ["short reason"] } ],
           "remove": ["<id to drop>"],
           "impact_delta": [ { "label": "waste", "value": "-2 items" } ],
           "rationale": "one sentence explaining the change"
@@ -1166,7 +1166,10 @@ public sealed class GoalAgent
             .Select(row => row with
             {
                 Id = target.Id,
-                Day = targetDay
+                Day = targetDay,
+                // The adapted dinner stays on its ORIGINAL calendar date — carry the target's
+                // When so it can't shift to the model's emitted (or advanced-day) date (v4.2).
+                When = target.When
             })
             .ToArray();
 
@@ -1248,7 +1251,9 @@ public sealed class GoalAgent
 
         var (newPlan, changed) = ApplyPatch(active.Plan, pending.Patch);
         active.Plan = newPlan;
-        _logger.LogInformation("adaptation_applied {ProposalId} changed={Changed} plan_items={Count}", proposalId, changed.Count, newPlan.Count);
+        var changedItem = changed.Count > 0 ? newPlan.FirstOrDefault(p => p.Id == changed[0]) : null;
+        _logger.LogInformation("adaptation_applied {ProposalId} changed={Changed} plan_items={Count} changed_day={Day} changed_when={When}",
+            proposalId, changed.Count, newPlan.Count, changedItem?.Day, changedItem?.When ?? "-");
         return (
             new ExecutedEffect { ProposalId = proposalId, Action = $"{PlanPatchModule}.{PlanPatchFunction}", Result = "plan_updated", Detail = pending.Patch.Rationale },
             newPlan,
@@ -1280,14 +1285,16 @@ public sealed class GoalAgent
             }
             else
             {
-                // Editing an existing day: keep its stable Day and calendar When (v4.2) when
-                // the patch row omits them — an adaptation changes the dish, not the date.
+                // Editing an existing day: an adaptation changes the DISH, never the calendar
+                // date. Keep the stable Day, and FORCE the original When back (v4.2) even if the
+                // model emitted a date — otherwise advancing a day and adapting a dinner shifts
+                // that row's date. The date is device-owned, not the model's to move.
                 var prev = byId[row.Id];
                 if (next.Day <= 0)
                 {
                     next = next with { Day = prev.Day };
                 }
-                if (string.IsNullOrWhiteSpace(next.When) && !string.IsNullOrWhiteSpace(prev.When))
+                if (!string.IsNullOrWhiteSpace(prev.When))
                 {
                     next = next with { When = prev.When };
                 }
