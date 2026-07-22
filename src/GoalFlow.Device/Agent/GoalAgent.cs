@@ -770,7 +770,7 @@ public sealed class GoalAgent
 
         await _trace.PhaseAsync("planning");
         var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
-        modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan, dispatch.Domain) };
+        modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan, dispatch.Domain, _clock.Today) };
 
         await _trace.PhaseAsync("checking");
         // Collapse duplicate proposals the model sometimes emits (e.g. the same
@@ -1235,9 +1235,19 @@ public sealed class GoalAgent
                 order.Add(row.Id);
                 next = next.Day > 0 ? next : next with { Day = order.Count };
             }
-            else if (next.Day <= 0)
+            else
             {
-                next = next with { Day = byId[row.Id].Day };
+                // Editing an existing day: keep its stable Day and calendar When (v4.2) when
+                // the patch row omits them — an adaptation changes the dish, not the date.
+                var prev = byId[row.Id];
+                if (next.Day <= 0)
+                {
+                    next = next with { Day = prev.Day };
+                }
+                if (string.IsNullOrWhiteSpace(next.When) && !string.IsNullOrWhiteSpace(prev.When))
+                {
+                    next = next with { When = prev.When };
+                }
             }
             byId[row.Id] = next;
             if (!changed.Contains(row.Id))
@@ -1274,7 +1284,7 @@ public sealed class GoalAgent
     /// shares a day and the span reflects the real calendar.
     /// </para>
     /// </summary>
-    private static IReadOnlyList<PlanItem> AssignPlanDays(IReadOnlyList<PlanItem> plan, string domain)
+    private static IReadOnlyList<PlanItem> AssignPlanDays(IReadOnlyList<PlanItem> plan, string domain, DateOnly mealAnchor)
     {
         if (plan.Count == 0)
         {
@@ -1283,7 +1293,17 @@ public sealed class GoalAgent
 
         if (string.Equals(domain, "meal_plan", StringComparison.Ordinal))
         {
-            return plan.Take(7).Select((item, index) => item with { Day = index + 1 }).ToArray();
+            // A dinner week IS one item per day by construction. Stamp both the 1-based Day
+            // AND a real calendar When (anchor + Day-1) so surfaces can show "Tue, Jul 22"
+            // instead of an opaque "Day N" ordinal (v4.2). The anchor is the compose-time
+            // clock = plan Day 1's date; adaptations preserve each item's When by id.
+            return plan.Take(7)
+                .Select((item, index) => item with
+                {
+                    Day = index + 1,
+                    When = mealAnchor.AddDays(index).ToString("yyyy-MM-dd")
+                })
+                .ToArray();
         }
 
         var dates = plan.Select(item => ParseWhenDate(item.When)).ToArray();
