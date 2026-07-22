@@ -25,6 +25,22 @@ public sealed record AgentSettings
 
     /// <summary>OPENROUTER_MODEL, default openai/gpt-oss-120b.</summary>
     public string ModelId { get; init; } = "openai/gpt-oss-120b";
+
+    /// <summary>
+    /// LLM_CALL_TIMEOUT_SECONDS — per-call deadline for NON-streaming LLM calls (plan
+    /// compose, daily adaptation). The line past which "slow" becomes "hung". Generous
+    /// by default because large/slow models (and provider load) push a legitimate
+    /// compose past a minute; too tight and a healthy call is cancelled and retried,
+    /// which only makes planning slower. Default 180s.
+    /// </summary>
+    public int LlmCallTimeoutSeconds { get; init; } = 180;
+
+    /// <summary>
+    /// LLM_STREAM_TIMEOUT_SECONDS — per-call deadline for the STREAMING grounding pass
+    /// (runs the tool loop + reasons aloud, so it gets more room than a compose call).
+    /// Default 210s.
+    /// </summary>
+    public int LlmStreamTimeoutSeconds { get; init; } = 210;
 }
 
 /// <summary>
@@ -94,7 +110,8 @@ public sealed class GoalAgent
         TaskManager tasks,
         PrecheckEngine prechecks,
         IClock clock,
-        ILogger<GoalAgent> logger)
+        ILogger<GoalAgent> logger,
+        AgentSettings settings)
     {
         _kernel = kernel;
         _trace = trace;
@@ -107,6 +124,10 @@ public sealed class GoalAgent
         _prechecks = prechecks;
         _clock = clock;
         _logger = logger;
+        _llmCallBudget = TimeSpan.FromSeconds(Math.Max(MinTimeoutSeconds, settings.LlmCallTimeoutSeconds));
+        _streamingCallBudget = TimeSpan.FromSeconds(Math.Max(MinTimeoutSeconds, settings.LlmStreamTimeoutSeconds));
+        _logger.LogInformation("llm_budgets model={Model} call_timeout_s={Call} stream_timeout_s={Stream}",
+            settings.ModelId, (int)_llmCallBudget.TotalSeconds, (int)_streamingCallBudget.TotalSeconds);
     }
 
     /// <summary>
@@ -326,9 +347,19 @@ public sealed class GoalAgent
     /// the board reported progress. Streaming gets more room because it runs the tool
     /// loop and reasons aloud. See <see cref="Deadline"/>.
     /// </para>
+    /// <para>
+    /// CONFIGURABLE (v4.2): defaults come from <see cref="AgentSettings.LlmCallTimeoutSeconds"/>
+    /// / <see cref="AgentSettings.LlmStreamTimeoutSeconds"/> (env <c>LLM_CALL_TIMEOUT_SECONDS</c>
+    /// / <c>LLM_STREAM_TIMEOUT_SECONDS</c>, or goalflow.conf on Tizen). A large/slow model or
+    /// provider load can push a legitimate compose past the old fixed 90s, which cancelled the
+    /// socket mid-response and retried — so the timeout is now tunable per environment.
+    /// </para>
     /// </summary>
-    private static readonly TimeSpan LlmCallBudget = TimeSpan.FromSeconds(90);
-    private static readonly TimeSpan StreamingCallBudget = TimeSpan.FromSeconds(150);
+    private readonly TimeSpan _llmCallBudget;
+    private readonly TimeSpan _streamingCallBudget;
+
+    /// <summary>Floor so a misconfigured tiny value can't make every call cancel instantly.</summary>
+    private const int MinTimeoutSeconds = 10;
 
     /// <summary>Id of the one task a goal falls back to when decomposition is unavailable.</summary>
     private const string SingleTaskId = "t1";
@@ -631,7 +662,7 @@ public sealed class GoalAgent
     /// more branching for the model to reason through before it could start writing.
     /// On a reasoning model that inflates REASONING tokens, which is the slow half of
     /// the call, and pushes a 90s compose toward its deadline (see
-    /// <see cref="LlmCallBudget"/>) or an empty response under json response_format.
+    /// <see cref="_llmCallBudget"/>) or an empty response under json response_format.
     /// The contract names exactly one domain, so only that shape is worth sending —
     /// shorter AND sharper, since the meal shape is no longer in front of a model
     /// planning a vacation. That bleed was the original bug.
@@ -874,7 +905,7 @@ public sealed class GoalAgent
             {
                 // The grounding pass calls tools and streams its reasoning, so it gets
                 // the widest budget of any call here — but a budget nonetheless.
-                using var cts = Deadline(ct, StreamingCallBudget);
+                using var cts = Deadline(ct, _streamingCallBudget);
                 await foreach (var chunk in chat.GetStreamingChatMessageContentsAsync(history, settings, _kernel, cts.Token))
                 {
                     if (!string.IsNullOrEmpty(chunk.Content))
@@ -965,7 +996,7 @@ public sealed class GoalAgent
 
         try
         {
-            using var cts = Deadline(ct, LlmCallBudget);
+            using var cts = Deadline(ct, _llmCallBudget);
             var response = await chat.GetChatMessageContentAsync(history, jsonSettings, _kernel, cts.Token);
             var content = response.Content ?? "";
             if (!string.IsNullOrWhiteSpace(content))
@@ -994,7 +1025,7 @@ public sealed class GoalAgent
             Temperature = 0.1,
             MaxTokens = 6000
         };
-        using var cts = Deadline(ct, LlmCallBudget);
+        using var cts = Deadline(ct, _llmCallBudget);
         var response = await chat.GetChatMessageContentAsync(history, strictSettings, _kernel, cts.Token);
         return response.Content ?? "";
     }
@@ -1170,7 +1201,7 @@ public sealed class GoalAgent
         {
             try
             {
-                using var cts = Deadline(ct, LlmCallBudget);
+                using var cts = Deadline(ct, _llmCallBudget);
                 var resp = await chat.GetChatMessageContentAsync(history, settings, _kernel, cts.Token);
                 var content = resp.Content ?? "";
                 if (!string.IsNullOrWhiteSpace(content))
