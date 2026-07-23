@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
 using GoalFlow.Device.Harness;
@@ -108,13 +109,17 @@ public sealed class MealPlanObserver : IDomainObserver
         }
 
         var kind = ev["kind"]?.GetValue<string>() ?? "world.change";
+        // The event's resolved fire date IS the target day's calendar date (the feed keeps
+        // day_offset and target day in lockstep: day == day_offset + 1). Show that real date
+        // rather than an opaque "Day N" ordinal (v4.2).
+        var whenLabel = FormatWhen(evDate) ?? $"Day {targetDay}";
         return new WorldChange
         {
             // STABLE key — the feed keeps returning this event every day after its
             // date, so the key must not embed today or it would re-fire daily.
             Key = $"daily:{id}",
             Kind = kind,
-            Description = $"Day {targetDay} - {summary}",
+            Description = $"{whenLabel} - {summary}",
             AffectedPlanItems = affected,
             TargetDay = targetDay,
             TargetItemId = targetItem?.Id,
@@ -144,6 +149,12 @@ public sealed class MealPlanObserver : IDomainObserver
 
     private static PlanItem? FindTargetPlanItem(IReadOnlyList<PlanItem> plan, int requestedDay)
         => plan.Count == 0 ? null : plan.FirstOrDefault(item => item.Day == requestedDay) ?? plan[^1];
+
+    /// <summary>Formats an ISO date as a short human label, e.g. "Tue, Jul 22" (v4.2). Null-safe.</summary>
+    private static string? FormatWhen(string? isoDate)
+        => DateOnly.TryParse(isoDate?.Split('T')[0], out var d)
+            ? d.ToString("ddd, MMM d", CultureInfo.InvariantCulture)
+            : null;
 
     /// <summary>The feed is optional — the guest demo has none. Absent = no events, not a crash.</summary>
     private async Task<JsonObject> LoadFeedAsync(CancellationToken ct)

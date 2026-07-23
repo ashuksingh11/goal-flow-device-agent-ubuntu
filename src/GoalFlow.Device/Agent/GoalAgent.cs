@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
+using Stopwatch = System.Diagnostics.Stopwatch;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -24,6 +25,22 @@ public sealed record AgentSettings
 
     /// <summary>OPENROUTER_MODEL, default openai/gpt-oss-120b.</summary>
     public string ModelId { get; init; } = "openai/gpt-oss-120b";
+
+    /// <summary>
+    /// LLM_CALL_TIMEOUT_SECONDS — per-call deadline for NON-streaming LLM calls (plan
+    /// compose, daily adaptation). The line past which "slow" becomes "hung". Generous
+    /// by default because large/slow models (and provider load) push a legitimate
+    /// compose past a minute; too tight and a healthy call is cancelled and retried,
+    /// which only makes planning slower. Default 180s.
+    /// </summary>
+    public int LlmCallTimeoutSeconds { get; init; } = 180;
+
+    /// <summary>
+    /// LLM_STREAM_TIMEOUT_SECONDS — per-call deadline for the STREAMING grounding pass
+    /// (runs the tool loop + reasons aloud, so it gets more room than a compose call).
+    /// Default 210s.
+    /// </summary>
+    public int LlmStreamTimeoutSeconds { get; init; } = 210;
 }
 
 /// <summary>
@@ -93,7 +110,8 @@ public sealed class GoalAgent
         TaskManager tasks,
         PrecheckEngine prechecks,
         IClock clock,
-        ILogger<GoalAgent> logger)
+        ILogger<GoalAgent> logger,
+        AgentSettings settings)
     {
         _kernel = kernel;
         _trace = trace;
@@ -106,6 +124,10 @@ public sealed class GoalAgent
         _prechecks = prechecks;
         _clock = clock;
         _logger = logger;
+        _llmCallBudget = TimeSpan.FromSeconds(Math.Max(MinTimeoutSeconds, settings.LlmCallTimeoutSeconds));
+        _streamingCallBudget = TimeSpan.FromSeconds(Math.Max(MinTimeoutSeconds, settings.LlmStreamTimeoutSeconds));
+        _logger.LogInformation("llm_budgets model={Model} call_timeout_s={Call} stream_timeout_s={Stream}",
+            settings.ModelId, (int)_llmCallBudget.TotalSeconds, (int)_streamingCallBudget.TotalSeconds);
     }
 
     /// <summary>
@@ -249,6 +271,8 @@ public sealed class GoalAgent
             var material = changes.FirstOrDefault(c => c.Material && goal.EmittedMaterialChanges.Add(c.Key));
             if (material is not null)
             {
+                _logger.LogInformation("world_change_material goal={GoalId} kind={Kind} target_day={TargetDay} key={Key}",
+                    goalId, material.Kind, material.TargetDay, material.Key);
                 await _trace.PhaseAsync("adapting");
                 var proposal = material.Steer is not null
                     ? await ProposeDailyAdaptationAsync(goalId, goal, material, ct)
@@ -265,6 +289,7 @@ public sealed class GoalAgent
                 var quiet = changes.Any(c => c.Material)
                     ? "on track; material change already surfaced for approval."
                     : "on track; no material world changes affect the active plan.";
+                _logger.LogDebug("world_change_none goal={GoalId} observed={Observed}", goalId, changes.Count);
                 statuses.Add(BuildMonitoringStatus(goalId, goal.Dispatch.CorrelationId, false, quiet));
             }
         }
@@ -275,6 +300,8 @@ public sealed class GoalAgent
             Day = ComputeSimDay(),
             Events = events.Values.ToArray()
         };
+        _logger.LogInformation("world_tick command={Command} sim_date={SimDate} day={Day} goals={Goals} events={Events} proposals={Proposals}",
+            control.Command, summary.SimDate, summary.Day, _tasks.ActiveGoals.Count(), summary.Events.Count, proposals.Count);
         return new ControlResult(statuses, proposals, summary);
     }
 
@@ -320,9 +347,19 @@ public sealed class GoalAgent
     /// the board reported progress. Streaming gets more room because it runs the tool
     /// loop and reasons aloud. See <see cref="Deadline"/>.
     /// </para>
+    /// <para>
+    /// CONFIGURABLE (v4.2): defaults come from <see cref="AgentSettings.LlmCallTimeoutSeconds"/>
+    /// / <see cref="AgentSettings.LlmStreamTimeoutSeconds"/> (env <c>LLM_CALL_TIMEOUT_SECONDS</c>
+    /// / <c>LLM_STREAM_TIMEOUT_SECONDS</c>, or goalflow.conf on Tizen). A large/slow model or
+    /// provider load can push a legitimate compose past the old fixed 90s, which cancelled the
+    /// socket mid-response and retried — so the timeout is now tunable per environment.
+    /// </para>
     /// </summary>
-    private static readonly TimeSpan LlmCallBudget = TimeSpan.FromSeconds(90);
-    private static readonly TimeSpan StreamingCallBudget = TimeSpan.FromSeconds(150);
+    private readonly TimeSpan _llmCallBudget;
+    private readonly TimeSpan _streamingCallBudget;
+
+    /// <summary>Floor so a misconfigured tiny value can't make every call cancel instantly.</summary>
+    private const int MinTimeoutSeconds = 10;
 
     /// <summary>Id of the one task a goal falls back to when decomposition is unavailable.</summary>
     private const string SingleTaskId = "t1";
@@ -625,7 +662,7 @@ public sealed class GoalAgent
     /// more branching for the model to reason through before it could start writing.
     /// On a reasoning model that inflates REASONING tokens, which is the slow half of
     /// the call, and pushes a 90s compose toward its deadline (see
-    /// <see cref="LlmCallBudget"/>) or an empty response under json response_format.
+    /// <see cref="_llmCallBudget"/>) or an empty response under json response_format.
     /// The contract names exactly one domain, so only that shape is worth sending —
     /// shorter AND sharper, since the meal shape is no longer in front of a model
     /// planning a vacation. That bleed was the original bug.
@@ -744,6 +781,7 @@ public sealed class GoalAgent
         var taskDag = await DecomposeAsync(chat, dispatch, ct);
 
         await _trace.PhaseAsync("grounding");
+        var groundingClock = Stopwatch.StartNew();
         var ground = await _grounding.AssembleAsync(dispatch, _kernel, ct);
 
         var history = new ChatHistory();
@@ -762,6 +800,8 @@ public sealed class GoalAgent
         };
 
         var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
+        _logger.LogInformation("grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars}",
+            dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length);
 
         if (groundingSummary.Length > 0)
         {
@@ -769,8 +809,11 @@ public sealed class GoalAgent
         }
 
         await _trace.PhaseAsync("planning");
+        var composeClock = Stopwatch.StartNew();
         var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
-        modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan, dispatch.Domain) };
+        _logger.LogInformation("compose_done goal={GoalId} elapsed_ms={Elapsed} items={Items} proposals={Proposals}",
+            dispatch.GoalId, composeClock.ElapsedMilliseconds, modelPlan.Plan.Count, modelPlan.Proposals.Count);
+        modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan, dispatch.Domain, _clock.Today) };
 
         await _trace.PhaseAsync("checking");
         // Collapse duplicate proposals the model sometimes emits (e.g. the same
@@ -862,7 +905,7 @@ public sealed class GoalAgent
             {
                 // The grounding pass calls tools and streams its reasoning, so it gets
                 // the widest budget of any call here — but a budget nonetheless.
-                using var cts = Deadline(ct, StreamingCallBudget);
+                using var cts = Deadline(ct, _streamingCallBudget);
                 await foreach (var chunk in chat.GetStreamingChatMessageContentsAsync(history, settings, _kernel, cts.Token))
                 {
                     if (!string.IsNullOrEmpty(chunk.Content))
@@ -919,7 +962,9 @@ public sealed class GoalAgent
 
             if (!string.IsNullOrWhiteSpace(raw))
             {
-                await _trace.ThinkingAsync(raw);
+                // Raw plan JSON must NOT hit the thinking wire channel (ugly if
+                // rendered, bloats UI state); genuine prose thinking comes from the
+                // grounding stream. Kept on history for the model's own context only.
                 history.AddAssistantMessage(raw);
             }
 
@@ -951,7 +996,7 @@ public sealed class GoalAgent
 
         try
         {
-            using var cts = Deadline(ct, LlmCallBudget);
+            using var cts = Deadline(ct, _llmCallBudget);
             var response = await chat.GetChatMessageContentAsync(history, jsonSettings, _kernel, cts.Token);
             var content = response.Content ?? "";
             if (!string.IsNullOrWhiteSpace(content))
@@ -980,7 +1025,7 @@ public sealed class GoalAgent
             Temperature = 0.1,
             MaxTokens = 6000
         };
-        using var cts = Deadline(ct, LlmCallBudget);
+        using var cts = Deadline(ct, _llmCallBudget);
         var response = await chat.GetChatMessageContentAsync(history, strictSettings, _kernel, cts.Token);
         return response.Content ?? "";
     }
@@ -995,7 +1040,7 @@ public sealed class GoalAgent
         plan — do not rewrite rows the change doesn't touch. Reply with a MINIMAL
         JSON patch and nothing else (no prose, no Markdown, no code fence):
         {
-          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "day": 1, "title": "...", "detail": "...", "when": "YYYY-MM-DD", "why": ["short reason"] } ],
+          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "day": 1, "title": "...", "detail": "...", "why": ["short reason"] } ],
           "remove": ["<id to drop>"],
           "impact_delta": [ { "label": "waste", "value": "-2 items" } ],
           "rationale": "one sentence explaining the change"
@@ -1019,7 +1064,9 @@ public sealed class GoalAgent
             var raw = await GetAdaptContentAsync(chat, history, ct);
             if (!string.IsNullOrWhiteSpace(raw))
             {
-                await _trace.ThinkingAsync(raw);
+                // Raw JSON patch must NOT hit the thinking wire channel (ugly if
+                // rendered, bloats UI state). Kept on history for the model's own
+                // context only.
                 history.AddAssistantMessage(raw);
             }
 
@@ -1119,7 +1166,10 @@ public sealed class GoalAgent
             .Select(row => row with
             {
                 Id = target.Id,
-                Day = targetDay
+                Day = targetDay,
+                // The adapted dinner stays on its ORIGINAL calendar date — carry the target's
+                // When so it can't shift to the model's emitted (or advanced-day) date (v4.2).
+                When = target.When
             })
             .ToArray();
 
@@ -1154,7 +1204,7 @@ public sealed class GoalAgent
         {
             try
             {
-                using var cts = Deadline(ct, LlmCallBudget);
+                using var cts = Deadline(ct, _llmCallBudget);
                 var resp = await chat.GetChatMessageContentAsync(history, settings, _kernel, cts.Token);
                 var content = resp.Content ?? "";
                 if (!string.IsNullOrWhiteSpace(content))
@@ -1201,7 +1251,9 @@ public sealed class GoalAgent
 
         var (newPlan, changed) = ApplyPatch(active.Plan, pending.Patch);
         active.Plan = newPlan;
-        _logger.LogInformation("adaptation_applied {ProposalId} changed={Changed} plan_items={Count}", proposalId, changed.Count, newPlan.Count);
+        var changedItem = changed.Count > 0 ? newPlan.FirstOrDefault(p => p.Id == changed[0]) : null;
+        _logger.LogInformation("adaptation_applied {ProposalId} changed={Changed} plan_items={Count} changed_day={Day} changed_when={When}",
+            proposalId, changed.Count, newPlan.Count, changedItem?.Day, changedItem?.When ?? "-");
         return (
             new ExecutedEffect { ProposalId = proposalId, Action = $"{PlanPatchModule}.{PlanPatchFunction}", Result = "plan_updated", Detail = pending.Patch.Rationale },
             newPlan,
@@ -1231,9 +1283,21 @@ public sealed class GoalAgent
                 order.Add(row.Id);
                 next = next.Day > 0 ? next : next with { Day = order.Count };
             }
-            else if (next.Day <= 0)
+            else
             {
-                next = next with { Day = byId[row.Id].Day };
+                // Editing an existing day: an adaptation changes the DISH, never the calendar
+                // date. Keep the stable Day, and FORCE the original When back (v4.2) even if the
+                // model emitted a date — otherwise advancing a day and adapting a dinner shifts
+                // that row's date. The date is device-owned, not the model's to move.
+                var prev = byId[row.Id];
+                if (next.Day <= 0)
+                {
+                    next = next with { Day = prev.Day };
+                }
+                if (!string.IsNullOrWhiteSpace(prev.When))
+                {
+                    next = next with { When = prev.When };
+                }
             }
             byId[row.Id] = next;
             if (!changed.Contains(row.Id))
@@ -1270,7 +1334,7 @@ public sealed class GoalAgent
     /// shares a day and the span reflects the real calendar.
     /// </para>
     /// </summary>
-    private static IReadOnlyList<PlanItem> AssignPlanDays(IReadOnlyList<PlanItem> plan, string domain)
+    private static IReadOnlyList<PlanItem> AssignPlanDays(IReadOnlyList<PlanItem> plan, string domain, DateOnly mealAnchor)
     {
         if (plan.Count == 0)
         {
@@ -1279,7 +1343,17 @@ public sealed class GoalAgent
 
         if (string.Equals(domain, "meal_plan", StringComparison.Ordinal))
         {
-            return plan.Take(7).Select((item, index) => item with { Day = index + 1 }).ToArray();
+            // A dinner week IS one item per day by construction. Stamp both the 1-based Day
+            // AND a real calendar When (anchor + Day-1) so surfaces can show "Tue, Jul 22"
+            // instead of an opaque "Day N" ordinal (v4.2). The anchor is the compose-time
+            // clock = plan Day 1's date; adaptations preserve each item's When by id.
+            return plan.Take(7)
+                .Select((item, index) => item with
+                {
+                    Day = index + 1,
+                    When = mealAnchor.AddDays(index).ToString("yyyy-MM-dd")
+                })
+                .ToArray();
         }
 
         var dates = plan.Select(item => ParseWhenDate(item.When)).ToArray();
@@ -1328,6 +1402,9 @@ public sealed class GoalAgent
         // The human answered, so every task waiting on that answer moves. This is
         // where a goal stops being 0% — progress is the ledger, not the clock.
         await AdvanceTasksAsync(approval.GoalId, TaskState.AwaitingApproval, TaskState.Executing);
+        var decisions = approval.Payload?.Decisions ?? [];
+        _logger.LogInformation("approval_received goal={GoalId} decisions={Total} approved={Approved} declined={Declined}",
+            approval.GoalId, decisions.Count, decisions.Count(d => d.Approved), decisions.Count(d => !d.Approved));
         var cleared = _approvals.ApplyDecisions(approval);
         var executed = new List<ExecutedEffect>();
         IReadOnlyList<PlanItem>? updatedPlan = null;

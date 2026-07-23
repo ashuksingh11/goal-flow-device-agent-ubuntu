@@ -75,6 +75,12 @@ var settings = new AgentSettings
     BaseUrl = Environment.GetEnvironmentVariable("OPENROUTER_BASE_URL") ?? "https://openrouter.ai/api/v1",
     ModelId = Environment.GetEnvironmentVariable("OPENROUTER_MODEL") ?? "openai/gpt-oss-120b",
 };
+// Per-call LLM deadlines are tunable (slow/large models push a legitimate compose past
+// the default) — override only when the env var is a positive int, else keep the default.
+if (ProgramHelpers.TryParsePositiveInt(Environment.GetEnvironmentVariable("LLM_CALL_TIMEOUT_SECONDS"), out var llmCallTimeout))
+    settings = settings with { LlmCallTimeoutSeconds = llmCallTimeout };
+if (ProgramHelpers.TryParsePositiveInt(Environment.GetEnvironmentVariable("LLM_STREAM_TIMEOUT_SECONDS"), out var llmStreamTimeout))
+    settings = settings with { LlmStreamTimeoutSeconds = llmStreamTimeout };
 var kernel = GoalAgent.BuildKernel(settings, provider);
 
 WsClient? liveWs = null;
@@ -111,7 +117,8 @@ var agent = new GoalAgent(
     tasks,
     provider.GetRequiredService<PrecheckEngine>(),
     provider.GetRequiredService<IClock>(),
-    loggerFactory.CreateLogger<GoalAgent>());
+    loggerFactory.CreateLogger<GoalAgent>(),
+    settings);
 
 // M0 VERIFICATION GATE (dev tool, not a demo path): print the deterministic
 // surface of the kernel so a refactor can be proven behavior-neutral.
@@ -1288,6 +1295,17 @@ private static string ResolveTodayToken(string value, IClock clock)
 
 public static LogLevel? ParseLogLevel()
     => Enum.TryParse<LogLevel>(Environment.GetEnvironmentVariable("LOG_LEVEL"), ignoreCase: true, out var level) ? level : null;
+
+/// <summary>Parses a positive integer config value; false (and 0) when absent/blank/non-positive.</summary>
+public static bool TryParsePositiveInt(string? raw, out int value)
+{
+    if (int.TryParse(raw, out value) && value > 0)
+    {
+        return true;
+    }
+    value = 0;
+    return false;
+}
 
 /// <summary>
 /// --verify-deadline (M6 gate 15) — a stalled provider stream must not wedge a goal.

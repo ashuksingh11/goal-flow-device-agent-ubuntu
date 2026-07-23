@@ -175,6 +175,21 @@ public sealed class Trace
             ["item"] = JsonSerializer.SerializeToNode(item, ContractJson.Options)
         });
 
+    /// <summary>A short, human-scannable label for an agent_event's Info line (no full JSON).</summary>
+    private static string CompactDetail(string kind, JsonObject payload)
+    {
+        string S(string key) => payload[key]?.ToString() ?? "";
+        return kind switch
+        {
+            AgentEventKinds.Phase => $"phase={S("phase")}",
+            AgentEventKinds.ToolCall => $"{S("module")}.{S("function")}",
+            AgentEventKinds.ToolResult => $"{S("module")}.{S("function")}",
+            AgentEventKinds.PlanProgress => $"item={payload["item"]?["title"]?.ToString() ?? ""}",
+            AgentEventKinds.TaskUpdate => $"task={S("task_id")} state={S("state")} progress={S("progress_pct")}%",
+            _ => ""
+        };
+    }
+
     private async Task EmitAsync(string kind, JsonObject payload)
     {
         var scope = Current.Value
@@ -190,7 +205,20 @@ public sealed class Trace
             Event = kind,
             Payload = payload
         };
-        _logger.LogInformation("agent_event {Event} seq={Seq} payload={Payload}", kind, evt.Seq, payload.ToJsonString(ContractJson.Options));
+        // Streamed `thinking` is high-frequency (one frame per model token-chunk) and now
+        // has a UI home (the chat-ui reasoning transcript) — keep it OFF the Info channel so
+        // the decision timeline stays readable; --verbose (Debug) still shows it. Every other
+        // agent_event is low-volume and gets a COMPACT Info line (kind + a short label), with
+        // the full payload only at Debug.
+        if (kind == AgentEventKinds.Thinking)
+        {
+            _logger.LogDebug("agent_event thinking seq={Seq} chars={Chars}", evt.Seq, (payload["text"]?.ToString() ?? "").Length);
+        }
+        else
+        {
+            _logger.LogInformation("agent_event {Event} seq={Seq} {Detail}", kind, evt.Seq, CompactDetail(kind, payload));
+            _logger.LogDebug("agent_event {Event} seq={Seq} payload={Payload}", kind, evt.Seq, payload.ToJsonString(ContractJson.Options));
+        }
         // Best-effort: a dropped/failed trace frame must NEVER crash planning.
         // The structured log above is the durable record; the streamed frame is
         // a live nicety.
