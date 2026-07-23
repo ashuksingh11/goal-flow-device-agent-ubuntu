@@ -80,10 +80,57 @@ public static class AgentEventKinds
     /// </para>
     /// </summary>
     public const string TaskUpdate = "task_update";
+
+    /// <summary>
+    /// Payload: { module, status, note?, verdict?, grade? } — one HARNESS ENGINE
+    /// entered/finished a step (v5). Where <c>phase</c> is coarse (grounding →
+    /// planning → checking), this names the specific engine doing the work —
+    /// Pre-Check, Capability Manager, Grounding, Planner, Safety Policy, Task
+    /// Manager, Approval, Monitor &amp; Adapt — so the UI can render the "harness
+    /// pipeline" lighting up engine-by-engine. Additive: an unknown module/status
+    /// is ignored rather than fatal.
+    /// </summary>
+    public const string Harness = "harness";
+}
+
+/// <summary>
+/// The <c>module</c> values a <see cref="AgentEventKinds.Harness"/> event can carry —
+/// one per harness engine, in roughly the order they fire during a plan. Unknown
+/// values are ignored by the UI, so adding an engine is additive.
+/// </summary>
+public static class HarnessModules
+{
+    public const string Precheck = "precheck";
+    public const string CapabilityManager = "capability_manager";
+    public const string Grounding = "grounding";
+    public const string Planner = "planner";
+    public const string Safety = "safety";
+    public const string TaskManager = "task_manager";
+    public const string Approval = "approval";
+    public const string MonitorAdapt = "monitor_adapt";
+}
+
+/// <summary>
+/// The <c>status</c> values a <see cref="AgentEventKinds.Harness"/> event can carry.
+/// <c>enter</c>/<c>active</c> light the engine up (the "now X is working" beat, held
+/// by the demo dwell); <c>pass</c>/<c>done</c> resolve it green; <c>block</c> resolves
+/// it red; <c>skip</c> greys it out (engine not needed this run).
+/// </summary>
+public static class HarnessStatuses
+{
+    public const string Enter = "enter";
+    public const string Active = "active";
+    public const string Pass = "pass";
+    public const string Block = "block";
+    public const string Done = "done";
+    public const string Skip = "skip";
 }
 
 /// <summary>Typed payload helpers (serialized into <see cref="AgentEvent.Payload"/>).</summary>
 public sealed record PhasePayload(string Phase);
+
+/// <summary>Payload for a <see cref="AgentEventKinds.Harness"/> event.</summary>
+public sealed record HarnessPayload(string Module, string Status, string? Note = null, string? Verdict = null, string? Grade = null);
 
 public sealed record ThinkingPayload(string Text);
 
