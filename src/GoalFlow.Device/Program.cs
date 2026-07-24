@@ -81,6 +81,10 @@ if (ProgramHelpers.TryParsePositiveInt(Environment.GetEnvironmentVariable("LLM_C
     settings = settings with { LlmCallTimeoutSeconds = llmCallTimeout };
 if (ProgramHelpers.TryParsePositiveInt(Environment.GetEnvironmentVariable("LLM_STREAM_TIMEOUT_SECONDS"), out var llmStreamTimeout))
     settings = settings with { LlmStreamTimeoutSeconds = llmStreamTimeout };
+// HARNESS_DWELL_MS (v5, presenter mode): >0 holds each harness engine's spotlight so a demo
+// audience can watch the pipeline light up. 0/unset = OFF (real timing). Allow 0 explicitly.
+if (int.TryParse(Environment.GetEnvironmentVariable("HARNESS_DWELL_MS"), out var harnessDwell) && harnessDwell >= 0)
+    settings = settings with { HarnessDwellMs = harnessDwell };
 var kernel = GoalAgent.BuildKernel(settings, provider);
 
 WsClient? liveWs = null;

@@ -168,6 +168,27 @@ public sealed class Trace
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Emits a <c>harness</c> beat: one engine (Pre-Check, Capability Manager,
+    /// Safety Policy, …) entered or finished a step. This is what lights the v5
+    /// "harness pipeline" up engine-by-engine. <paramref name="module"/> is a
+    /// <see cref="HarnessModules"/> value, <paramref name="status"/> a
+    /// <see cref="HarnessStatuses"/> value; the optional fields carry the engine's
+    /// live sub-line (<paramref name="note"/>), a short verdict, and a safety grade.
+    /// </summary>
+    public Task HarnessAsync(string module, string status, string? note = null, string? verdict = null, string? grade = null)
+    {
+        var payload = new JsonObject
+        {
+            ["module"] = module,
+            ["status"] = status
+        };
+        if (note is not null) payload["note"] = note;
+        if (verdict is not null) payload["verdict"] = verdict;
+        if (grade is not null) payload["grade"] = grade;
+        return EmitAsync(AgentEventKinds.Harness, payload);
+    }
+
     /// <summary>Emits plan_progress as each plan item materializes.</summary>
     public Task PlanProgressAsync(PlanItem item)
         => EmitAsync(AgentEventKinds.PlanProgress, new JsonObject
@@ -182,6 +203,7 @@ public sealed class Trace
         return kind switch
         {
             AgentEventKinds.Phase => $"phase={S("phase")}",
+            AgentEventKinds.Harness => $"{S("module")} {S("status")}",
             AgentEventKinds.ToolCall => $"{S("module")}.{S("function")}",
             AgentEventKinds.ToolResult => $"{S("module")}.{S("function")}",
             AgentEventKinds.PlanProgress => $"item={payload["item"]?["title"]?.ToString() ?? ""}",

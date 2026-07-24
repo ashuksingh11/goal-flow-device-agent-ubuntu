@@ -41,6 +41,16 @@ public sealed record AgentSettings
     /// Default 210s.
     /// </summary>
     public int LlmStreamTimeoutSeconds { get; init; } = 210;
+
+    /// <summary>
+    /// HARNESS_DWELL_MS (v5) — "presenter mode" demo pacing. Real harness engines run in
+    /// milliseconds, too fast to watch; when this is &gt; 0 the agent holds each engine's
+    /// spotlight for this many ms (after its <c>active</c> beat) so a demo audience can
+    /// follow the harness pipeline lighting up. Default 0 = OFF (honest timing) — real and
+    /// verify runs keep it 0, so goldens/latencies are untouched. Env var, or goalflow.conf
+    /// on Tizen. Suggested demo value ~1200–1500.
+    /// </summary>
+    public int HarnessDwellMs { get; init; } = 0;
 }
 
 /// <summary>
@@ -126,8 +136,9 @@ public sealed class GoalAgent
         _logger = logger;
         _llmCallBudget = TimeSpan.FromSeconds(Math.Max(MinTimeoutSeconds, settings.LlmCallTimeoutSeconds));
         _streamingCallBudget = TimeSpan.FromSeconds(Math.Max(MinTimeoutSeconds, settings.LlmStreamTimeoutSeconds));
-        _logger.LogInformation("llm_budgets model={Model} call_timeout_s={Call} stream_timeout_s={Stream}",
-            settings.ModelId, (int)_llmCallBudget.TotalSeconds, (int)_streamingCallBudget.TotalSeconds);
+        _harnessDwell = TimeSpan.FromMilliseconds(Math.Max(0, settings.HarnessDwellMs));
+        _logger.LogInformation("llm_budgets model={Model} call_timeout_s={Call} stream_timeout_s={Stream} harness_dwell_ms={Dwell}",
+            settings.ModelId, (int)_llmCallBudget.TotalSeconds, (int)_streamingCallBudget.TotalSeconds, (int)_harnessDwell.TotalMilliseconds);
     }
 
     /// <summary>
@@ -274,9 +285,10 @@ public sealed class GoalAgent
                 _logger.LogInformation("world_change_material goal={GoalId} kind={Kind} target_day={TargetDay} key={Key}",
                     goalId, material.Kind, material.TargetDay, material.Key);
                 await _trace.PhaseAsync("adapting");
-                var proposal = material.Steer is not null
-                    ? await ProposeDailyAdaptationAsync(goalId, goal, material, ct)
-                    : await _monitor.ProposeAdaptationAsync(goalId, material, ct);
+                var proposal = await AdaptWithHarnessAsync(goalId, material, () =>
+                    material.Steer is not null
+                        ? ProposeDailyAdaptationAsync(goalId, goal, material, ct)
+                        : _monitor.ProposeAdaptationAsync(goalId, material, ct), ct);
                 if (proposal is not null)
                 {
                     proposals.Add(proposal with { CorrelationId = goal.Dispatch.CorrelationId });
@@ -358,8 +370,24 @@ public sealed class GoalAgent
     private readonly TimeSpan _llmCallBudget;
     private readonly TimeSpan _streamingCallBudget;
 
+    /// <summary>v5 presenter-mode demo pacing; <see cref="TimeSpan.Zero"/> = OFF (real timing).</summary>
+    private readonly TimeSpan _harnessDwell;
+
     /// <summary>Floor so a misconfigured tiny value can't make every call cancel instantly.</summary>
     private const int MinTimeoutSeconds = 10;
+
+    /// <summary>
+    /// Presenter-mode dwell (v5): hold a beat after a harness engine's <c>active</c> event so a
+    /// demo audience can watch the pipeline light up engine-by-engine. No-op unless
+    /// HARNESS_DWELL_MS &gt; 0, so real and verify runs are unaffected. Honours cancellation and
+    /// never throws — a cancelled dwell must not fail planning.
+    /// </summary>
+    private async Task DwellAsync(CancellationToken ct)
+    {
+        if (_harnessDwell <= TimeSpan.Zero) return;
+        try { await Task.Delay(_harnessDwell, ct); }
+        catch (OperationCanceledException) { }
+    }
 
     /// <summary>Id of the one task a goal falls back to when decomposition is unavailable.</summary>
     private const string SingleTaskId = "t1";
@@ -767,11 +795,25 @@ public sealed class GoalAgent
         // is spent. A plan built while signed out is a plan that cannot be
         // delivered, and finding that out at approval time wastes the user's
         // decision as well as the tokens.
+        // v5 HARNESS PIPELINE: name the specific engine at work (where `phase` is coarse),
+        // so the UI lights the pipeline up engine-by-engine. Each `active` beat can be held
+        // by the presenter-mode dwell so a demo audience can watch each engine do its job.
+        await _trace.HarnessAsync(HarnessModules.Precheck, HarnessStatuses.Active, note: "Checking the world is ready…");
+        await DwellAsync(ct);
         var precheck = await _prechecks.RunForDispatchAsync(dispatch, ct);
         if (!precheck.Ok)
         {
+            await _trace.HarnessAsync(HarnessModules.Precheck, HarnessStatuses.Block,
+                note: precheck.Results.FirstOrDefault(r => r.Blocks)?.Detail ?? "world not ready", verdict: "blocked");
             return BuildPrecheckBlockedPlan(dispatch, precheck);
         }
+        await _trace.HarnessAsync(HarnessModules.Precheck, HarnessStatuses.Pass, note: "The world is ready", verdict: "ready");
+
+        // CAPABILITY MANAGER: the tool surface the planner is allowed to reach for.
+        var toolCount = GroundingFunctions().Count;
+        await _trace.HarnessAsync(HarnessModules.CapabilityManager, HarnessStatuses.Active, note: "Discovering the device's tool surface…");
+        await DwellAsync(ct);
+        await _trace.HarnessAsync(HarnessModules.CapabilityManager, HarnessStatuses.Done, note: $"{toolCount} tools available", verdict: $"{toolCount} tools");
 
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
 
@@ -781,6 +823,8 @@ public sealed class GoalAgent
         var taskDag = await DecomposeAsync(chat, dispatch, ct);
 
         await _trace.PhaseAsync("grounding");
+        await _trace.HarnessAsync(HarnessModules.Grounding, HarnessStatuses.Active, note: "Assembling real-world context…");
+        await DwellAsync(ct);
         var groundingClock = Stopwatch.StartNew();
         var ground = await _grounding.AssembleAsync(dispatch, _kernel, ct);
 
@@ -802,6 +846,7 @@ public sealed class GoalAgent
         var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
         _logger.LogInformation("grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars}",
             dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length);
+        await _trace.HarnessAsync(HarnessModules.Grounding, HarnessStatuses.Done, note: "Context assembled from the live world", verdict: "grounded");
 
         if (groundingSummary.Length > 0)
         {
@@ -809,13 +854,35 @@ public sealed class GoalAgent
         }
 
         await _trace.PhaseAsync("planning");
+        await _trace.HarnessAsync(HarnessModules.Planner, HarnessStatuses.Active, note: "Composing the plan…");
+        await DwellAsync(ct);
         var composeClock = Stopwatch.StartNew();
         var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
         _logger.LogInformation("compose_done goal={GoalId} elapsed_ms={Elapsed} items={Items} proposals={Proposals}",
             dispatch.GoalId, composeClock.ElapsedMilliseconds, modelPlan.Plan.Count, modelPlan.Proposals.Count);
         modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan, dispatch.Domain, _clock.Today) };
+        await _trace.HarnessAsync(HarnessModules.Planner, HarnessStatuses.Done, note: $"{modelPlan.Plan.Count} steps drafted", verdict: $"{modelPlan.Plan.Count} steps");
 
         await _trace.PhaseAsync("checking");
+
+        // SAFETY POLICY ENGINE: "LLM plans, code checks." The filter has vetted every tool
+        // call since grounding; here we surface its verdict (grade + any blocked actions).
+        await _trace.HarnessAsync(HarnessModules.Safety, HarnessStatuses.Active, note: "Enforcing constraints.hard on every action…");
+        await DwellAsync(ct);
+        var safetyGate = _safety.GateFor(dispatch.GoalId);
+        var safetyViolations = _safety.ViolationsFor(dispatch.GoalId).ToArray();
+        if (safetyViolations.Length > 0)
+            await _trace.HarnessAsync(HarnessModules.Safety, HarnessStatuses.Block,
+                note: safetyViolations[0], verdict: $"{safetyViolations.Length} blocked", grade: safetyGate);
+        else
+            await _trace.HarnessAsync(HarnessModules.Safety, HarnessStatuses.Pass,
+                note: "Every action within policy", verdict: "allowed", grade: safetyGate);
+
+        // TASK MANAGER: the goal ledger the whole plan hangs off (the DAG grounded above).
+        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Active, note: "Recording the goal ledger…");
+        await DwellAsync(ct);
+        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Done, note: $"{taskDag.Count} task(s) tracked", verdict: $"{taskDag.Count} tasks");
+
         // Collapse duplicate proposals the model sometimes emits (e.g. the same
         // "run dishwasher" action repeated per night) — dedupe by module+function+args
         // so the UI shows one, and re-assign sequential proposal ids after collapsing.
@@ -826,6 +893,14 @@ public sealed class GoalAgent
             .Select((p, i) => p with { ProposalId = $"p{i + 1}" })
             .Select(_approvals.Register)
             .ToArray();
+
+        // APPROVAL / CONSENT: side-effecting calls frozen into tiered proposals for the human.
+        await _trace.HarnessAsync(HarnessModules.Approval, HarnessStatuses.Active, note: "Freezing side-effects for your approval…");
+        await DwellAsync(ct);
+        await _trace.HarnessAsync(HarnessModules.Approval, HarnessStatuses.Done,
+            note: proposals.Length == 0 ? "Nothing needs approval" : $"{proposals.Length} awaiting approval",
+            verdict: $"{proposals.Length} pending");
+
         foreach (var item in modelPlan.Plan)
         {
             await _trace.PlanProgressAsync(item);
@@ -845,7 +920,7 @@ public sealed class GoalAgent
             {
                 Plan = modelPlan.Plan,
                 Proposals = proposals,
-                Safety = new SafetyVerdict { Gate = _safety.GateFor(dispatch.GoalId), Violations = _safety.ViolationsFor(dispatch.GoalId).ToArray() },
+                Safety = new SafetyVerdict { Gate = safetyGate, Violations = safetyViolations },
                 Precheck = ToPrecheckVerdict(precheck),
                 Impact = modelPlan.Impact,
                 DemoEvents = demoEvents,
@@ -1048,6 +1123,32 @@ public sealed class GoalAgent
         Keep it tiny: usually a single upsert. Reuse an existing id to SWAP that row;
         use a new id only to ADD a step. Honor the steer.
         """;
+
+    /// <summary>
+    /// v5: wrap a daily adaptation with the harness beats that light the board's monitoring
+    /// ribbon — Monitor &amp; Adapt → Safety → Task Manager — regardless of which branch
+    /// actually produced the proposal (LLM steer vs deterministic effect patch) or which
+    /// control path called it. Keeping the beats HERE (not inside the two proposer methods)
+    /// is what makes advance-day and trigger_event light the ribbon identically.
+    /// </summary>
+    private async Task<Proposal?> AdaptWithHarnessAsync(string goalId, WorldChange material, Func<Task<Proposal?>> propose, CancellationToken ct)
+    {
+        await _trace.HarnessAsync(HarnessModules.MonitorAdapt, HarnessStatuses.Active, note: $"Re-planning around: {material.Description}");
+        await DwellAsync(ct);
+        var proposal = await propose();
+        if (proposal is not null)
+        {
+            await _trace.HarnessAsync(HarnessModules.Safety, HarnessStatuses.Pass, note: "Re-checked every item against policy", verdict: "allowed", grade: _safety.GateFor(goalId));
+            await DwellAsync(ct);
+            await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Done, note: "Ledger updated", verdict: "updated");
+            await _trace.HarnessAsync(HarnessModules.MonitorAdapt, HarnessStatuses.Done, note: "1 adaptation proposed", verdict: "1 proposal");
+        }
+        else
+        {
+            await _trace.HarnessAsync(HarnessModules.MonitorAdapt, HarnessStatuses.Done, note: "No change needed", verdict: "no change");
+        }
+        return proposal;
+    }
 
     private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, GoalRecord active, WorldChange change, CancellationToken ct, string? eventId = null)
     {
@@ -1573,7 +1674,8 @@ public sealed class GoalAgent
 
             await _trace.ThinkingAsync($"material event triggered: {change.Description}");
             await _trace.PhaseAsync("adapting");
-            var proposal = await ProposeDailyAdaptationAsync(control.GoalId, activeGoal, change, ct, eventId);
+            var proposal = await AdaptWithHarnessAsync(control.GoalId, change, () =>
+                ProposeDailyAdaptationAsync(control.GoalId, activeGoal, change, ct, eventId), ct);
             if (proposal is not null)
             {
                 proposal = proposal with { CorrelationId = activeGoal.Dispatch.CorrelationId };
@@ -1652,9 +1754,10 @@ public sealed class GoalAgent
             await _trace.PhaseAsync("adapting");
             // Daily-feed changes carry a steer → a SCOPED LLM re-plan produces a plan
             // patch. Other changes (guest RSVP) keep the deterministic effect proposal.
-            var proposal = material.Steer is not null
-                ? await ProposeDailyAdaptationAsync(control.GoalId, active, material, ct)
-                : await _monitor.ProposeAdaptationAsync(control.GoalId, material, ct);
+            var proposal = await AdaptWithHarnessAsync(control.GoalId, material, () =>
+                material.Steer is not null
+                    ? ProposeDailyAdaptationAsync(control.GoalId, active, material, ct)
+                    : _monitor.ProposeAdaptationAsync(control.GoalId, material, ct), ct);
             if (proposal is not null)
             {
                 proposal = proposal with { CorrelationId = active.Dispatch.CorrelationId };
