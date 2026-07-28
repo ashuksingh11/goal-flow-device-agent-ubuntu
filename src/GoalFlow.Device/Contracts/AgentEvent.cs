@@ -138,4 +138,10 @@ public sealed record ToolCallPayload(string Module, string Function, JsonObject?
 
 public sealed record ToolResultPayload(string Module, string Function, string Summary);
 
-public sealed record PlanProgressPayload(PlanItem Item);
+/// <summary>
+/// One plan item taking shape. <paramref name="Total"/> (v5.1) is how many items the
+/// finished plan has: the compose call is NOT streamed, so every item is emitted in one
+/// loop and a UI cannot otherwise tell how many are still coming. With it a surface can
+/// reserve exactly N rows up front, whatever the goal's shape.
+/// </summary>
+public sealed record PlanProgressPayload(PlanItem Item, int Total);
