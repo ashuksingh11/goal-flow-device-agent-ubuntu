@@ -189,11 +189,16 @@ public sealed class Trace
         return EmitAsync(AgentEventKinds.Harness, payload);
     }
 
-    /// <summary>Emits plan_progress as each plan item materializes.</summary>
-    public Task PlanProgressAsync(PlanItem item)
+    /// <summary>
+    /// Emits plan_progress as each plan item materializes. <paramref name="total"/> is the
+    /// finished plan's item count — see PlanProgressPayload: the caller knows it before it
+    /// emits the first item, and a UI cannot derive it from the stream.
+    /// </summary>
+    public Task PlanProgressAsync(PlanItem item, int total)
         => EmitAsync(AgentEventKinds.PlanProgress, new JsonObject
         {
-            ["item"] = JsonSerializer.SerializeToNode(item, ContractJson.Options)
+            ["item"] = JsonSerializer.SerializeToNode(item, ContractJson.Options),
+            ["total"] = total
         });
 
     /// <summary>A short, human-scannable label for an agent_event's Info line (no full JSON).</summary>
@@ -206,7 +211,7 @@ public sealed class Trace
             AgentEventKinds.Harness => $"{S("module")} {S("status")}",
             AgentEventKinds.ToolCall => $"{S("module")}.{S("function")}",
             AgentEventKinds.ToolResult => $"{S("module")}.{S("function")}",
-            AgentEventKinds.PlanProgress => $"item={payload["item"]?["title"]?.ToString() ?? ""}",
+            AgentEventKinds.PlanProgress => $"item={payload["item"]?["title"]?.ToString() ?? ""} of {payload["total"]?.ToString() ?? "?"}",
             AgentEventKinds.TaskUpdate => $"task={S("task_id")} state={S("state")} progress={S("progress_pct")}%",
             _ => ""
         };

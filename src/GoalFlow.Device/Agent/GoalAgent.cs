@@ -901,9 +901,12 @@ public sealed class GoalAgent
             note: proposals.Length == 0 ? "Nothing needs approval" : $"{proposals.Length} awaiting approval",
             verdict: $"{proposals.Length} pending");
 
+        // The whole plan is already in hand (one non-streaming compose call), so every
+        // item carries the total — that is what lets a surface reserve exactly N rows
+        // before the first one lands, for a goal of any shape.
         foreach (var item in modelPlan.Plan)
         {
-            await _trace.PlanProgressAsync(item);
+            await _trace.PlanProgressAsync(item, modelPlan.Plan.Count);
         }
 
         var worldSnapshot = await _monitor.CaptureSnapshotAsync(ct);
