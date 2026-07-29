@@ -27,36 +27,23 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     private readonly ILogger<SafetyFilter> _logger;
 
     /// <summary>
-    /// Armed policy + recorded violations, PER GOAL. This used to be two plain
-    /// fields on a singleton, which made the gate unsound the moment two goals
-    /// overlapped — see <see cref="BeginGoal"/>.
+    /// Armed policy + recorded violations, PER GOAL — see <see cref="ArmedPolicies"/>,
+    /// which owns that state so a capability plugin can READ the armed policy without
+    /// taking a reference to the enforcer (and closing a DI cycle).
     /// </summary>
-    private readonly ConcurrentDictionary<string, GoalPolicy> _policies = new(StringComparer.Ordinal);
-
-    /// <summary>
-    /// Which goal the current call belongs to. AsyncLocal because the kernel
-    /// invokes plugin functions deep inside the planning await-chain: there is no
-    /// parameter to thread a goal id through, but the ExecutionContext flows —
-    /// including across the <c>Task.Run</c> that Program uses to dispatch frames.
-    /// </summary>
-    private static readonly AsyncLocal<string?> CurrentGoalId = new();
+    private readonly ArmedPolicies _armed;
 
     private Trace? _trace;
 
     private readonly SafetyPolicy _policy;
     private readonly CapabilityManager _capabilities;
 
-    public SafetyFilter(ILogger<SafetyFilter> logger, SafetyPolicy policy, CapabilityManager capabilities)
+    public SafetyFilter(ILogger<SafetyFilter> logger, SafetyPolicy policy, CapabilityManager capabilities, ArmedPolicies armed)
     {
         _logger = logger;
         _policy = policy;
         _capabilities = capabilities;
-    }
-
-    private sealed class GoalPolicy
-    {
-        public required JsonObject Hard { get; init; }
-        public List<string> Violations { get; } = [];
+        _armed = armed;
     }
 
     /// <summary>
@@ -78,10 +65,7 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     /// </para>
     /// </summary>
     public IDisposable BeginGoal(string goalId, JsonObject hardConstraints)
-    {
-        _policies[goalId] = new GoalPolicy { Hard = hardConstraints };
-        return new GoalScope(goalId);
-    }
+        => _armed.Arm(goalId, hardConstraints);
 
     /// <summary>
     /// Re-enters an already-armed goal's scope, for calls that happen after
@@ -95,34 +79,19 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     /// appliance) checks the wrong goal's constraints.
     /// </para>
     /// </summary>
-    public IDisposable EnterGoal(string goalId) => new GoalScope(goalId);
+    public IDisposable EnterGoal(string goalId) => _armed.Enter(goalId);
 
     /// <summary>Forgets a goal's policy and violations (control: reset).</summary>
-    public void RemoveGoal(string goalId) => _policies.TryRemove(goalId, out _);
+    public void RemoveGoal(string goalId) => _armed.Remove(goalId);
 
     public void SetTrace(Trace trace) => _trace = trace;
 
     /// <summary>Violations recorded for one goal → its plan_ready payload.safety.</summary>
-    public IReadOnlyList<string> ViolationsFor(string goalId)
-        => _policies.TryGetValue(goalId, out var policy) ? policy.Violations.ToArray() : [];
+    public IReadOnlyList<string> ViolationsFor(string goalId) => _armed.ViolationsFor(goalId);
 
     /// <summary>That goal's overall gate ("passed" / "blocked").</summary>
     public string GateFor(string goalId)
         => ViolationsFor(goalId).Count == 0 ? SafetyGates.Passed : SafetyGates.Blocked;
-
-    /// <summary>Sets the ambient goal for this async flow; restores the previous on dispose.</summary>
-    private sealed class GoalScope : IDisposable
-    {
-        private readonly string? _previous;
-
-        public GoalScope(string goalId)
-        {
-            _previous = CurrentGoalId.Value;
-            CurrentGoalId.Value = goalId;
-        }
-
-        public void Dispose() => CurrentGoalId.Value = _previous;
-    }
 
     /// <inheritdoc />
     public async Task OnFunctionInvocationAsync(
@@ -171,17 +140,16 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     /// be noticed if a code path ever forgets to enter a scope.
     /// </para>
     /// </summary>
-    private GoalPolicy? CurrentPolicy(string module, string function)
+    private ArmedPolicies.GoalPolicy? CurrentPolicy(string module, string function)
     {
-        var goalId = CurrentGoalId.Value;
-        if (goalId is not null && _policies.TryGetValue(goalId, out var policy))
+        if (_armed.Current() is { } policy)
         {
             return policy;
         }
 
         _logger.LogWarning(
             "safety_unscoped {Module}.{Function} ran with no armed policy (goal_id={GoalId}) — nothing to enforce; a caller likely forgot BeginGoal/EnterGoal",
-            module, function, goalId ?? "<none>");
+            module, function, _armed.CurrentGoal ?? "<none>");
         return null;
     }
 

@@ -57,6 +57,38 @@
       "modules": ["Appliance", "Notify"],
       "constraint": "quiet_hours",
       "args": ["time", "atTime"]
+    },
+    {
+      "$comment": [
+        "PEAK TARIFF (v6). The same rule KIND as quiet hours, pointed at a different",
+        "window — no new engine code, which is the point of kinds-vs-instances.",
+        "",
+        "It binds only to Appliance, and only bites when the dispatch CARRIES peak_hours.",
+        "The cloud puts that key on energy_saving goals alone, so a guest dinner's 21:00",
+        "dishwasher run — inside the 17:00-21:00 peak window — is untouched. That is the",
+        "scoping doing its job: on an energy goal a peak-hour run defeats the goal's own",
+        "objective; on a dinner it is just how dinner works."
+      ],
+      "kind": "time_window_block",
+      "modules": ["Appliance"],
+      "constraint": "peak_hours",
+      "args": ["time", "atTime"]
+    },
+    {
+      "$comment": [
+        "AWAY WINDOW (v6). Nobody is home, so nothing may be set running in the house —",
+        "an oven preheat, a dishwasher cycle, a defrost, or an announcement to an empty",
+        "kitchen. Endpoints are exclusive (see DateWindowBlockRule): the family is home",
+        "for part of the departure and return days, and 'run the dishwasher before you",
+        "leave' is the vacation plan's own best move.",
+        "",
+        "This is the constraint that makes a vacation goal genuinely enforced rather than",
+        "merely advised — through v5 the away plan was pure suggestion."
+      ],
+      "kind": "date_window_block",
+      "modules": ["Appliance", "Notify"],
+      "constraint": "away_window",
+      "args": ["atTime", "date", "when"]
     }
   ]
 }

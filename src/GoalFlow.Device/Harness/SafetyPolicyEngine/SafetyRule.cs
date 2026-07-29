@@ -253,3 +253,81 @@ public sealed class TimeWindowBlockRule : SafetyRule
         return TimeOnly.TryParse(value, out var time) ? time.ToString("HH:mm") : null;
     }
 }
+
+/// <summary>
+/// Blocks a call scheduled on a DATE inside a forbidden date range — the away
+/// window: nobody is home, so nothing may be set running in the house.
+///
+/// <para>
+/// The sibling of <see cref="TimeWindowBlockRule"/>, and separate on purpose: that
+/// one compares a time of day (and wraps midnight), this one compares a calendar
+/// date. Folding them into one rule would mean one Evaluate guessing which kind of
+/// value it was handed, which is how "22:00" ends up parsed as a date.
+/// </para>
+///
+/// <para>
+/// ENDPOINTS ARE EXCLUSIVE. The family is home for part of the departure day and
+/// part of the return day, and the vacation plan's own best move — run the
+/// dishwasher before you leave — happens ON the departure date. Blocking the travel
+/// days would veto the plan the goal exists to produce, so only the days the house
+/// is genuinely empty count. Whole-day granularity: the seeded world knows which
+/// DAY the family leaves, not the hour.
+/// </para>
+/// </summary>
+public sealed class DateWindowBlockRule : SafetyRule
+{
+    /// <summary>The constraints.hard key holding {start, end} as ISO dates (away_window).</summary>
+    public required string Constraint { get; init; }
+
+    /// <summary>Argument names that might carry the date ("atTime", "date", "when").</summary>
+    public required IReadOnlyList<string> Args { get; init; }
+
+    public override string? Evaluate(JsonObject hard, string function, KernelArguments arguments, string? resultText)
+    {
+        if (hard[Constraint] is not JsonObject window)
+        {
+            return null;
+        }
+
+        if (!DateOnly.TryParse(window["start"]?.GetValue<string>(), out var start)
+            || !DateOnly.TryParse(window["end"]?.GetValue<string>(), out var end))
+        {
+            return null;
+        }
+
+        foreach (var name in Args)
+        {
+            var scheduled = ExtractDate(GetString(arguments, name));
+            if (scheduled is { } date && date > start && date < end)
+            {
+                return $"{function} is scheduled for {date:yyyy-MM-dd}, inside {Constraint} {start:yyyy-MM-dd}-{end:yyyy-MM-dd} — nobody is home";
+            }
+        }
+
+        return null;
+    }
+
+    private static string? GetString(KernelArguments args, string name)
+        => args.TryGetValue(name, out var value) ? value?.ToString() : null;
+
+    /// <summary>
+    /// The ISO date prefix of an argument, or null when it carries no date.
+    ///
+    /// <para>
+    /// Deliberately strict rather than DateTime.TryParse: that helpfully resolves a
+    /// bare "22:00" to TODAY, which would make a quiet-hours-shaped argument look
+    /// like a date inside the away window and block a call nobody scheduled while
+    /// away. The contract's arg shapes are "YYYY-MM-DD" and "YYYY-MM-DDTHH:mm", so
+    /// requiring that prefix costs nothing real and removes the false positive.
+    /// </para>
+    /// </summary>
+    private static DateOnly? ExtractDate(string? value)
+    {
+        if (value is null || value.Length < 10)
+        {
+            return null;
+        }
+
+        return DateOnly.TryParseExact(value[..10], "yyyy-MM-dd", out var date) ? date : null;
+    }
+}

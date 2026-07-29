@@ -1,16 +1,23 @@
 {
   "comment": [
-    "GROCERY/HOUSEHOLD BUDGET. Read-only awareness for the planner: it ESTIMATES with",
-    "this so it can plan within the cap. ENFORCEMENT of budget_cap is the SafetyFilter's",
-    "job at ShoppingList.PlaceOrder time (the numeric_cap rule in policy.json) — 'LLM",
-    "plans, code checks'. The cap here is informational; the hard cap rides constraints.hard.",
+    "GROCERY/HOUSEHOLD BUDGET — what has been SPENT, and what things cost. Read-only",
+    "awareness for the planner: it ESTIMATES with this so it can plan within the cap.",
+    "ENFORCEMENT of budget_cap is the SafetyFilter's job at ShoppingList.PlaceOrder",
+    "time (the numeric_cap rule in policy.json) — 'LLM plans, code checks'.",
+    "",
+    "v6 — THE CAP IS GONE FROM THIS FILE, deliberately. It used to sit here as",
+    "`cap: 120.0` beside the cloud's constraints.hard.budget_cap: 120.0 — one policy,",
+    "two copies, hand-synced, and the copy the planner read was not the copy anything",
+    "enforced. It was also wrong per goal, since the account now sends $200 for a party",
+    "and $1500 for a trip. BudgetPlugin reads the goal's ARMED cap through IActivePolicy",
+    "(gate 19 fails if `cap` reappears here). Policy pushes down from the account; the",
+    "device owns world state, which is `spent`.",
     "",
     "No dates: `period` is a label, not a schedule, so the day-offset rule doesn't apply.",
     "`prices` is a small price book so EstimateCost returns a real number instead of a guess."
   ],
   "period": "this week",
   "currency": "USD",
-  "cap": 120.0,
   "spent": 34.5,
   "prices": {
     "milk": 3.2,

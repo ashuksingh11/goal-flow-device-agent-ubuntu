@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
 using GoalFlow.Device.Harness;
@@ -14,30 +15,55 @@ namespace GoalFlow.Device.Products.FamilyHub;
 /// READ-ONLY by design: the planner uses this to ESTIMATE so it can plan within
 /// the cap. ENFORCEMENT of budget_cap is the SafetyFilter's job at
 /// ShoppingList.PlaceOrder time (the numeric_cap rule) — "LLM plans, code checks".
-/// The cap returned here is informational; the hard cap rides constraints.hard.
+///
+/// <para>
+/// v6 — THE CAP IS NOT DEVICE DATA. It comes from the goal's armed
+/// <c>constraints.hard.budget_cap</c> via <see cref="IActivePolicy"/>, so the number
+/// the planner plans against IS the number that will be enforced. data/budget.json
+/// used to carry its own <c>cap: 120</c> beside the cloud's — two copies of one
+/// policy, hand-synced, and the planner read the copy nothing enforced. It was also
+/// wrong per goal: the cloud now sends $200 for a party and $1500 for a trip, and a
+/// device-side 120 would have quietly contradicted both. What stays here is what is
+/// genuinely device knowledge: what has been SPENT, and the price book.
+/// </para>
 /// </summary>
 [Description("Grocery/household budget status and cost estimation.")]
 public sealed class BudgetPlugin
 {
     private readonly IProductApiAdapter _store;
+    private readonly IActivePolicy _policy;
 
-    public BudgetPlugin(IProductApiAdapter store) => _store = store;
+    public BudgetPlugin(IProductApiAdapter store, IActivePolicy policy)
+    {
+        _store = store;
+        _policy = policy;
+    }
 
     [KernelFunction]
     [Description("Returns the budget period, cap, amount spent so far, and remaining headroom.")]
     public async Task<string> GetBudgetStatus(CancellationToken ct = default)
     {
         var doc = await _store.LoadResolvedAsync("budget", ct);
-        var cap = doc["cap"]?.GetValue<double>() ?? 0;
         var spent = doc["spent"]?.GetValue<double>() ?? 0;
-        return Json(new JsonObject
+        var status = new JsonObject
         {
             ["period"] = doc["period"]?.GetValue<string>() ?? "this week",
             ["currency"] = doc["currency"]?.GetValue<string>() ?? "USD",
-            ["cap"] = cap,
-            ["spent"] = spent,
-            ["remaining"] = Math.Round(cap - spent, 2)
-        });
+            ["spent"] = spent
+        };
+
+        // No cap on this goal (or no goal scope) is a real answer, not a zero: an
+        // energy-saving goal has no spend ceiling, and reporting "cap 0, remaining
+        // -34.50" would tell the planner it is already over budget.
+        var cap = _policy.ActiveHard()?["budget_cap"];
+        if (cap is not null && cap.GetValueKind() != JsonValueKind.Null)
+        {
+            var ceiling = cap.GetValue<double>();
+            status["cap"] = ceiling;
+            status["remaining"] = Math.Round(ceiling - spent, 2);
+        }
+
+        return Json(status);
     }
 
     [KernelFunction]
