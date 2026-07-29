@@ -119,7 +119,12 @@ wired separately in each host.
     which `data/budget.json` no longer duplicates. Two new window instances land
     here too: `peak_hours` (existing `time_window_block` kind, energy goals only)
     and `away_window` (new `date_window_block` kind, exclusive endpoints).
-    Gate: `verify/v6-m2/check.sh`.
+    **v6-M3:** `IPolicyResolver` (product-implemented) narrows the dispatched ceiling
+    against the world before arming — `min(budget_cap, envelope − spent)` — and
+    `ReResolveAsync` recomputes it on approval and each day tick, always from the
+    DISPATCHED block so a freed-up envelope lets the ceiling climb back.
+    `ShoppingList.PlaceOrder` accrues into `budget.spent`, which is what makes two
+    goals share a wallet. Gate: `verify/v6-m3/check.sh`.
   - `TaskManager/` — THE GOAL LEDGER (v3-M2). `TaskManager` + `GoalRecord` +
     `TaskRecord` + `TaskState`: the task DAG, a validated lifecycle (illegal moves
     are refused, not applied), retries, and **derived** progress — which is what

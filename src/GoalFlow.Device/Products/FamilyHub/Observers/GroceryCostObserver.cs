@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using GoalFlow.Device.Contracts;
 using GoalFlow.Device.Harness;
@@ -47,6 +48,84 @@ public sealed class GroceryCostObserver : IDomainObserver
             ["grocery"] = grocery,
             ["inventory"] = await _store.LoadResolvedAsync("inventory", ct),
             ["budget"] = await _store.LoadResolvedAsync("budget", ct)
+        };
+    }
+
+    /// <summary>
+    /// The pending-update feed PLUS the one change no feed announces: another goal
+    /// spending the household envelope (v6-M3).
+    /// </summary>
+    public async Task<IReadOnlyList<WorldChange>> ObserveAsync(GoalRecord goal, CancellationToken ct = default)
+    {
+        var changes = Observe(goal).ToList();
+        if (await EnvelopeSqueezeAsync(goal, ct) is { } squeeze)
+        {
+            changes.Add(squeeze);
+        }
+
+        return changes;
+    }
+
+    /// <summary>
+    /// "Someone else spent the money." Material only when the envelope's remaining
+    /// headroom has fallen BELOW this goal's own budget — until then another goal's
+    /// spending is simply not this goal's problem, and waking a family for it would be
+    /// the kind of noise that gets an agent switched off.
+    ///
+    /// <para>
+    /// The comparison is against the goal's DISPATCHED cap, not its armed one: the
+    /// armed cap is already narrowed by this same envelope, so comparing to it would
+    /// be comparing a number to itself.
+    /// </para>
+    /// </summary>
+    private async Task<WorldChange?> EnvelopeSqueezeAsync(GoalRecord goal, CancellationToken ct)
+    {
+        var hard = goal.Dispatch.Constraints.Hard;
+        if (hard["budget_envelope"] is not JsonObject envelope
+            || envelope["cap"]?.GetValueKind() != JsonValueKind.Number
+            || hard["budget_cap"]?.GetValueKind() != JsonValueKind.Number)
+        {
+            return null;
+        }
+
+        var planned = goal.WorldSnapshot["budget"]?["spent"]?.GetValue<double>() ?? 0;
+        var spent = (await _store.LoadResolvedAsync("budget", ct))["spent"]?.GetValue<double>() ?? 0;
+        if (spent <= planned)
+        {
+            return null;
+        }
+
+        var cap = envelope["cap"]!.GetValue<double>();
+        var goalCap = hard["budget_cap"]!.GetValue<double>();
+        var remaining = Math.Round(Math.Max(0, cap - spent), 2);
+        if (remaining >= goalCap)
+        {
+            return null;
+        }
+
+        return new WorldChange
+        {
+            // STABLE per spend level: the squeeze keeps being true every day after it
+            // happens, so keying on today would re-raise it every tick.
+            Key = $"budget:envelope:{spent:0.00}",
+            Kind = "budget.envelope_squeezed",
+            Description =
+                $"Another goal has spent from the household budget: ${remaining:0.00} of the ${cap:0.00} "
+                + $"envelope is left, less than this goal's ${goalCap:0.00}.",
+            AffectedPlanItems = ["grocery-basket"],
+            Context = new JsonObject
+            {
+                ["envelope_cap"] = cap,
+                ["spent"] = Math.Round(spent, 2),
+                ["remaining"] = remaining,
+                ["goal_cap"] = goalCap
+            },
+            Material = true,
+            RecommendedAction = $"Re-plan the basket to fit the ${remaining:0.00} left in the household budget.",
+            Steer =
+                $"The household budget is shared, and another goal has spent from it: only ${remaining:0.00} is left "
+                + $"this period, below this goal's ${goalCap:0.00}. Re-plan the shopping to fit ${remaining:0.00} — defer "
+                + "what is not urgent, substitute cheaper equivalents, and keep the hard dietary constraints intact."
         };
     }
 
