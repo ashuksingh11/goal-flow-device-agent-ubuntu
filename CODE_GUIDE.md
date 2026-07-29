@@ -40,6 +40,7 @@ src/GoalFlow.Device/
       SafetyRule.cs                  #     the rule KINDS (blocked_terms, numeric_cap, time_window_block,
                                      #     date_window_block — the away window — result_screen)
       ArmedPolicies.cs               #     which constraints are in force for which goal (read via IActivePolicy)
+      IPolicyResolver.cs             #     the seam: how the WORLD narrows a dispatched ceiling before arming
       TermMatcher.cs                 #     token/stem matching: "peanuts" blocks "peanut butter", not "coconut"
       AutomationGrade.cs             #     A0/A1/A2/AX + the v2 tier mapping
     TaskManager/                     # [4] THE GOAL LEDGER — what makes Agent Board honest
@@ -72,7 +73,7 @@ src/GoalFlow.Device/
       # 18 grounded READ tools + 14 [SideEffect] proposable functions across the 11
       # (FamilyProfiles/Budget/Notify were [Unavailable] stubs in early v3; M7 filled them in)
   Transport/WsClient.cs              # one outbound BCL ClientWebSocket to the cloud hub
-verify/m0/ … verify/v6-m2/         # the gates — run the LATEST milestone's check.sh before every commit
+verify/m0/ … verify/v6-m3/         # the gates — run the LATEST milestone's check.sh before every commit
 ```
 
 **The split is the point.** `Harness/` is domain- and product-agnostic; `Products/`
@@ -201,6 +202,20 @@ different classes:
     says which of its calls each applies to, plus its ingredient vocabulary
     (dairy → milk/paneer/…). Before v3 this was a chain of hardcoded
     `module == "ShoppingList"` comparisons inside the filter.
+  - **v6-M3 — the household envelope, resolved BEFORE arming.** The account sends a
+    shared `budget_envelope` ($600/month) alongside the goal's own `budget_cap`; the
+    device holds the third number, `spent`. `IPolicyResolver` (implemented by the pack
+    as `FamilyHubPolicyResolver`) narrows the goal's ceiling to
+    `min(budget_cap, envelope − spent)` at `BeginGoalAsync`, and `ReResolveAsync`
+    recomputes it at approval time and on every day tick. **The rules still read
+    `constraints.hard` and nothing else** — the arithmetic happens once, in a
+    resolution step, and what gets armed is a plain hard block. Re-resolution starts
+    from the DISPATCHED block every time, so a ceiling can climb back when the
+    envelope frees up; from the last effective one it could only ever fall.
+    `ShoppingList.PlaceOrder` now adds its total to `budget.spent` — that write is what
+    makes two goals share a wallet, and `GroceryCostObserver` raises a material
+    `budget.envelope_squeezed` change when another goal's spending leaves less than
+    this goal's own cap.
   - **v6 — two window instances the cloud resolves per domain.** `peak_hours`
     (electricity tariff) needed NO engine code: it is `time_window_block` pointed at
     a different key, bound to `Appliance`, and it only bites on goals whose dispatch

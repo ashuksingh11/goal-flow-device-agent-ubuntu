@@ -42,7 +42,20 @@ public sealed class ArmedPolicies : IActivePolicy
     /// <summary>One goal's armed constraints plus the violations recorded against it.</summary>
     public sealed class GoalPolicy
     {
-        public required JsonObject Hard { get; init; }
+        /// <summary>
+        /// What the CLOUD sent, kept verbatim. Re-resolution starts here every time —
+        /// never from the last effective block, or the envelope would be subtracted
+        /// again on each pass and the ceiling would walk itself down to zero.
+        /// </summary>
+        public required JsonObject Dispatched { get; init; }
+
+        /// <summary>
+        /// What is actually enforced: the dispatched block after the product's
+        /// <see cref="IPolicyResolver"/> narrowed it against the world. Equal to
+        /// <see cref="Dispatched"/> when a product declares no resolver.
+        /// </summary>
+        public required JsonObject Hard { get; set; }
+
         public List<string> Violations { get; } = [];
     }
 
@@ -50,10 +63,31 @@ public sealed class ArmedPolicies : IActivePolicy
     public string? CurrentGoal => CurrentGoalId.Value;
 
     /// <summary>Arms a goal's constraints and enters its scope; dispose leaves the scope only.</summary>
-    public IDisposable Arm(string goalId, JsonObject hard)
+    /// <param name="effective">
+    /// The block to enforce, when a resolver has already narrowed it. Omit and the
+    /// dispatched block is enforced as sent.
+    /// </param>
+    public IDisposable Arm(string goalId, JsonObject hard, JsonObject? effective = null)
     {
-        _policies[goalId] = new GoalPolicy { Hard = hard };
+        _policies[goalId] = new GoalPolicy { Dispatched = hard, Hard = effective ?? hard };
         return new GoalScope(goalId);
+    }
+
+    /// <summary>The dispatched (un-narrowed) constraints of an armed goal, for re-resolution.</summary>
+    public JsonObject? DispatchedFor(string goalId)
+        => _policies.TryGetValue(goalId, out var policy) ? policy.Dispatched : null;
+
+    /// <summary>
+    /// Replaces what is enforced for a goal, leaving the dispatched block and the
+    /// recorded violations alone. Used when the world moved under an armed goal —
+    /// another goal spent the shared budget — so the ceiling has to be recomputed.
+    /// </summary>
+    public void ReArm(string goalId, JsonObject effective)
+    {
+        if (_policies.TryGetValue(goalId, out var policy))
+        {
+            policy.Hard = effective;
+        }
     }
 
     /// <summary>Re-enters an already-armed goal's scope (approvals, control ticks).</summary>

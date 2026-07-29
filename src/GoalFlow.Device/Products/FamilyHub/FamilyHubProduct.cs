@@ -69,6 +69,12 @@ public static class FamilyHubProduct
         services.AddSingleton<ApplianceControlPlugin>();
         services.AddSingleton<FamilyProfilesPlugin>();
         services.AddSingleton<BudgetPlugin>();
+
+        // How THIS product's world narrows a dispatched ceiling: the household envelope
+        // minus what has already been spent (v6-M3). Registered in the pack because the
+        // harness must not know a household's spending lives in a document called
+        // "budget"; a product with no such policy simply declares no resolver.
+        services.AddSingleton<IPolicyResolver>(sp => new FamilyHubPolicyResolver(sp.GetRequiredService<IProductApiAdapter>()));
         services.AddSingleton<NotifyPlugin>();
         services.AddSingleton<SecurityPlugin>();
 

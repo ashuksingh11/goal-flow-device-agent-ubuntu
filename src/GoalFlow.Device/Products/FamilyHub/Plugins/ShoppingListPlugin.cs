@@ -84,7 +84,24 @@ public sealed class ShoppingListPlugin
         doc["ordered_on"] = _store.Clock.Today.ToString("yyyy-MM-dd");
         doc["estimated_total"] = estimatedTotal;
         await _store.SaveAsync("shopping_list", doc, ct);
-        return Json(new JsonObject { ["status"] = "ordered", ["estimated_total"] = estimatedTotal });
+
+        // THE MONEY ACTUALLY LEAVES THE HOUSEHOLD (v6-M3). Until now an approved order
+        // marked the list "ordered" and budget.spent never moved — so every goal saw
+        // the same untouched headroom no matter what the others had already bought,
+        // and the household envelope would have been decoration. This is the one write
+        // that makes goals share a wallet: the next policy resolution, for THIS goal or
+        // any other, narrows its cap against the new spend.
+        var budget = await _store.LoadResolvedAsync("budget", ct);
+        var spent = (budget["spent"]?.GetValue<double>() ?? 0) + estimatedTotal;
+        budget["spent"] = Math.Round(spent, 2);
+        await _store.SaveAsync("budget", budget, ct);
+
+        return Json(new JsonObject
+        {
+            ["status"] = "ordered",
+            ["estimated_total"] = estimatedTotal,
+            ["household_spent"] = budget["spent"]!.GetValue<double>()
+        });
     }
 
     private static string Json(JsonNode? node)

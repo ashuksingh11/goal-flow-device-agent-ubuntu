@@ -180,6 +180,15 @@ if (options.VerifyActivePolicy)
     return;
 }
 
+// v6-M3 GATE: two goals share one wallet — approving one order narrows the other
+// goal's ceiling, and the other goal notices. MUTATES the world (it places an
+// order), so run it against a throwaway --data dir.
+if (options.VerifyEnvelope)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyEnvelopeAsync(provider, options.DataDir);
+    return;
+}
+
 // The goal's next step: the frontier task's title — what Agent Board shows as
 // "Next Step". Null once nothing is left to do.
 static string? tasksNextStep(GoalRecord goal)
@@ -381,6 +390,9 @@ internal sealed record CliOptions
     /// <summary>--verify-active-policy — assert the budget cap comes from the goal's armed policy, not device data (v6-M2 gate).</summary>
     public bool VerifyActivePolicy { get; init; }
 
+    /// <summary>--verify-envelope — assert one goal's approved order narrows another's ceiling (v6-M3 gate).</summary>
+    public bool VerifyEnvelope { get; init; }
+
     /// <summary>--verify-task-lifecycle — assert the task DAG, legal moves and derived progress (M2 gate).</summary>
     public bool VerifyTaskLifecycle { get; init; }
 
@@ -439,6 +451,7 @@ internal sealed record CliOptions
                 "--verify-safety-rules" => options with { VerifySafetyRules = true },
                 "--verify-grades" => options with { VerifyGrades = true },
                 "--verify-active-policy" => options with { VerifyActivePolicy = true },
+                "--verify-envelope" => options with { VerifyEnvelope = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
                 "--verify-suggestions" => options with { VerifySuggestions = true },
@@ -964,6 +977,166 @@ public static int VerifySafetyRules(SafetyFilter safety)
     return failures == 0 ? 0 : 1;
 
     static KernelArguments Items(params string[] items) => new() { ["items"] = items };
+}
+
+/// <summary>
+/// v6-M3 GATE: two goals share one wallet.
+///
+/// <para>
+/// Per-goal caps cannot see each other: a $200 party and a $120 grocery week each fit
+/// their own ceiling and together blow a $600 month. The envelope is the shared pool,
+/// and the proof it works is not that a number appears on a contract — it is that
+/// APPROVING ONE GOAL'S ORDER NARROWS ANOTHER GOAL'S CEILING, and that the second goal
+/// then notices.
+/// </para>
+///
+/// <para>
+/// Deterministic and offline: it drives the real resolver, the real armed-policy store
+/// and the real observer against a throwaway copy of the world, with no LLM anywhere.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyEnvelopeAsync(IServiceProvider provider, string dataDir)
+{
+    var failures = new List<string>();
+    var resolver = provider.GetRequiredService<IPolicyResolver>();
+    var armed = provider.GetRequiredService<ArmedPolicies>();
+    var safety = provider.GetRequiredService<SafetyFilter>();
+    var store = provider.GetRequiredService<IProductApiAdapter>();
+    var shopping = provider.GetRequiredService<ShoppingListPlugin>();
+    var observer = provider.GetServices<IDomainObserver>().First(o => o.Domain == "grocery_cost");
+
+    JsonObject Envelope(double cap) => new() { ["cap"] = cap, ["period"] = "monthly" };
+    JsonObject Hard(double goalCap) => new() { ["budget_cap"] = goalCap, ["budget_envelope"] = Envelope(600.0) };
+    async Task<double> SpentAsync() => (await store.LoadResolvedAsync("budget"))["spent"]?.GetValue<double>() ?? 0;
+
+    var spent0 = await SpentAsync();
+
+    // 1. The envelope narrows a cap that exceeds what is left, and leaves alone one
+    //    that does not. A trip's $1500 cannot mean $1500 when the month holds $600.
+    var trip = await resolver.ResolveAsync(Hard(1500.0));
+    if (trip["budget_cap"]?.GetValue<double>() is not { } tripCap || Math.Abs(tripCap - (600.0 - spent0)) > 0.001)
+    {
+        failures.Add($"a $1500 trip cap must narrow to the ${600.0 - spent0:0.00} left in the envelope, got {trip["budget_cap"]}");
+    }
+
+    var week = await resolver.ResolveAsync(Hard(120.0));
+    if (week["budget_cap"]?.GetValue<double>() is not 120.0)
+    {
+        failures.Add($"a $120 week fits inside the remaining envelope and must be left alone, got {week["budget_cap"]}");
+    }
+
+    // 2. No envelope on the dispatch: nothing to narrow against, cap untouched.
+    var noEnvelope = await resolver.ResolveAsync(new JsonObject { ["budget_cap"] = 120.0 });
+    if (noEnvelope["budget_cap"]?.GetValue<double>() is not 120.0)
+    {
+        failures.Add($"without an envelope the dispatched cap stands, got {noEnvelope["budget_cap"]}");
+    }
+
+    // 3. THE CROSS-GOAL EFFECT. Arm a grocery goal, let a DIFFERENT goal place an
+    //    order, then re-resolve: the grocery goal's ceiling must have moved, without
+    //    anyone touching the grocery goal.
+    using (armed.Arm("goal-grocery", Hard(120.0), await resolver.ResolveAsync(Hard(120.0))))
+    {
+        var before = armed.ActiveHard()?["budget_cap"]?.GetValue<double>() ?? -1;
+
+        using (armed.Arm("goal-party", Hard(200.0)))
+        {
+            await shopping.PlaceOrder(500.0);
+        }
+
+        var spentAfter = await SpentAsync();
+        if (Math.Abs(spentAfter - (spent0 + 500.0)) > 0.001)
+        {
+            failures.Add($"an approved order must consume the household budget: spent {spent0} -> {spentAfter}, expected {spent0 + 500.0}");
+        }
+
+        await safety.ReResolveAsync("goal-grocery");
+        var after = armed.ActiveHard()?["budget_cap"]?.GetValue<double>() ?? -1;
+        var expected = Math.Max(0, Math.Round(600.0 - spentAfter, 2));
+        if (Math.Abs(after - expected) > 0.001)
+        {
+            failures.Add($"the grocery goal's ceiling must fall to the ${expected:0.00} left after another goal spent, got {after}");
+        }
+
+        if (after >= before)
+        {
+            failures.Add($"another goal's approved order must SHRINK this goal's headroom: {before} -> {after}");
+        }
+
+        // Re-resolving twice must not move it again (narrowing is idempotent) …
+        await safety.ReResolveAsync("goal-grocery");
+        if (Math.Abs((armed.ActiveHard()?["budget_cap"]?.GetValue<double>() ?? -1) - after) > 0.001)
+        {
+            failures.Add("re-resolving twice moved the ceiling again");
+        }
+
+        // … and — the row that actually catches resolving from the wrong block — the
+        // ceiling must be able to CLIMB BACK. Narrowing is a min(), so re-narrowing an
+        // already-narrowed cap looks harmless; it only shows up when the envelope frees
+        // up (a refund, a new billing period) and a ceiling computed from the last
+        // effective value can never recover.
+        var refunded = await store.LoadResolvedAsync("budget");
+        refunded["spent"] = spent0;
+        await store.SaveAsync("budget", refunded);
+        await safety.ReResolveAsync("goal-grocery");
+        var recovered = armed.ActiveHard()?["budget_cap"]?.GetValue<double>() ?? -1;
+        if (Math.Abs(recovered - 120.0) > 0.001)
+        {
+            failures.Add($"once the envelope frees up the ceiling must return to the dispatched $120, got {recovered}");
+        }
+
+        // Put the spend back so the observer rows below see the squeezed world.
+        refunded["spent"] = spentAfter;
+        await store.SaveAsync("budget", refunded);
+
+        // 4. AND THE OTHER GOAL NOTICES. A ceiling that quietly shrinks is a plan that
+        //    fails at approval time; the point is that the goal re-plans first.
+        var goal = new GoalRecord
+        {
+            Dispatch = new Dispatch
+            {
+                GoalId = "goal-grocery",
+                CorrelationId = "c",
+                Domain = "grocery_cost",
+                Objective = "keep the kitchen stocked for less",
+                Constraints = new TaskConstraints { Hard = Hard(120.0) },
+                TimeWindow = new TimeWindow { Start = "2026-07-29", End = "2026-08-05" }
+            },
+            Tasks = [],
+            WorldSnapshot = new JsonObject { ["budget"] = new JsonObject { ["spent"] = spent0 } }
+        };
+
+        var changes = await observer.ObserveAsync(goal);
+        var squeeze = changes.FirstOrDefault(c => c.Kind == "budget.envelope_squeezed");
+        if (squeeze is null)
+        {
+            failures.Add("the grocery goal must notice that another goal spent the shared envelope");
+        }
+        else if (!squeeze.Material || string.IsNullOrWhiteSpace(squeeze.Steer))
+        {
+            failures.Add("the squeeze must be material and carry a steer, or nothing re-plans");
+        }
+
+        // 5. NOT NOISE. Before the envelope is squeezed past this goal's own cap,
+        //    another goal's spending is not this goal's problem — an agent that
+        //    interrupts a family over $2 of someone else's shopping gets switched off.
+        var quiet = new GoalRecord
+        {
+            Dispatch = goal.Dispatch,
+            Tasks = [],
+            WorldSnapshot = new JsonObject { ["budget"] = new JsonObject { ["spent"] = await SpentAsync() } }
+        };
+        if ((await observer.ObserveAsync(quiet)).Any(c => c.Kind == "budget.envelope_squeezed"))
+        {
+            failures.Add("no new spending since the plan means no squeeze to report");
+        }
+    }
+
+    foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
+    Console.Out.WriteLine(failures.Count == 0
+        ? "gate 20 (household envelope: two goals, one wallet): PASS"
+        : $"gate 20 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
 }
 
 /// <summary>

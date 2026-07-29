@@ -38,12 +38,25 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     private readonly SafetyPolicy _policy;
     private readonly CapabilityManager _capabilities;
 
-    public SafetyFilter(ILogger<SafetyFilter> logger, SafetyPolicy policy, CapabilityManager capabilities, ArmedPolicies armed)
+    /// <summary>
+    /// The product's policy resolution, if it declares one — how the world narrows a
+    /// dispatched ceiling (v6-M3: the household envelope minus what is already spent).
+    /// Null is the normal case for a product with no such policy: arm what was sent.
+    /// </summary>
+    private readonly IPolicyResolver? _resolver;
+
+    public SafetyFilter(
+        ILogger<SafetyFilter> logger,
+        SafetyPolicy policy,
+        CapabilityManager capabilities,
+        ArmedPolicies armed,
+        IPolicyResolver? resolver = null)
     {
         _logger = logger;
         _policy = policy;
         _capabilities = capabilities;
         _armed = armed;
+        _resolver = resolver;
     }
 
     /// <summary>
@@ -66,6 +79,74 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     /// </summary>
     public IDisposable BeginGoal(string goalId, JsonObject hardConstraints)
         => _armed.Arm(goalId, hardConstraints);
+
+    /// <summary>
+    /// Arms a goal AFTER letting the product narrow the dispatched constraints against
+    /// the world (v6-M3). Prefer this on the planning path; <see cref="BeginGoal"/>
+    /// remains for callers with nothing to resolve.
+    /// </summary>
+    public async Task<IDisposable> BeginGoalAsync(string goalId, JsonObject hardConstraints, CancellationToken ct = default)
+    {
+        var effective = await ResolveAsync(goalId, hardConstraints, ct);
+        return _armed.Arm(goalId, hardConstraints, effective);
+    }
+
+    /// <summary>
+    /// Recomputes an armed goal's ceiling from its DISPATCHED constraints and the world
+    /// as it is now.
+    ///
+    /// <para>
+    /// Called wherever the world may have moved under a goal that is already armed: at
+    /// approval time (another goal may have spent the shared budget since this plan was
+    /// made) and on each day tick.
+    /// </para>
+    ///
+    /// <para>
+    /// ALWAYS FROM THE DISPATCHED BLOCK, never from the last effective one. Narrowing
+    /// is a min(), so re-narrowing an already-narrowed cap looks harmless — until the
+    /// envelope FREES UP (a refund, a new billing period) and the ceiling cannot climb
+    /// back, because min() only ever goes down. Recomputing from what the account
+    /// actually said lets the ceiling recover as well as fall.
+    /// </para>
+    /// </summary>
+    public async Task ReResolveAsync(string goalId, CancellationToken ct = default)
+    {
+        if (_resolver is null || _armed.DispatchedFor(goalId) is not { } dispatched)
+        {
+            return;
+        }
+
+        _armed.ReArm(goalId, await ResolveAsync(goalId, dispatched, ct));
+    }
+
+    private async Task<JsonObject> ResolveAsync(string goalId, JsonObject dispatched, CancellationToken ct)
+    {
+        if (_resolver is null)
+        {
+            return dispatched;
+        }
+
+        try
+        {
+            var effective = await _resolver.ResolveAsync(dispatched, ct);
+            if (!JsonNode.DeepEquals(effective, dispatched))
+            {
+                _logger.LogInformation(
+                    "policy_resolved goal={GoalId} dispatched_cap={Dispatched} effective_cap={Effective}",
+                    goalId, dispatched["budget_cap"]?.ToJsonString(), effective["budget_cap"]?.ToJsonString());
+            }
+
+            return effective;
+        }
+        catch (Exception ex)
+        {
+            // Arm the DISPATCHED policy rather than nothing. A resolver that cannot read
+            // the world has lost the tightening, not the constraint — falling back to no
+            // policy at all would turn a bad read into an open gate.
+            _logger.LogError(ex, "policy_resolve_failed goal={GoalId} — arming the dispatched constraints unnarrowed", goalId);
+            return dispatched;
+        }
+    }
 
     /// <summary>
     /// Re-enters an already-armed goal's scope, for calls that happen after

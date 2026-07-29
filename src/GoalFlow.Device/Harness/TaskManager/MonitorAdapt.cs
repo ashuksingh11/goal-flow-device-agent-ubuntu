@@ -60,9 +60,19 @@ public sealed class MonitorAdapt
     }
 
     /// <summary>Changes for this goal, as classified by the observers of its domain.</summary>
-    public Task<IReadOnlyList<WorldChange>> ObserveAsync(GoalRecord goal, CancellationToken ct = default)
-        => Task.FromResult<IReadOnlyList<WorldChange>>(
-            For(goal.Dispatch.Domain).SelectMany(o => o.Observe(goal)).ToArray());
+    public async Task<IReadOnlyList<WorldChange>> ObserveAsync(GoalRecord goal, CancellationToken ct = default)
+    {
+        var changes = new List<WorldChange>();
+        foreach (var observer in For(goal.Dispatch.Domain))
+        {
+            // ObserveAsync, not Observe: an observer that has to READ the world to spot
+            // its change (v6-M3 — another goal spent the shared budget) overrides it;
+            // the rest inherit the synchronous answer unchanged.
+            changes.AddRange(await observer.ObserveAsync(goal, ct));
+        }
+
+        return changes;
+    }
 
     /// <summary>The fire-able event catalog advertised for a domain, if it has one.</summary>
     public IReadOnlyList<DemoEvent>? DemoEventsFor(string domain, JsonObject snapshot)
