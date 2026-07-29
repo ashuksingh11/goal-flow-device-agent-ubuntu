@@ -189,6 +189,16 @@ if (options.VerifyEnvelope)
     return;
 }
 
+// v6 GATE: the last gate before a real side effect must report a refusal AS a
+// refusal. Needs the agent (it drives the real approval path), so it sits after the
+// kernel is built. MUTATES the world (the allowed proposal really runs) — use a
+// throwaway --data dir.
+if (options.VerifyApprovalBlock)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyApprovalBlockAsync(provider, agent, tasks);
+    return;
+}
+
 // The goal's next step: the frontier task's title — what Agent Board shows as
 // "Next Step". Null once nothing is left to do.
 static string? tasksNextStep(GoalRecord goal)
@@ -393,6 +403,9 @@ internal sealed record CliOptions
     /// <summary>--verify-envelope — assert one goal's approved order narrows another's ceiling (v6-M3 gate).</summary>
     public bool VerifyEnvelope { get; init; }
 
+    /// <summary>--verify-approval-block — assert a refused proposal is reported blocked, not executed (v6 gate).</summary>
+    public bool VerifyApprovalBlock { get; init; }
+
     /// <summary>--verify-task-lifecycle — assert the task DAG, legal moves and derived progress (M2 gate).</summary>
     public bool VerifyTaskLifecycle { get; init; }
 
@@ -452,6 +465,7 @@ internal sealed record CliOptions
                 "--verify-grades" => options with { VerifyGrades = true },
                 "--verify-active-policy" => options with { VerifyActivePolicy = true },
                 "--verify-envelope" => options with { VerifyEnvelope = true },
+                "--verify-approval-block" => options with { VerifyApprovalBlock = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
                 "--verify-suggestions" => options with { VerifySuggestions = true },
@@ -977,6 +991,133 @@ public static int VerifySafetyRules(SafetyFilter safety)
     return failures == 0 ? 0 : 1;
 
     static KernelArguments Items(params string[] items) => new() { ["items"] = items };
+}
+
+/// <summary>
+/// v6 GATE: approving something the policy forbids comes back as BLOCKED, not executed.
+///
+/// <para>
+/// THE BUG THIS PINS. Side-effecting tools are not exposed during planning, so the
+/// window constraints (quiet hours, peak tariff, the away window) can only bite at
+/// ACTUATION — the moment a person taps Approve. That path invoked the function, took
+/// whatever came back, called MarkExecuted and reported <c>"executed"</c>. The filter
+/// worked perfectly: the plugin never ran, and the refusal sat in a detail string
+/// nobody reads. The user was told the action had happened.
+/// </para>
+///
+/// <para>
+/// A gate that blocks correctly and then reports success is worse than one that fails
+/// loudly, so this drives the REAL <see cref="GoalAgent.ApplyApprovalAsync"/> — same
+/// kernel, same filter, same ledger — and checks both halves: the refused proposal is
+/// reported blocked and is NOT marked executed (re-applying it can never work), while
+/// an allowed one alongside it still goes through.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider, GoalAgent agent, TaskManager tasks)
+{
+    var failures = new List<string>();
+    var approvals = provider.GetRequiredService<ApprovalCoordinator>();
+    var safety = provider.GetRequiredService<SafetyFilter>();
+    var clock = provider.GetRequiredService<IClock>();
+
+    // The family is away from tomorrow for a week.
+    var away = new JsonObject
+    {
+        ["start"] = clock.Today.AddDays(1).ToString("yyyy-MM-dd"),
+        ["end"] = clock.Today.AddDays(8).ToString("yyyy-MM-dd"),
+    };
+    var hard = new JsonObject { ["away_window"] = away };
+    var dispatch = ProgramHelpers.BuildLocalDispatch("verify the approval gate", "vacation_prep", clock) with
+    {
+        GoalId = "approval-block",
+        Constraints = new TaskConstraints { Hard = hard },
+    };
+    tasks.CreateGoal(dispatch, [new TaskRecord { TaskId = "t1", GoalId = dispatch.GoalId, Title = "prep" }], new JsonObject());
+
+    // p1 runs the dishwasher mid-trip (forbidden); p2 adds to the shopping list (fine).
+    approvals.Register(new ProposalItem
+    {
+        ProposalId = "p1",
+        Action = "run the dishwasher while away",
+        Module = "Appliance",
+        Function = "RunProgram",
+        Args = new JsonObject
+        {
+            ["appliance"] = "dishwasher",
+            ["program"] = "eco",
+            ["atTime"] = $"{clock.Today.AddDays(4):yyyy-MM-dd}T09:00",
+        },
+        Tier = ApprovalTiers.Firm,
+        Reason = "cleanup",
+    });
+    approvals.Register(new ProposalItem
+    {
+        ProposalId = "p2",
+        Action = "add tinned goods to the list",
+        Module = "ShoppingList",
+        Function = "Add",
+        Args = new JsonObject { ["items"] = new JsonArray("rice"), ["reason"] = "restock" },
+        Tier = ApprovalTiers.Light,
+        Reason = "restock",
+    });
+
+    using (safety.BeginGoal(dispatch.GoalId, hard))
+    {
+        var status = await agent.ApplyApprovalAsync(new Approval
+        {
+            GoalId = dispatch.GoalId,
+            CorrelationId = "c-approval-block",
+            Payload = new ApprovalPayload
+            {
+                Decisions =
+                [
+                    new ApprovalDecision { ProposalId = "p1", Approved = true },
+                    new ApprovalDecision { ProposalId = "p2", Approved = true },
+                ],
+            },
+        });
+
+        var executed = status.Payload?.Executed ?? [];
+        var blocked = executed.FirstOrDefault(e => e.ProposalId == "p1");
+        if (blocked is null)
+        {
+            failures.Add("the refused proposal must still be REPORTED — silence loses it entirely");
+        }
+        else
+        {
+            if (blocked.Result != ExecutionResults.BlockedSafety)
+            {
+                failures.Add($"a proposal the filter refused must come back blocked, got '{blocked.Result}' — the user is being told it happened");
+            }
+
+            if (blocked.Detail?.Contains("away_window", StringComparison.Ordinal) != true)
+            {
+                failures.Add($"the block must say WHICH constraint refused it, got '{blocked.Detail}'");
+            }
+        }
+
+        if (approvals.ExecutedIds().Contains("p1"))
+        {
+            failures.Add("a blocked proposal must NOT be marked executed — unlike a deferred pre-check, re-applying it can never work");
+        }
+
+        var allowed = executed.FirstOrDefault(e => e.ProposalId == "p2");
+        if (allowed?.Result != ExecutionResults.Executed)
+        {
+            failures.Add($"one blocked proposal must not take the others down with it, got '{allowed?.Result}'");
+        }
+
+        if (!approvals.ExecutedIds().Contains("p2"))
+        {
+            failures.Add("the allowed proposal must be marked executed");
+        }
+    }
+
+    foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
+    Console.Out.WriteLine(failures.Count == 0
+        ? "gate 21 (approval: a refusal is reported as a refusal): PASS"
+        : $"gate 21 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
 }
 
 /// <summary>

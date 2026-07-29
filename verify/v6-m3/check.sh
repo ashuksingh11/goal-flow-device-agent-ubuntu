@@ -29,4 +29,13 @@ trap 'rm -rf "$ENVELOPE_DATA"' EXIT
 cp data/*.json "$ENVELOPE_DATA"/
 dotnet run --project GoalFlow.Device.csproj --no-build -- --verify-envelope --data "$ENVELOPE_DATA"
 
+# GATE 21 — the last gate before a real side effect reports a refusal AS a refusal.
+# Side-effecting tools are not exposed during planning, so the window constraints can
+# only bite at actuation; this pins that the user is told so. Mutates the world (the
+# allowed proposal really runs), hence the throwaway dir.
+APPROVAL_DATA="$(mktemp -d)"
+trap 'rm -rf "$ENVELOPE_DATA" "$APPROVAL_DATA"' EXIT
+cp data/*.json "$APPROVAL_DATA"/
+dotnet run --project GoalFlow.Device.csproj --no-build -- --verify-approval-block --data "$APPROVAL_DATA"
+
 echo "v6-M3 gate: PASS"

@@ -1572,13 +1572,37 @@ public sealed class GoalAgent
             var args = ToKernelArguments(proposal.Args);
             _logger.LogInformation("execute_proposal {ProposalId} {Module}.{Function}", proposal.ProposalId, proposal.Module, proposal.Function);
             var invokeResult = await _kernel.InvokeAsync(function, args, ct);
+            var resultText = invokeResult.ToString();
+
+            // THE FILTER REFUSED IT. The plugin never ran — the gate did its job — but
+            // saying "executed" here would tell the user the action happened, with the
+            // refusal buried in a detail string nobody reads. Approving something the
+            // policy forbids has to come back as a block, and the approval must NOT be
+            // marked executed: unlike a deferred pre-check ("not yet"), re-applying it
+            // will never work, because nothing about the world is going to change the
+            // answer. This is where the v6 window constraints actually bite, since
+            // side-effecting tools are not exposed during planning.
+            if (SafetyFilter.IsRefusal(resultText))
+            {
+                _logger.LogWarning("proposal_blocked {ProposalId} {Module}.{Function}: {Detail}",
+                    proposal.ProposalId, proposal.Module, proposal.Function, resultText);
+                executed.Add(new ExecutedEffect
+                {
+                    ProposalId = proposal.ProposalId,
+                    Action = $"{proposal.Module}.{proposal.Function}",
+                    Result = ExecutionResults.BlockedSafety,
+                    Detail = resultText
+                });
+                continue;
+            }
+
             _approvals.MarkExecuted(proposal.ProposalId);
             executed.Add(new ExecutedEffect
             {
                 ProposalId = proposal.ProposalId,
                 Action = $"{proposal.Module}.{proposal.Function}",
-                Result = "executed",
-                Detail = invokeResult.ToString()
+                Result = ExecutionResults.Executed,
+                Detail = resultText
             });
         }
 

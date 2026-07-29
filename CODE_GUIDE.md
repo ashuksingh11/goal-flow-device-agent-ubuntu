@@ -229,6 +229,14 @@ different classes:
     still allowing coconut, butternut squash and nutmeg under a "nuts" allergy.
     Over-blocking is a real failure mode, not a safe default: an agent that
     vetoes coconut gets switched off.
+  - **A refusal is REPORTED as a refusal (v6).** Side-effecting tools are not exposed
+    during planning, so the window constraints only bite at ACTUATION — when a person
+    taps Approve. That path used to invoke the function, take whatever came back, and
+    report `executed` with the refusal buried in a detail string: the gate worked, and
+    the user was told the action had happened. `SafetyFilter.IsRefusal` now drives
+    `ExecutionResults.BlockedSafety`, and a blocked proposal is NOT marked executed —
+    unlike a deferred pre-check ("not yet"), re-applying it can never work.
+    Gate: `--verify-approval-block` (gate 21).
   - **`constraints.hard` remains its ONLY input.** Soft preferences never gate.
 - The **pre-check gate** (`Harness/PrecheckEngine/`, v3-M3) asks the question the
   other two don't: is this POSSIBLE right now? A plan that preheats an unplugged

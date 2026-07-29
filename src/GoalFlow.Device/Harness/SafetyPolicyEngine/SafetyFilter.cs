@@ -162,6 +162,22 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
     /// </summary>
     public IDisposable EnterGoal(string goalId) => _armed.Enter(goalId);
 
+    /// <summary>
+    /// The marker every refusal starts with. A CONSTANT, not a repeated literal:
+    /// the approval path has to recognise a refused call to report it honestly
+    /// (ExecutionResults.BlockedSafety), and a magic string copied into two files is
+    /// how that check quietly stops matching.
+    /// </summary>
+    public const string RefusalPrefix = "BLOCKED by safety policy:";
+
+    /// <summary>The refusal the model — and the approval path — sees.</summary>
+    public static string Refusal(string violation)
+        => $"{RefusalPrefix} {violation}. Re-plan without violating hard constraints.";
+
+    /// <summary>True when a kernel result is one of our refusals rather than a real answer.</summary>
+    public static bool IsRefusal(string? resultText)
+        => resultText?.StartsWith(RefusalPrefix, StringComparison.Ordinal) == true;
+
     /// <summary>Forgets a goal's policy and violations (control: reset).</summary>
     public void RemoveGoal(string goalId) => _armed.Remove(goalId);
 
@@ -189,7 +205,7 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
         {
             policy?.Violations.Add(violation);
             _logger.LogWarning("safety_blocked {Module}.{Function}: {Violation}", module, function, violation);
-            var refusal = $"BLOCKED by safety policy: {violation}. Re-plan without violating hard constraints.";
+            var refusal = Refusal(violation);
             context.Result = new FunctionResult(context.Function, refusal);
             await (_trace?.ToolResultAsync(module, function, refusal) ?? Task.CompletedTask);
             return;
@@ -202,7 +218,7 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
         {
             policy?.Violations.Add(resultViolation);
             _logger.LogWarning("safety_result_blocked {Module}.{Function}: {Violation}", module, function, resultViolation);
-            resultText = $"BLOCKED by safety policy: {resultViolation}. Re-plan without violating hard constraints.";
+            resultText = Refusal(resultViolation);
             context.Result = new FunctionResult(context.Function, resultText);
         }
 
