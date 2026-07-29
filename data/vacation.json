@@ -1,16 +1,20 @@
 {
   "comment": [
-    "VACATION-PREP domain slice: the away window plus changes that land while the",
-    "family is gone. Dates are day_offsets from IClock.Today (generic-clock rule).",
-    "pending_updates mirrors the guests.json shape: each carries an",
-    "activation_day_offset and surfaces when the simulated week reaches it.",
-    "Seeded with one believable material change — a delivery arriving to an empty",
-    "house — so vacation prep has an adaptation beat, not just a static plan."
+    "VACATION-PREP domain slice: the changes that land while the family is gone.",
+    "Dates are day_offsets from IClock.Today (generic-clock rule). pending_updates",
+    "mirrors the guests.json shape: each carries an activation_day_offset and",
+    "surfaces when the simulated week reaches it. Seeded with one believable material",
+    "change — a delivery arriving to an empty house — so vacation prep has an",
+    "adaptation beat, not just a static plan.",
+    "",
+    "v6 — THE AWAY WINDOW IS NOT HERE ANY MORE. It used to sit in this file as",
+    "`away: {depart_day_offset: 1, return_day_offset: 8}`, read by nothing: the",
+    "observer only ever consumed pending_updates. It is now POLICY — it arrives on the",
+    "dispatch as constraints.hard.away_window (ISO dates), where the date_window_block",
+    "rule enforces it, so an appliance run scheduled into the empty house is blocked",
+    "rather than merely discouraged. Two copies of the trip dates would only be a way",
+    "for the enforced window and the planned one to disagree."
   ],
-  "away": {
-    "depart_day_offset": 1,
-    "return_day_offset": 8
-  },
   "pending_updates": [
     {
       "id": "vac-upd-001",

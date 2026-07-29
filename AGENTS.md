@@ -113,6 +113,13 @@ wired separately in each host.
     token/stem-based (`allergens:["peanuts"]` blocks "peanut butter" — v2's
     substring check did not — while still allowing coconut under a nut allergy).
     `constraints.hard` remains its only input.
+    **v6-M2:** the armed policies moved into `ArmedPolicies` (a store with no
+    dependencies) so a capability plugin can READ them via `IActivePolicy` without
+    closing a DI cycle through `CapabilityManager` — Budget reports the goal's cap,
+    which `data/budget.json` no longer duplicates. Two new window instances land
+    here too: `peak_hours` (existing `time_window_block` kind, energy goals only)
+    and `away_window` (new `date_window_block` kind, exclusive endpoints).
+    Gate: `verify/v6-m2/check.sh`.
   - `TaskManager/` — THE GOAL LEDGER (v3-M2). `TaskManager` + `GoalRecord` +
     `TaskRecord` + `TaskState`: the task DAG, a validated lifecycle (illegal moves
     are refused, not applied), retries, and **derived** progress — which is what

@@ -37,7 +37,9 @@ src/GoalFlow.Device/
     SafetyPolicyEngine/
       SafetyFilter.cs                # [2] SK IFunctionInvocationFilter — the safety gate; policy is PER GOAL
       SafetyPolicy.cs                #     loads policy.json; the grade ratchet (config may only tighten)
-      SafetyRule.cs                  #     the rule KINDS (blocked_terms, numeric_cap, time_window_block, …)
+      SafetyRule.cs                  #     the rule KINDS (blocked_terms, numeric_cap, time_window_block,
+                                     #     date_window_block — the away window — result_screen)
+      ArmedPolicies.cs               #     which constraints are in force for which goal (read via IActivePolicy)
       TermMatcher.cs                 #     token/stem matching: "peanuts" blocks "peanut butter", not "coconut"
       AutomationGrade.cs             #     A0/A1/A2/AX + the v2 tier mapping
     TaskManager/                     # [4] THE GOAL LEDGER — what makes Agent Board honest
@@ -70,7 +72,7 @@ src/GoalFlow.Device/
       # 18 grounded READ tools + 14 [SideEffect] proposable functions across the 11
       # (FamilyProfiles/Budget/Notify were [Unavailable] stubs in early v3; M7 filled them in)
   Transport/WsClient.cs              # one outbound BCL ClientWebSocket to the cloud hub
-verify/m0/ … verify/m5/            # the gates — run the LATEST milestone's check.sh before every commit
+verify/m0/ … verify/v6-m2/         # the gates — run the LATEST milestone's check.sh before every commit
 ```
 
 **The split is the point.** `Harness/` is domain- and product-agnostic; `Products/`
@@ -183,18 +185,30 @@ different classes:
   call `next` — the plugin never runs, `context.Result` becomes a structured
   refusal (so the model sees why and re-plans), and the violation lands in
   the `plan_ready` safety verdict.
-  - **The policy is PER GOAL** (`BeginGoal` on the plan path, `EnterGoal` on the
-    approval/control paths; the ambient goal rides an `AsyncLocal`). It was one
-    field on a singleton until v3-M1, which made the gate unsound as soon as two
-    goals overlapped — and Program has always dispatched frames concurrently.
-    A call outside any scope enforces nothing and says so loudly
-    (`safety_unscoped`); it no longer inherits a stranger's policy.
+  - **The policy is PER GOAL**, held by `ArmedPolicies` (`BeginGoal` on the plan
+    path, `EnterGoal` on the approval/control paths; the ambient goal rides an
+    `AsyncLocal`). It was one field on a singleton until v3-M1, which made the gate
+    unsound as soon as two goals overlapped — and Program has always dispatched
+    frames concurrently. A call outside any scope enforces nothing and says so
+    loudly (`safety_unscoped`); it no longer inherits a stranger's policy.
+    **v6** split the STORE (`ArmedPolicies`, depends on nothing) from the ENFORCER
+    (`SafetyFilter`) so a capability plugin can READ the armed policy through
+    `IActivePolicy` — Budget reports the goal's cap — without closing a DI cycle
+    through `CapabilityManager`, which deadlocks the container at startup, silently.
   - **The checks are declarative** (`Products/FamilyHub/config/policy.json`). The
     harness implements rule KINDS — `blocked_terms`, `numeric_cap`,
-    `time_window_block`, `result_screen` — and the product pack says which of its
-    calls each applies to, plus its ingredient vocabulary (dairy → milk/paneer/…).
-    Before v3 this was a chain of hardcoded `module == "ShoppingList"` comparisons
-    inside the filter.
+    `time_window_block`, `date_window_block`, `result_screen` — and the product pack
+    says which of its calls each applies to, plus its ingredient vocabulary
+    (dairy → milk/paneer/…). Before v3 this was a chain of hardcoded
+    `module == "ShoppingList"` comparisons inside the filter.
+  - **v6 — two window instances the cloud resolves per domain.** `peak_hours`
+    (electricity tariff) needed NO engine code: it is `time_window_block` pointed at
+    a different key, bound to `Appliance`, and it only bites on goals whose dispatch
+    carries the key — energy goals. `away_window` needed one new kind,
+    `date_window_block`: same idea over calendar DATES, so an appliance run or
+    announcement scheduled into an empty house is blocked. Its endpoints are
+    EXCLUSIVE — the family is home for part of a travel day, and "run the dishwasher
+    before you leave" is the vacation plan's own best move.
   - **Term matching is token/stem-based** (`TermMatcher.cs`), so `allergens:
     ["peanuts"]` blocks "peanut butter" — v2's substring check did not — while
     still allowing coconut, butternut squash and nutmeg under a "nuts" allergy.

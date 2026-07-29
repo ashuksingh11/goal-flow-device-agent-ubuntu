@@ -5,6 +5,13 @@
     "constraints.hard from the cloud family profile; this file is diets, dislikes, ages,",
     "and who to invite. No dates here, so the day-offset rule doesn't apply.",
     "",
+    "v6 — READ THIS BEFORE ADDING A `dietary` ENTRY. A value here ATTRIBUTES a",
+    "constraint to a person so the planner can shape a menu ('Rohan is the low-sodium",
+    "one'); it does NOT create one. Nothing enforces this file. Adding `no_shellfish`",
+    "to a member here would read like a safety rule and block exactly nothing — the",
+    "constraint has to go in the ACCOUNT's store (cloud data/memory/family_profile.json),",
+    "which is the only thing that reaches constraints.hard and therefore the filter.",
+    "",
     "Names align with the cloud memory profile (Priya, Rohan, Aarav): those are the",
     "residents. The Maya/Leo/Sam set in guests.json are dinner GUESTS, a different list."
   ],
