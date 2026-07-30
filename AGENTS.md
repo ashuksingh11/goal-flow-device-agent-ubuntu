@@ -23,8 +23,8 @@ of `Agent/`, `Contracts/`, `Harness/`, `Products/`, `Transport/` + a `dotnet bui
 verify with
 `diff -rq <dir> ../goal-flow-device-agent-tizen/<dir>` (must be empty).
 NEVER copy the host files — each platform owns its own (`Program.cs` here;
-`Program.cs`/`DeviceHost.cs`/`DeviceConfig.cs`/`DlogLogger.cs`/`AssemblyResolver.cs`/
-`UiChannel.cs` there). A core change that needs host wiring (like `device_id`) must be
+`Program.cs`/`DeviceHost.cs`/`DeviceConfig.cs`/`DlogLogger.cs`/`AssemblyResolver.cs`
+there — `UiChannel.cs` was dropped in v3-M9 with the on-Hub UI channel). A core change that needs host wiring (like `device_id`) must be
 wired separately in each host.
 
 ## Stack & run

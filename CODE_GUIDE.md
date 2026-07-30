@@ -168,8 +168,9 @@ whole way (via `Trace`; over the WebSocket when connected, stderr otherwise).
 **Actuation** (`ApplyApprovalAsync`): an `approval` frame's decisions flip
 ledger entries; each cleared proposal's frozen `{module}.{function}(args)` is
 invoked **through the kernel** (`_kernel.InvokeAsync` — the SafetyFilter still
-applies), then `MarkExecuted` makes replays no-ops. Returns a `status` frame
-listing executed effects.
+applies), then `MarkExecuted` makes replays no-ops. A call the filter REFUSES takes the
+other branch: it is reported `blocked_safety` and deliberately **not** marked executed
+(see "the safety gate" below). Returns a `status` frame listing what actually happened.
 
 ## The three gates — "LLM plans, code checks"
 
@@ -386,7 +387,8 @@ The agent, filters, and contracts don't change.
 
 ## Run & verify
 
-# Full-stack demo commands live in goal-flow-agents/docs/FINAL_DEMO.md. Driving the device alone:
+Full-stack demo commands live in one place: `../goal-flow-agents/docs/FINAL_DEMO.md`. Driving
+the device alone:
 ```bash
 dotnet build GoalFlow.Device.csproj
 dotnet run --project GoalFlow.Device.csproj -- --contract data/sample-contract.json          # plan_ready: plan + tiered proposals + safety verdict
