@@ -1485,8 +1485,11 @@ public sealed class GoalAgent
             Rules for this patch:
             - Upsert EVERY row that needs to change, reusing each row's exact existing id.
               This is not a single-day swap.
-            - To mark a day as deliberately empty, upsert it with "status":"skipped", a
-              short "title" saying so, and a "status_reason" in the user's own terms.
+            - To mark a day as deliberately empty, upsert it with "status":"skipped" plus the
+              exact "title" and "status_reason" the steer gives you — copy them verbatim
+              rather than paraphrasing. These two strings are read by a person asking why a
+              day is empty, so "Skipped - away" is the wrong answer to that question even
+              though it is a true one.
               NEVER put it in "remove": a deleted row makes the plan silently shorter and
               nothing on screen says why.
             - Keep each row's original date in "when". You are re-planning days, not moving them.

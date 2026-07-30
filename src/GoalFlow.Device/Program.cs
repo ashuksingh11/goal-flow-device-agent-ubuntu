@@ -1985,20 +1985,34 @@ public static void EnsureDataDir(string dataDir)
         {
             return; // this IS the seed
         }
-        if (Directory.Exists(dataDir) && Directory.EnumerateFiles(dataDir, "*.json").Any())
-        {
-            return; // already has a world
-        }
         if (!Directory.Exists(seed))
         {
             return; // nothing to seed from — let the store fail loudly
         }
         Directory.CreateDirectory(dataDir);
+
+        // v7 — FILL IN WHAT IS MISSING, rather than skipping a dir that has any json at
+        // all. The old rule ("already has a world → leave it alone") had a failure mode
+        // with no symptom: add a world file and every pre-existing --data dir silently
+        // lacks it, so the observer that reads it throws FileNotFoundException, returns
+        // no changes, and the goal simply never adapts. Nothing errors. It cost real time
+        // twice — once for workout.json, once for deliveries.json — and on a Hub that has
+        // already run an older build there is no `rm -rf` to reach for.
+        //
+        // Copying per-file is safe because overwrite stays FALSE: a file the run has
+        // mutated is never clobbered, so this only ever adds what was never there.
+        var added = 0;
         foreach (var file in Directory.EnumerateFiles(seed, "*.json"))
         {
-            File.Copy(file, Path.Combine(dataDir, Path.GetFileName(file)), overwrite: false);
+            var target = Path.Combine(dataDir, Path.GetFileName(file));
+            if (File.Exists(target)) continue;
+            File.Copy(file, target, overwrite: false);
+            added++;
         }
-        Console.Error.WriteLine($"seeded mock world: {dataDir} <- {seed}");
+        if (added > 0)
+        {
+            Console.Error.WriteLine($"seeded mock world: {dataDir} <- {seed} ({added} file(s))");
+        }
     }
     catch (Exception ex)
     {
