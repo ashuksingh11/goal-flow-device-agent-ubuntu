@@ -12,20 +12,15 @@ deterministic safety filter, a generic clock, and structured logging. It connect
 outbound (WS client) to the cloud hub. **"LLM plans, code checks."**
 
 Siblings under `~/ashu/git/`: `goal-flow-cloud-agent` (Python hub, owns the canonical
-`CONTRACT.md`), `goal-flow-agent-chat-ui` (React UI), `goal-flow-device-agent-tizen`
-(frozen port — see its AGENTS.md). This repo's C# `Contracts/*.cs` MIRROR the cloud's
-`CONTRACT.md`.
+`CONTRACT.md`), `goal-flow-agent-chat-ui` / `goal-flow-agent-board-ui` /
+`goal-flow-agent-bixby-ui` (the surfaces), `goal-flow-device-agent-tizen` (the port — see
+its AGENTS.md). This repo's C# `Contracts/*.cs` MIRROR the cloud's `CONTRACT.md`.
+System design: `../goal-flow-agents/docs/DESIGN.md`.
 
-**Tizen sync status: OUT OF SYNC since v3-M0** (2026-07-17). `Modules/` no longer
-exists — it split into `Harness/` (generic core) + `Products/FamilyHub/` (product
-pack) — so the old copy recipe names a directory that is gone and the Tizen ports
-will not build against this tree. This is EXPECTED and accepted: both Tizen repos are
-frozen pre-v2 by decision, and v3 re-syncs them ONCE at M9 rather than taxing every
-milestone. Do not attempt a partial re-sync before then.
-
-When M9 comes: this repo is the SOURCE OF TRUTH for the portable core, and the recipe
-becomes a plain copy of `Agent/`, `Contracts/`, `Harness/`, `Products/`, `Transport/`
-(five dirs, was four) + a `dotnet build`, then verify with
+**Tizen sync: IN SYNC.** The port is re-synced at the end of each milestone that touches
+the core. This repo is the SOURCE OF TRUTH for the portable core; the recipe is a plain copy
+of `Agent/`, `Contracts/`, `Harness/`, `Products/`, `Transport/` + a `dotnet build`, then
+verify with
 `diff -rq <dir> ../goal-flow-device-agent-tizen/<dir>` (must be empty).
 NEVER copy the host files — each platform owns its own (`Program.cs` here;
 `Program.cs`/`DeviceHost.cs`/`DeviceConfig.cs`/`DlogLogger.cs`/`AssemblyResolver.cs`/
@@ -148,7 +143,7 @@ wired separately in each host.
     approved effect (fail → `deferred_precheck`; the approval still stands, so it
     executes when the world recovers). Probes are product knowledge and live in the
     pack (`Probes/`, bound by `config/prechecks.json`, reading `data/device_state.json`).
-- `Contracts/*.cs` — C# mirror of CONTRACT v2. `PlanReady.cs` has `PlanItem.Day`,
+- `Contracts/*.cs` — C# mirror of CONTRACT.md. `PlanReady.cs` has `PlanItem.Day`,
   `DemoEvent {Id,Day,Label,Title,Kind,Order}`, `DemoEvents` catalog. `Control.cs` has
   `EventId` + `TriggerEvent` const. `Status.cs` has `EventId`/`UpdatedPlan`/
   `ChangedIds`/`ImpactDelta`. `Proposal.cs` has `EventId`. `Hello.cs` has
@@ -176,16 +171,19 @@ Sends: `hello` (now with `device_id`/`device_name` — see Stack & run), `capabi
 ## Current state
 
 **Six domains** built and verified (headless sims + live): `meal_plan`, `guest_dinner`,
-`vacation_prep`, `birthday_party`, and (v3.4) `grocery_cost` + `energy_saving`. Event-driven
-meal demo, scoped-LLM daily/event adaptation, guest prep-timeline + appliance gating, the
-global Advance-day world tick (v3.2), and the v3.5 generic planner (per-domain plan shape,
-date-derived plan days) all work. No plugin stubs remain — all 11 are implemented.
+`vacation_prep`, `birthday_party`, `grocery_cost`, `energy_saving`. All 11 plugins are
+implemented — no stubs. Working: the generic per-domain planner, scoped-LLM daily adaptation,
+the global Advance-day world tick, guest prep-timeline + appliance gating, and constraint
+enforcement resolved per goal, including the household envelope across goals and the
+date-window block for an empty house.
+
+Verify with `./verify/v6-m3/check.sh` — it chains gates 1–21 and needs no API key.
 
 ## Conventions & gotchas
 
 - **Commit identity:** author as `ashuksingh11`
   (`31301999+ashuksingh11@users.noreply.github.com`). **Push only when asked.**
-- **Workflow:** plan=Opus · design=Fable · coding=Codex CLI · browsing=Sonnet.
+- **Workflow:** plan=Opus · design=Fable · coding=Opus · browsing=Sonnet.
 - **Do NOT `git checkout -- data/` blindly:** `data/daily_events.json` is now a
   STRUCTURAL file (labels + the 6th event), not just runtime-mutated seed — reverting
   it drops the 6th event. Only reset appliances/shopping_list/inventory/calendar/

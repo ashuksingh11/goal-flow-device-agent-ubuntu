@@ -1,4 +1,4 @@
-# Code Guide — goal-flow-device-agent-ubuntu (v3)
+# Code Guide — goal-flow-device-agent-ubuntu
 
 The on-device agent is a .NET 8 process where **the device IS a Semantic
 Kernel agent**: device capabilities are SK **plugins** the LLM calls via auto
@@ -7,9 +7,8 @@ function-calling, and every harness module is either one of those plugins
 Planning is **LLM-only** — there is no rules or scripted planner anywhere in
 the agent. Built Linux-first; the Tizen port swaps plugin internals, never the agent.
 
-Companion docs: `docs/ARCHITECTURE.md` (kernel/filter/stream design),
-`docs/HARNESSES.md` (the five harness components → real primitives),
-`../goal-flow-agents/docs/V2_DESIGN_PROPOSAL.md` (the framing).
+System design — the two tiers, the five harness components, the constraint model, the gates:
+`../goal-flow-agents/docs/DESIGN.md`.
 
 ## File map
 
@@ -27,7 +26,7 @@ data/                                # mock world — ALL dates are day offsets 
 src/GoalFlow.Device/
   Program.cs                         # CLI + DI composition root                ← start here
   Agent/GoalAgent.cs                 # SK kernel host: BuildKernel / RunAsync / ApplyApprovalAsync / HandleControlAsync
-  Contracts/                         # C# mirror of CONTRACT v3 (Dispatch, PlanReady, Proposal, Approval, Status, Control, AgentEvent, Capabilities, …)
+  Contracts/                         # C# mirror of CONTRACT.md (Dispatch, PlanReady, Proposal, Approval, Status, Control, AgentEvent, Capabilities, …)
   Harness/                           # THE GENERIC CORE — no product types, no LLM inside
     CapabilityManager/               # [1] the toolbox: discovery, advertisement, the planner's tool set
       CapabilityManager.cs           #     discovery over kernel.Plugins + the pack's descriptors
@@ -305,8 +304,8 @@ frozen for this path — `set_date`/`advance_day` handling only runs after the
 
 ## Capability vs steering — the harnesses as real primitives
 
-The "11 harness modules" of the v2 design are not conventions; each is a real
-type here or a real SK feature (full table in `docs/HARNESSES.md`):
+The harness is not a convention; every part of it is a real type here or a real SK feature
+(what was specified versus what was built: `../goal-flow-agents/docs/DESIGN.md` §11):
 
 - **Capability modules** = SK plugins in `Products/FamilyHub/Plugins/`, registered
   in `GoalAgent.BuildKernel` under their advertised names (`Inventory`,

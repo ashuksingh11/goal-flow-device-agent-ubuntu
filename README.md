@@ -1,4 +1,4 @@
-# GoalFlow Device Agent (Ubuntu / .NET 8) — v3
+# GoalFlow Device Agent (Ubuntu / .NET 8)
 
 The **on-device agent** for GoalFlow — the **executor tier of a general
 goal agent** for the Samsung Family Hub. The cloud agent owns the conversation
@@ -125,7 +125,7 @@ environment:
 
 ```
 src/GoalFlow.Device/
-  Contracts/              C# mirror of every CONTRACT v3 message (snake_case JSON)
+  Contracts/              C# mirror of every CONTRACT.md message (snake_case JSON)
   Agent/GoalAgent.cs      the SK kernel host: build kernel, plan, actuate, adapt
   Harness/                THE GENERIC CORE — five first-class components + supporting
                           modules; no product types, no LLM inside:
@@ -144,9 +144,8 @@ src/GoalFlow.Device/
   Program.cs              CLI entry + DI composition root
 data/                     mock world (day-offset dates; see data/README.md) + sample contracts
                           + device_id (persisted self-generated pairing key, first run)
-docs/                     ARCHITECTURE.md (kernel/filter/stream design), HARNESSES.md (harness catalog)
 ```
 
-See `CODE_GUIDE.md` for the code walkthrough, `docs/ARCHITECTURE.md` for the
-invoke/filter/stream flow, and `docs/HARNESSES.md` for the mapping of the five
-harness components (and the supporting modules) to real SK/framework primitives.
+See `CODE_GUIDE.md` for the code walkthrough — the invoke/filter/stream flow and the five
+harness components as real SK primitives. System design:
+`../goal-flow-agents/docs/DESIGN.md`.
