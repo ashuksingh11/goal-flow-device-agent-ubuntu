@@ -189,6 +189,14 @@ if (options.VerifyEnvelope)
     return;
 }
 
+// v7-M2 GATE: one Advance day reports two changes and opens one approval. Read-only
+// (it observes; it does not adapt or execute), so it needs no throwaway --data dir.
+if (options.VerifyDayTick)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyDayTickAsync(provider);
+    return;
+}
+
 // v6 GATE: the last gate before a real side effect must report a refusal AS a
 // refusal. Needs the agent (it drives the real approval path), so it sits after the
 // kernel is built. MUTATES the world (the allowed proposal really runs) — use a
@@ -403,6 +411,9 @@ internal sealed record CliOptions
     /// <summary>--verify-envelope — assert one goal's approved order narrows another's ceiling (v6-M3 gate).</summary>
     public bool VerifyEnvelope { get; init; }
 
+    /// <summary>--verify-day-tick — assert one tick reports two changes and opens one approval (v7-M2 gate).</summary>
+    public bool VerifyDayTick { get; init; }
+
     /// <summary>--verify-approval-block — assert a refused proposal is reported blocked, not executed (v6 gate).</summary>
     public bool VerifyApprovalBlock { get; init; }
 
@@ -465,6 +476,7 @@ internal sealed record CliOptions
                 "--verify-grades" => options with { VerifyGrades = true },
                 "--verify-active-policy" => options with { VerifyActivePolicy = true },
                 "--verify-envelope" => options with { VerifyEnvelope = true },
+                "--verify-day-tick" => options with { VerifyDayTick = true },
                 "--verify-approval-block" => options with { VerifyApprovalBlock = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
@@ -1136,6 +1148,158 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
 /// and the real observer against a throwaway copy of the world, with no LLM anywhere.
 /// </para>
 /// </summary>
+/// <summary>
+/// v7-M2 GATE: the day tick TELLS the family everything and ASKS about one thing.
+///
+/// <para>
+/// Act 2 shows two changes overnight — a hard training day and a fish delivery — and
+/// exactly one approval. That is a real distinction in the harness, not staging: a
+/// non-material change is listed in the day summary and never opens an approval, and
+/// before v7 it went nowhere at all (only the single material change reached
+/// <c>DayAdvanced.Events</c>, so an observed non-material change was indistinguishable
+/// from a quiet day).
+/// </para>
+///
+/// <para>
+/// Deterministic and offline: the real observer, the real feed, the real clock. No LLM,
+/// so the ADAPTATION itself is out of scope here — what is in scope is that exactly one
+/// change is eligible to cause one, and that its steer carries both facts, which is the
+/// only reason a single adaptation can explain both.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyDayTickAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    var observer = provider.GetServices<IDomainObserver>().First(o => o.Domain == "meal_plan");
+    var workout = provider.GetRequiredService<WorkoutPlugin>();
+    var clock = provider.GetRequiredService<IClock>();
+
+    // 1. THE WORLD FILE SEEDS AND READS. A missing data file fails silently — the
+    //    observer catches FileNotFoundException, returns no changes, and the goal just
+    //    never adapts — so a gate that only checked behaviour would pass on an empty world.
+    var routine = JsonNode.Parse(await workout.GetWeeklyRoutine())?.AsObject();
+    if (routine?["target_steps_per_day"]?.GetValue<int>() is not 8000)
+    {
+        failures.Add($"Workout.GetWeeklyRoutine must return the household's step target, got {routine?.ToJsonString()}");
+    }
+    if ((routine?["week"]?.AsArray()?.Count ?? 0) != 7)
+    {
+        failures.Add("the routine must cover a full week, or 'workout-friendly' has nothing to shape a week against");
+    }
+
+    // 2. THE GENERIC-CLOCK RULE holds for activity too: -1 is yesterday on any day the
+    //    demo runs, resolved at READ time. An absolute date here would go stale between
+    //    demos in a way nobody notices until the numbers read as a week old.
+    var recent = JsonNode.Parse(await workout.GetRecentActivity())?.AsArray();
+    var yesterday = recent?
+        .Select(n => n?.AsObject())
+        .OfType<JsonObject>()
+        .FirstOrDefault(d => d["day_offset"]?.GetValue<int>() == -1);
+    var wantYesterday = clock.Today.AddDays(-1).ToString("yyyy-MM-dd");
+    if (yesterday?["date"]?.GetValue<string>() != wantYesterday)
+    {
+        failures.Add($"recent activity must resolve day_offset -1 to {wantYesterday}, got {yesterday?["date"]}");
+    }
+
+    // 3. THE SPIKE IS NOT IN THE STEADY STATE. If 12,400 steps were seeded here it
+    //    would already be true on day 1, the plan would have been built knowing it, and
+    //    Act 2's adaptation would be reacting to nothing new. It belongs in the feed.
+    if ((recent?.ToJsonString() ?? "").Contains("12400", StringComparison.Ordinal))
+    {
+        failures.Add("the Act 2 activity spike must live in daily_events.json, not in workout.json's steady state");
+    }
+
+    // 4. DAY 1 OF THE FEED: two changes, one of them material.
+    var goal = new GoalRecord
+    {
+        Dispatch = new Dispatch
+        {
+            GoalId = "goal-week",
+            CorrelationId = "c",
+            Domain = "meal_plan",
+            Objective = "plan my weekly meal",
+            Constraints = new TaskConstraints { Hard = new JsonObject() },
+            TimeWindow = new TimeWindow
+            {
+                Start = clock.Today.ToString("yyyy-MM-dd"),
+                End = clock.Today.AddDays(6).ToString("yyyy-MM-dd")
+            }
+        },
+        Tasks = [],
+        Plan = Enumerable.Range(1, 7)
+            .Select(day => new PlanItem { Id = $"d{day}", Day = day, Title = $"Dinner {day}" })
+            .ToArray(),
+        WorldSnapshot = await observer.CaptureAsync()
+    };
+
+    // The snapshot froze the feed's fire dates; now advance INTO day 2, which is what
+    // pressing Advance day does once.
+    if (clock is SimulatedClock sim) sim.AdvanceDay();
+
+    var changes = await observer.ObserveAsync(goal);
+    if (changes.Count != 2)
+    {
+        failures.Add($"day 1 must surface exactly two changes (a training day and a delivery), got {changes.Count}: "
+                     + string.Join(", ", changes.Select(c => c.Key)));
+    }
+
+    var material = changes.Where(c => c.Material).ToArray();
+    if (material.Length != 1 || material[0].Kind != "inventory.restocked")
+    {
+        failures.Add("exactly one day-1 change may be material, and it is the delivery — got "
+                     + string.Join(", ", material.Select(c => c.Kind)));
+    }
+
+    var note = changes.FirstOrDefault(c => c.Kind == "workout.activity_logged");
+    if (note is null)
+    {
+        failures.Add("the training day must be observed at all — it is half of what Advance day reports");
+    }
+    else
+    {
+        if (note.Material)
+        {
+            failures.Add("a workout is worth TELLING the family about and not worth asking them to approve a plan change for");
+        }
+        if (!string.IsNullOrWhiteSpace(note.Steer))
+        {
+            failures.Add("an informational change must carry no steer, or it becomes a re-plan by accident");
+        }
+        if (string.IsNullOrWhiteSpace(note.Description))
+        {
+            failures.Add("an informational change still needs a description — it is what the day summary shows");
+        }
+    }
+
+    // 5. ONE ADAPTATION, BOTH REASONS. This is why two events are allowed to produce
+    //    one approval: the material change's steer quotes the other one's numbers, so
+    //    the single re-plan the user approves can explain itself in full.
+    var steer = material.FirstOrDefault()?.Steer ?? "";
+    foreach (var mustSay in new[] { "fish", "12,400" })
+    {
+        if (!steer.Contains(mustSay, StringComparison.OrdinalIgnoreCase))
+        {
+            failures.Add($"the delivery's steer must name '{mustSay}' — one adaptation has to account for both changes");
+        }
+    }
+
+    // 6. EXACTLY ONCE, both kinds. The tick dedups through one "already surfaced" set;
+    //    a listed change that re-fires every tick is a day summary that repeats itself
+    //    forever, which reads as a broken agent rather than a quiet week.
+    foreach (var change in changes) goal.EmittedMaterialChanges.Add(change.Key);
+    var again = (await observer.ObserveAsync(goal))
+        .Where(c => !goal.EmittedMaterialChanges.Contains(c.Key))
+        .ToArray();
+    if (again.Length != 0)
+    {
+        failures.Add($"a surfaced change must not surface again, got {string.Join(", ", again.Select(c => c.Key))}");
+    }
+
+    foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
+    Console.WriteLine("gate 22 (day tick: two changes, one approval): " + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
+    return failures.Count == 0 ? 0 : 1;
+}
+
 public static async Task<int> VerifyEnvelopeAsync(IServiceProvider provider, string dataDir)
 {
     var failures = new List<string>();

@@ -1,0 +1,50 @@
+{
+  "comment": [
+    "ACTIVITY DATA (v7). Stands in for the household's wearables and the Health app.",
+    "",
+    "WHICH GOAL THIS SERVES: meal_plan, and only meal_plan. It is the evidence behind the",
+    "'workout-friendly' PREFERENCE the cloud resolves for a meal goal — the planner reads",
+    "the routine here and shapes the week's protein around it. It is soft by nature: a",
+    "calorie target that could BLOCK a dinner would be a medical rule, and nobody entered",
+    "one.",
+    "",
+    "WHY THERE IS NO WorkoutObserver AND NO workout_routine DOMAIN. An IDomainObserver is",
+    "what makes the cloud ADVERTISE a domain, and the interpreter classifies against those",
+    "hints — so adding one here would start routing 'help me train for a 10k' to this",
+    "device, which cannot advance it. Activity is a FACT the meal planner reasons over, not",
+    "a kind of goal the Family Hub can run. MealPlanObserver watches it instead.",
+    "",
+    "WHAT IS AND IS NOT IN HERE. `routine` and `recent` are the STEADY STATE: what this",
+    "household normally does, which is what Act 1 plans against. The Act 2 spike (12,400",
+    "steps) is deliberately NOT here — it arrives through data/daily_events.json like every",
+    "other world change, because the feed is where the materiality decision lives. If the",
+    "spike were seeded here it would already be true on day 1 and the adaptation would be",
+    "reacting to nothing new.",
+    "",
+    "GENERIC CLOCK: `day_offset` is resolved against IClock.Today at READ time, so -1 is",
+    "always yesterday, on any day the demo runs."
+  ],
+
+  "routine": {
+    "target_steps_per_day": 8000,
+    "week": [
+      { "day": "Monday", "activity": "gym — upper body", "intensity": "moderate" },
+      { "day": "Tuesday", "activity": "rest", "intensity": "none" },
+      { "day": "Wednesday", "activity": "gym — legs", "intensity": "hard" },
+      { "day": "Thursday", "activity": "rest", "intensity": "none" },
+      { "day": "Friday", "activity": "gym — full body", "intensity": "moderate" },
+      { "day": "Saturday", "activity": "long run", "intensity": "hard" },
+      { "day": "Sunday", "activity": "walk", "intensity": "light" }
+    ],
+    "notes": [
+      "Rohan is the one who logs; the plan is cooked for the household either way.",
+      "Hard days want more protein at dinner; rest days want it lighter."
+    ]
+  },
+
+  "recent": [
+    { "day_offset": -3, "member": "Rohan", "steps": 6200, "calories_burned": 410, "activity": "walk" },
+    { "day_offset": -2, "member": "Rohan", "steps": 7100, "calories_burned": 470, "activity": "gym — upper body" },
+    { "day_offset": -1, "member": "Rohan", "steps": 6800, "calories_burned": 440, "activity": "rest" }
+  ]
+}

@@ -16,6 +16,7 @@ or a simulated date driven by `control` frames / `--date` (`SimulatedClock`,
 | `calendar.json` | `day_offset` | event occurs on `today + N` |
 | `reminders.json` | `due_in_days` | reminder due `today + N` |
 | `daily_events.json` | `day_offset` | resolves each demo event to the fixed week's target ISO date at snapshot time (does not decide when it fires — the presenter does, via `control: trigger_event`) |
+| `workout.json` | `day_offset` (negative) | a logged activity day, `today − N`; `-1` is always yesterday |
 | `sample-contract.json` | `${today+N}` tokens | resolved to ISO dates when the file is loaded |
 
 `MockFamilyHubAdapter.LoadResolvedAsync` resolves offsets against `IClock.Today` at
@@ -38,7 +39,7 @@ The five headline use cases (v3.4), plus `guest_dinner` which is kept but unhead
 
 | Domain | Its slice | Change source (day-triggered) |
 |---|---|---|
-| `meal_plan` | `inventory`, `recipes`, `calendar` | `daily_events.json` |
+| `meal_plan` | `inventory`, `recipes`, `calendar`, `workout` | `daily_events.json` |
 | `birthday_party` | `party`, `family`, `budget`, `calendar` | `party.pending_updates` |
 | `vacation_prep` | `vacation`, `security`, `appliances`, `calendar` | `vacation.pending_updates` |
 | `grocery_cost` | `grocery`, `inventory`, `budget` | `grocery.pending_updates` |
@@ -57,10 +58,23 @@ The five headline use cases (v3.4), plus `guest_dinner` which is kept but unhead
   (eco program, off-peak), `Reminders` and `Notify`. Per-appliance draw lives on
   `appliances.json` under `energy`, which `Appliance.ListAppliances` returns **verbatim**
   — that is how the planner sees real kWh without a new tool.
-- `daily_events.json` — the meal week's world-change feed: 6 events (`day1-restock` …
+- `daily_events.json` — the meal week's world-change feed: 7 events (`day1-activity` …
   `day6-lighter-sunday`) with `id`/`label`/`title`/`order`/`day`/`kind`/`summary`/
   `context`/`steer`. **`kind` is a CLOSED vocabulary** — `MealPlanObserver.IsMaterial`
-  hardcodes the six; a new kind fires but is silently non-material.
+  decides; anything unlisted fires but is silently non-material.
+  **Day 1 is two events on purpose (v7):** `day1-activity` is *informational* (listed in
+  the day summary, no steer, never opens an approval) and `day1-fish` is *material*, with
+  a steer that quotes the activity numbers — so two changes produce ONE adaptation that
+  can explain both. An entry with no `steer` must also be non-material, or it re-plans
+  against nothing.
+- `workout.json` — the household's training routine and the last few days of steps and
+  calories, read by `Workout.GetWeeklyRoutine` / `GetRecentActivity`. It is the evidence
+  behind the cloud's soft *workout-friendly* preference on meal goals. **There is
+  deliberately no `WorkoutObserver` and no `workout_routine` domain**: an observer is what
+  makes the cloud advertise a domain, so adding one would start routing training goals to
+  a device that cannot advance them. Activity is a fact the meal planner reasons over.
+  The Act 2 spike lives in `daily_events.json`, **not** here — seeded here it would
+  already be true on day 1.
 - `family.json`, `budget.json` — grounding + the price book. Hard health constraints
   arrive on the dispatch's `constraints.hard`, NOT from `family.json`.
 - `device_state.json` — the precheck world (flip a flag to break a goal on cue).

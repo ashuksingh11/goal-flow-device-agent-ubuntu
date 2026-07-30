@@ -17,10 +17,13 @@ namespace GoalFlow.Device.Products.FamilyHub;
 /// </para>
 ///
 /// <para>
-/// MATERIALITY: every feed entry is material, and that is not laziness — the feed
-/// IS the materiality decision, curated so the demo shows four quiet days and one
-/// smart adaptation rather than a stream of noise. What is NOT material never
-/// enters the feed in the first place.
+/// MATERIALITY: the feed IS the materiality decision, curated so the demo shows quiet
+/// days and one smart adaptation rather than a stream of noise. Through v6 every entry
+/// was material and nothing else entered the feed. v7 adds the other case —
+/// <c>workout.activity_logged</c> is worth TELLING the family about and not worth
+/// re-planning for on its own — so the feed now carries both, and
+/// <see cref="IsMaterial"/> is where the difference is decided rather than at the point
+/// of writing an entry.
 /// </para>
 /// </summary>
 public sealed class MealPlanObserver : IDomainObserver
@@ -132,9 +135,18 @@ public sealed class MealPlanObserver : IDomainObserver
     }
 
     /// <summary>
-    /// Which meal-week changes are worth waking the family for. The daily feed is
-    /// curated, so every kind it can emit is material by construction; anything
-    /// unrecognised is not, so a stray entry stays quiet rather than nagging.
+    /// Which meal-week changes are worth RE-PLANNING for. Anything unrecognised is
+    /// not, so a stray entry stays quiet rather than nagging.
+    ///
+    /// <para>
+    /// A non-material kind is not ignored: it is still surfaced in the day summary
+    /// under Advance day, so the family is told it happened. It simply does not open
+    /// an approval. <c>workout.activity_logged</c> is the case that motivated the
+    /// distinction — knowing yesterday was a hard training day is worth saying, and
+    /// asking someone to approve a plan change because they went for a run is not.
+    /// The day it matters, it matters as a REASON inside another change's steer, which
+    /// is exactly how the fish delivery uses it.
+    /// </para>
     /// </summary>
     private static bool IsMaterial(string kind) => kind switch
     {
@@ -144,6 +156,8 @@ public sealed class MealPlanObserver : IDomainObserver
         "guest.headcount_added" => true,
         "appliance.unavailable" => true,
         "meal.lighter_requested" => true,
+        // Explicitly listed rather than left to the default: this one is a decision.
+        "workout.activity_logged" => false,
         _ => false
     };
 

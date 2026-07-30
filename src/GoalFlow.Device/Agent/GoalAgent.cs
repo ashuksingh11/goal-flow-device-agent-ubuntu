@@ -282,6 +282,20 @@ public sealed class GoalAgent
             }
 
             var changes = await _monitor.ObserveAsync(goal, ct);
+
+            // v7 — TELLING IS NOT THE SAME AS ASKING. A change that is not material is
+            // still something that happened in this home, and until now it went nowhere:
+            // only the one material change reached the day summary, so a non-material
+            // observation was indistinguishable from a quiet day. Listed here, adapted
+            // never. Deduped through the same set as the material ones (the set means
+            // "already surfaced", which is true of both) so a listed change does not
+            // reappear on every subsequent tick.
+            foreach (var note in changes.Where(c => !c.Material && goal.EmittedMaterialChanges.Add(c.Key)))
+            {
+                _logger.LogInformation("world_change_note goal={GoalId} kind={Kind} key={Key}", goalId, note.Kind, note.Key);
+                AddDayEvent(events, note, goalId);
+            }
+
             var material = changes.FirstOrDefault(c => c.Material && goal.EmittedMaterialChanges.Add(c.Key));
             if (material is not null)
             {

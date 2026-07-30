@@ -16,3 +16,5 @@ FamilyProfiles.GetMember
 Budget.GetBudgetStatus
 Budget.EstimateCost
 Security.GetSecurityStatus
+Workout.GetWeeklyRoutine
+Workout.GetRecentActivity
