@@ -56,7 +56,10 @@ public static class AgentEventKinds
     /// <summary>Payload: { "phase": … } — see <see cref="Phases"/>.</summary>
     public const string Phase = "phase";
 
-    /// <summary>Payload: { "text": "..." } — streamed model reasoning/narration.</summary>
+    /// <summary>
+    /// Payload: { "text": "...", "kind"?, "step"?, "detail"? } — model reasoning, or
+    /// (v7) a labelled step of the work. See <see cref="ThinkingKinds"/>.
+    /// </summary>
     public const string Thinking = "thinking";
 
     /// <summary>Payload: { "module": "...", "function": "...", "args": {...} }.</summary>
@@ -132,7 +135,46 @@ public sealed record PhasePayload(string Phase);
 /// <summary>Payload for a <see cref="AgentEventKinds.Harness"/> event.</summary>
 public sealed record HarnessPayload(string Module, string Status, string? Note = null, string? Verdict = null, string? Grade = null);
 
-public sealed record ThinkingPayload(string Text);
+/// <summary>
+/// What a <see cref="AgentEventKinds.Thinking"/> event IS (v7). Additive: absent means
+/// <see cref="Narration"/>, which is every thinking event emitted before v7.
+/// </summary>
+public static class ThinkingKinds
+{
+    /// <summary>Streamed model prose, arriving a fragment at a time. Merge on the client.</summary>
+    public const string Narration = "narration";
+
+    /// <summary>
+    /// One labelled step of the work, whole and self-contained: <c>step</c> is the
+    /// headline, <c>detail</c> the sub-line. Never fragmented, so a client renders it
+    /// on arrival rather than accumulating it.
+    /// </summary>
+    public const string Step = "step";
+
+    /// <summary>A retry, a fallback, an error — the run talking about itself.</summary>
+    public const string Notice = "notice";
+}
+
+/// <summary>
+/// Model reasoning, or a labelled step of the work.
+///
+/// <para>
+/// v7 ADDED THE STRUCTURE, AND THE REASON IS THE PLANNER. Through v6 this was one
+/// untyped string, which forced every client to guess: whether a fragment continued the
+/// last one, whether a chunk was prose or the JSON the model interleaved with it (the
+/// chat UI carries ~150 lines of heuristics for exactly that), and — worst — the
+/// composing screen was simply BLANK during planning, because the compose call is not
+/// streamed and deliberately keeps its plan JSON off this channel. A silent engine and a
+/// broken one look identical.
+/// </para>
+///
+/// <para>
+/// <paramref name="Text"/> stays required and stays first: a client that ignores the new
+/// fields renders exactly what it did before. For a step it holds "step — detail", so
+/// even the unstructured reading is a sentence.
+/// </para>
+/// </summary>
+public sealed record ThinkingPayload(string Text, string? Kind = null, string? Step = null, string? Detail = null);
 
 public sealed record ToolCallPayload(string Module, string Function, JsonObject? Args);
 

@@ -364,6 +364,28 @@ public sealed class GoalAgent
         return Math.Max(1, _clock.Today.DayNumber - starts.Min().DayNumber + 1);
     }
 
+    /// <summary>
+    /// How many household rules this goal is being held to — the number the Safety
+    /// engine's verdict reports. Counts LIST entries individually (three allergens are
+    /// three rules a plan can trip) and each scalar window or ceiling as one.
+    /// </summary>
+    internal static int CountHardConstraints(Dispatch dispatch)
+        => dispatch.Constraints.Hard.Sum(pair => pair.Value is JsonArray list ? list.Count : 1);
+
+    /// <summary>
+    /// The planner's verdict pill. Says what it WEIGHED when the model reported it, which
+    /// is the difference between "it produced seven steps" and "it produced seven steps
+    /// out of seventeen options, and here is what it threw away".
+    /// </summary>
+    internal static string PlannerVerdict(int stepCount, int? considered, int rejected)
+    {
+        var steps = $"{stepCount} steps";
+        if (considered is > 0 && rejected > 0) return $"{steps} · {considered} considered, {rejected} rejected";
+        if (considered is > 0) return $"{steps} · {considered} considered";
+        if (rejected > 0) return $"{steps} · {rejected} rejected";
+        return steps;
+    }
+
     private const int MaxComposeAttempts = 3;
 
     /// <summary>
@@ -764,6 +786,13 @@ public sealed class GoalAgent
           recurring action (e.g. a nightly dishwasher run) into ONE proposal, not one per night. Keep
           the plan tight — fewer, higher-value proposals.
         - Use ISO dates inside the contract time_window. Never use a hardcoded anchor date.
+        - EVERY plan item needs a "why". Write it as cause then effect, naming the real fact
+          that drove it ("spinach expires Tuesday", "780 kcal burned yesterday") — not a
+          restatement of the title. It is shown under the item, so one short line.
+        - "considered" is how many options you weighed, and "rejected" is the ones you did
+          NOT take with the reason for each. Report them honestly: if a hard constraint ruled
+          something out, say which constraint. If you weighed nothing, omit both rather than
+          inventing a number — a fabricated rejection is worse than a missing one.
         - The response must start with { and end with }. Do not output whitespace, Markdown, code fences, or prose outside the JSON object.
 
         Final answer must be only valid JSON with this shape:
@@ -776,6 +805,8 @@ public sealed class GoalAgent
             {"proposal_id":"p2","action":"place grocery order","module":"ShoppingList","function":"PlaceOrder","args":{"estimatedTotal":42.50},"tier":"firm","reason":"...","requires_approval":true}
           ],
           "impact": [{"label":"waste","value":"uses 2 expiring items"}],
+          "considered": 17,
+          "rejected": [{"option":"pork belly stir-fry","reason":"no pork"}],
           "explanation": "one concise paragraph"
         }
         """;
@@ -828,13 +859,22 @@ public sealed class GoalAgent
                 note: precheck.Results.FirstOrDefault(r => r.Blocks)?.Detail ?? "world not ready", verdict: "blocked");
             return BuildPrecheckBlockedPlan(dispatch, precheck);
         }
-        await _trace.HarnessAsync(HarnessModules.Precheck, HarnessStatuses.Pass, note: "The world is ready", verdict: "ready");
+        // v7 COUNTED VERDICTS. Every verdict below reports a real number the engine
+        // measured. "grounded" and "ready" were true and said nothing — a pipeline that
+        // only reports that it ran is an animation, and the reader learns to stop looking
+        // at it. Nothing here is computed for the display: these are counts the run
+        // already had in hand.
+        await _trace.HarnessAsync(HarnessModules.Precheck, HarnessStatuses.Pass,
+            note: "The world is ready", verdict: $"ready · {precheck.Results.Count} probe(s)");
 
         // CAPABILITY MANAGER: the tool surface the planner is allowed to reach for.
-        var toolCount = GroundingFunctions().Count;
+        var groundingFns = GroundingFunctions();
+        var toolCount = groundingFns.Count;
+        var moduleCount = groundingFns.Select(f => f.PluginName).Distinct(StringComparer.Ordinal).Count();
         await _trace.HarnessAsync(HarnessModules.CapabilityManager, HarnessStatuses.Active, note: "Discovering the device's tool surface…");
         await DwellAsync(ct);
-        await _trace.HarnessAsync(HarnessModules.CapabilityManager, HarnessStatuses.Done, note: $"{toolCount} tools available", verdict: $"{toolCount} tools");
+        await _trace.HarnessAsync(HarnessModules.CapabilityManager, HarnessStatuses.Done,
+            note: $"{toolCount} tools available", verdict: $"{toolCount} tools · {moduleCount} modules");
 
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
 
@@ -864,10 +904,16 @@ public sealed class GoalAgent
             MaxTokens = 2500
         };
 
+        var toolsBefore = _trace.ToolCallCount;
         var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
-        _logger.LogInformation("grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars}",
-            dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length);
-        await _trace.HarnessAsync(HarnessModules.Grounding, HarnessStatuses.Done, note: "Context assembled from the live world", verdict: "grounded");
+        var toolsUsed = _trace.ToolCallCount - toolsBefore;
+        _logger.LogInformation("grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars} tool_calls={Tools}",
+            dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length, toolsUsed);
+        await _trace.HarnessAsync(HarnessModules.Grounding, HarnessStatuses.Done,
+            note: "Context assembled from the live world",
+            // What it actually READ, not merely that it finished. The model chooses how
+            // many tools to call, so this number is genuinely per-run.
+            verdict: toolsUsed > 0 ? $"grounded · {toolsUsed} read(s)" : "grounded");
 
         if (groundingSummary.Length > 0)
         {
@@ -876,13 +922,42 @@ public sealed class GoalAgent
 
         await _trace.PhaseAsync("planning");
         await _trace.HarnessAsync(HarnessModules.Planner, HarnessStatuses.Active, note: "Composing the plan…");
+
+        // v7 — THE PLANNER STOPS BEING SILENT. The compose call is not streamed and
+        // deliberately keeps its plan JSON off the thinking channel, so through v6 this
+        // engine emitted nothing at all on a healthy run: the drawer was blank for the
+        // longest stretch of the run, and a silent engine looks exactly like a broken one.
+        // It cannot narrate what it is thinking — but it can say what it is thinking
+        // AGAINST, and that is knowable before the call and true every time.
+        var hardCount = CountHardConstraints(dispatch);
+        await _trace.ThinkingStepAsync(
+            "Composing the plan",
+            $"{taskDag.Count} task(s) · {toolCount} tools · {hardCount} household rule(s) to hold");
         await DwellAsync(ct);
         var composeClock = Stopwatch.StartNew();
         var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
-        _logger.LogInformation("compose_done goal={GoalId} elapsed_ms={Elapsed} items={Items} proposals={Proposals}",
-            dispatch.GoalId, composeClock.ElapsedMilliseconds, modelPlan.Plan.Count, modelPlan.Proposals.Count);
+        _logger.LogInformation("compose_done goal={GoalId} elapsed_ms={Elapsed} items={Items} proposals={Proposals} considered={Considered} rejected={Rejected}",
+            dispatch.GoalId, composeClock.ElapsedMilliseconds, modelPlan.Plan.Count, modelPlan.Proposals.Count,
+            modelPlan.Considered, modelPlan.Rejected?.Count ?? 0);
         modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan, dispatch.Domain, _clock.Today) };
-        await _trace.HarnessAsync(HarnessModules.Planner, HarnessStatuses.Done, note: $"{modelPlan.Plan.Count} steps drafted", verdict: $"{modelPlan.Plan.Count} steps");
+
+        await _trace.ThinkingStepAsync(
+            $"Drafted {modelPlan.Plan.Count} step(s)",
+            modelPlan.Proposals.Count == 0
+                ? "nothing that needs a decision from you"
+                : $"{modelPlan.Proposals.Count} action(s) to put to you");
+        // The discarded branches — the one thing the run knew and could never show, because
+        // they vanished inside a single compose call and the plan arrived looking like the
+        // only plan there was. Model-authored, so displayed and never enforced.
+        if (modelPlan.Rejected is { Count: > 0 } rejected)
+        {
+            await _trace.ThinkingStepAsync(
+                $"Rejected {rejected.Count} option(s)",
+                string.Join(" · ", rejected.Take(4).Select(r => $"{r.Option} ({r.Reason})")));
+        }
+        await _trace.HarnessAsync(HarnessModules.Planner, HarnessStatuses.Done,
+            note: $"{modelPlan.Plan.Count} steps drafted",
+            verdict: PlannerVerdict(modelPlan.Plan.Count, modelPlan.Considered, modelPlan.Rejected?.Count ?? 0));
 
         await _trace.PhaseAsync("checking");
 
@@ -896,13 +971,19 @@ public sealed class GoalAgent
             await _trace.HarnessAsync(HarnessModules.Safety, HarnessStatuses.Block,
                 note: safetyViolations[0], verdict: $"{safetyViolations.Length} blocked", grade: safetyGate);
         else
+            // "allowed" alone reads as "the engine had nothing to do". It held N rules over
+            // every call the model made, and that is the claim the whole demo rests on.
             await _trace.HarnessAsync(HarnessModules.Safety, HarnessStatuses.Pass,
-                note: "Every action within policy", verdict: "allowed", grade: safetyGate);
+                note: "Every action within policy",
+                verdict: hardCount > 0 ? $"allowed · {hardCount} rule(s) held" : "allowed",
+                grade: safetyGate);
 
         // TASK MANAGER: the goal ledger the whole plan hangs off (the DAG grounded above).
         await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Active, note: "Recording the goal ledger…");
         await DwellAsync(ct);
-        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Done, note: $"{taskDag.Count} task(s) tracked", verdict: $"{taskDag.Count} tasks");
+        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Done,
+            note: $"{taskDag.Count} task(s) tracked",
+            verdict: $"{taskDag.Count} tasks · {modelPlan.Plan.Count} steps");
 
         // Collapse duplicate proposals the model sometimes emits (e.g. the same
         // "run dishwasher" action repeated per night) — dedupe by module+function+args
@@ -948,7 +1029,13 @@ public sealed class GoalAgent
                 Precheck = ToPrecheckVerdict(precheck),
                 Impact = modelPlan.Impact,
                 DemoEvents = demoEvents,
-                Explanation = modelPlan.Explanation
+                Explanation = modelPlan.Explanation,
+                // v7, model-authored and display-only: what it weighed and what it threw
+                // away. Nothing downstream reads these — a wrong rejection reason costs a
+                // wrong sentence, which is the right price for the clearest evidence a
+                // person can be given that something reasoned rather than looked up.
+                Considered = modelPlan.Considered,
+                Rejected = modelPlan.Rejected
             }
         };
 
@@ -2113,5 +2200,10 @@ public sealed class GoalAgent
         public IReadOnlyList<ProposalItem> Proposals { get; init; } = [];
         public IReadOnlyList<ImpactItem> Impact { get; init; } = [];
         public string? Explanation { get; init; }
+
+        /// <summary>v7: how many options were weighed, and which were discarded and why.</summary>
+        public int? Considered { get; init; }
+
+        public IReadOnlyList<RejectedOption>? Rejected { get; init; }
     }
 }

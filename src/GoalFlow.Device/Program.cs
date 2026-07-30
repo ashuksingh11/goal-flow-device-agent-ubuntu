@@ -197,6 +197,14 @@ if (options.VerifyDayTick)
     return;
 }
 
+// v7-M3 GATE: a thinking step is whole, and plain narration is byte-identical to v6.
+// Needs the kernel (it drives a real blocked call through the real filter).
+if (options.VerifyThinkingSteps)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyThinkingStepsAsync(provider);
+    return;
+}
+
 // v6 GATE: the last gate before a real side effect must report a refusal AS a
 // refusal. Needs the agent (it drives the real approval path), so it sits after the
 // kernel is built. MUTATES the world (the allowed proposal really runs) — use a
@@ -414,6 +422,9 @@ internal sealed record CliOptions
     /// <summary>--verify-day-tick — assert one tick reports two changes and opens one approval (v7-M2 gate).</summary>
     public bool VerifyDayTick { get; init; }
 
+    /// <summary>--verify-thinking-steps — assert a step is whole and narration is v6-identical (v7-M3 gate).</summary>
+    public bool VerifyThinkingSteps { get; init; }
+
     /// <summary>--verify-approval-block — assert a refused proposal is reported blocked, not executed (v6 gate).</summary>
     public bool VerifyApprovalBlock { get; init; }
 
@@ -477,6 +488,7 @@ internal sealed record CliOptions
                 "--verify-active-policy" => options with { VerifyActivePolicy = true },
                 "--verify-envelope" => options with { VerifyEnvelope = true },
                 "--verify-day-tick" => options with { VerifyDayTick = true },
+                "--verify-thinking-steps" => options with { VerifyThinkingSteps = true },
                 "--verify-approval-block" => options with { VerifyApprovalBlock = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
@@ -1148,6 +1160,128 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
 /// and the real observer against a throwaway copy of the world, with no LLM anywhere.
 /// </para>
 /// </summary>
+/// <summary>
+/// v7-M3 GATE: the run says what it DID, and a v6 client cannot tell the difference.
+///
+/// <para>
+/// Two things are being pinned, and the second is the one that would break quietly.
+/// First: a step is WHOLE — it carries its own headline and sub-line, and a client never
+/// has to accumulate fragments or guess where one thought ends. Second: plain narration
+/// is BYTE-IDENTICAL to what v6 emitted. The whole design rests on `text` staying the
+/// only required field, so a surface that ignores `kind`/`step`/`detail` renders exactly
+/// what it always did — and the cheapest way to break that is to start stamping `kind`
+/// on everything for tidiness.
+/// </para>
+///
+/// <para>
+/// Deterministic and offline: a real Trace with a capturing sink, and the real
+/// SafetyFilter blocking a real call.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyThinkingStepsAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    var captured = new List<AgentEvent>();
+    var trace = new Trace(
+        provider.GetRequiredService<ILoggerFactory>().CreateLogger<Trace>(),
+        ev => { captured.Add(ev); return Task.CompletedTask; });
+
+    using (trace.BeginGoalScope("goal-steps", "c"))
+    {
+        await trace.ThinkingStepAsync("Composing the plan", "7 tasks · 20 tools");
+        await trace.ThinkingStepAsync("Drafted 7 steps");
+        await trace.ThinkingStepAsync("   ", "a step with no headline is not a step");
+        await trace.ThinkingAsync("the model's own words");
+    }
+
+    JsonObject? Payload(int i) => i < captured.Count ? captured[i].Payload : null;
+
+    // 1. A STEP IS WHOLE. Headline, sub-line, and a `text` that reads as a sentence for
+    //    anything that only knows about `text`.
+    var step = Payload(0);
+    if (step?["kind"]?.GetValue<string>() != ThinkingKinds.Step
+        || step["step"]?.GetValue<string>() != "Composing the plan"
+        || step["detail"]?.GetValue<string>() != "7 tasks · 20 tools"
+        || step["text"]?.GetValue<string>() != "Composing the plan — 7 tasks · 20 tools")
+    {
+        failures.Add($"a step must carry kind/step/detail and a joined text, got {step?.ToJsonString()}");
+    }
+
+    // 2. No detail means NO detail key — not an empty string a client has to test for.
+    var bare = Payload(1);
+    if (bare is null || bare.ContainsKey("detail") || bare["text"]?.GetValue<string>() != "Drafted 7 steps")
+    {
+        failures.Add($"a step with no sub-line must omit `detail` entirely, got {bare?.ToJsonString()}");
+    }
+
+    // 3. A step with no headline is dropped rather than emitted blank.
+    if (captured.Count != 3)
+    {
+        failures.Add($"a whitespace-only step must not be emitted, got {captured.Count} events");
+    }
+
+    // 4. BACK-COMPAT, and this is the one worth having. Narration carries `text` and
+    //    NOTHING else, so a v6 client sees the exact bytes it saw before v7.
+    var narration = captured.Count >= 3 ? captured[2].Payload : null;
+    if (narration is null || narration.Count != 1 || narration["text"]?.GetValue<string>() != "the model's own words")
+    {
+        failures.Add($"narration must stay exactly {{text}} — a v6 client must not see new keys, got {narration?.ToJsonString()}");
+    }
+
+    // 5. A SAFETY BLOCK SAYS SO, in the run's own transcript. Until v7 the most
+    //    interesting thing this engine ever does reached the user as a chip summary and
+    //    a number on the plan card, and never as a sentence at the moment it happened.
+    var filter = provider.GetRequiredService<SafetyFilter>();
+    var armed = provider.GetRequiredService<ArmedPolicies>();
+    captured.Clear();
+    filter.SetTrace(trace);
+    var hard = new JsonObject { ["allergens"] = new JsonArray("peanuts") };
+    // A kernel with one plugin and the real filter — the Kernel itself is built by
+    // GoalAgent rather than registered, and this gate needs a real invocation to travel
+    // the real filter rather than a hand-called method.
+    var builder = Kernel.CreateBuilder();
+    builder.Plugins.AddFromObject(provider.GetRequiredService<ShoppingListPlugin>(), "ShoppingList");
+    var kernel = builder.Build();
+    kernel.FunctionInvocationFilters.Add(filter);
+
+    using (trace.BeginGoalScope("goal-block", "c"))
+    using (armed.Arm("goal-block", hard, (JsonObject)hard.DeepClone()))
+    {
+        var fn = kernel.Plugins.GetFunction("ShoppingList", "Add");
+        await kernel.InvokeAsync(fn, new KernelArguments { ["items"] = new[] { "peanut butter" }, ["reason"] = "test" });
+    }
+
+    var notice = captured.FirstOrDefault(e =>
+        e.Event == AgentEventKinds.Thinking
+        && e.Payload["kind"]?.GetValue<string>() == ThinkingKinds.Notice);
+    if (notice is null)
+    {
+        failures.Add("a safety block must be said out loud as a notice step, not only counted");
+    }
+    else if (!(notice.Payload["detail"]?.GetValue<string>() ?? "").Contains("peanut", StringComparison.OrdinalIgnoreCase))
+    {
+        failures.Add($"the notice must carry the reason it blocked, got {notice.Payload["detail"]}");
+    }
+
+    // 6. COUNTED VERDICTS. "7 steps" alone says the engine ran; the rest says what it
+    //    weighed, which is the difference between an animation and a report.
+    foreach (var (steps, considered, rejected, want) in new (int, int?, int, string)[]
+    {
+        (7, 17, 5, "7 steps · 17 considered, 5 rejected"),
+        (7, 17, 0, "7 steps · 17 considered"),
+        (7, null, 5, "7 steps · 5 rejected"),
+        (7, null, 0, "7 steps"),
+    })
+    {
+        var got = GoalAgent.PlannerVerdict(steps, considered, rejected);
+        if (got != want) failures.Add($"planner verdict: expected \"{want}\", got \"{got}\"");
+    }
+
+    foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
+    Console.WriteLine("gate 23 (thinking steps: whole, and v6-compatible): " + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
+    return failures.Count == 0 ? 0 : 1;
+}
+
 /// <summary>
 /// v7-M2 GATE: the day tick TELLS the family everything and ASKS about one thing.
 ///
