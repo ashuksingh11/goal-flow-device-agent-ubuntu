@@ -37,7 +37,7 @@ public sealed class GroceryCostObserver : IDomainObserver
 
     public string Domain => "grocery_cost";
 
-    public string Hint => "keeping the kitchen stocked while minimising the grocery bill — stock levels, expiry, offers and prices against a budget";
+    public string Hint => "keeping the kitchen stocked while minimising the GROCERY bill — stock levels, expiry, offers and prices. Household shopping only; it is not general personal finance";
 
     public async Task<JsonObject> CaptureAsync(CancellationToken ct = default)
     {

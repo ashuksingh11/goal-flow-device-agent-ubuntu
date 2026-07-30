@@ -39,7 +39,7 @@ public sealed class MealPlanObserver : IDomainObserver
 
     public string Domain => "meal_plan";
 
-    public string Hint => "planning the week's dinners — healthy eating, using up what is in the fridge";
+    public string Hint => "planning the week's dinners at home — using up what is in the fridge, household dietary rules, the family's activity";
 
     public async Task<JsonObject> CaptureAsync(CancellationToken ct = default)
         => new()

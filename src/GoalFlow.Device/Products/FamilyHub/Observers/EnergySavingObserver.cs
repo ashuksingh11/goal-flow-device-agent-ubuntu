@@ -38,7 +38,7 @@ public sealed class EnergySavingObserver : IDomainObserver
 
     public string Domain => "energy_saving";
 
-    public string Hint => "cutting the electricity bill without hurting comfort — shifting appliances to off-peak, eco cycles, and standby waste";
+    public string Hint => "cutting the electricity bill of THIS home without hurting comfort — shifting appliance runs to off-peak, eco cycles, standby waste";
 
     public async Task<JsonObject> CaptureAsync(CancellationToken ct = default)
     {

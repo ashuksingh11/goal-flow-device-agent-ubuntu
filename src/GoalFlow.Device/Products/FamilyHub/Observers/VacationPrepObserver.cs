@@ -36,7 +36,7 @@ public sealed class VacationPrepObserver : IDomainObserver
 
     public string Domain => "vacation_prep";
 
-    public string Hint => "getting the home ready while the family is away — locking up, arming security, saving energy, pausing deliveries";
+    public string Hint => "getting the HOME ready while the family is away — using up perishables, pausing deliveries, appliances to eco, locking up and arming security, and having the house ready to come back to. It is about the house, not the trip: booking travel, hotels, flights or an itinerary is NOT this";
 
     public async Task<JsonObject> CaptureAsync(CancellationToken ct = default)
     {

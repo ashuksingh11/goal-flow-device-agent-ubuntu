@@ -23,6 +23,13 @@ OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-dump-mode}" \
 # Catches: a changed tier, a dropped/renamed function, a lost [Description],
 # a reordered module, an accidental rename of a steering module (that last one
 # is a CONTRACT change, reserved for M6).
+#
+# IT ALSO CATCHES A CHANGED DOMAIN HINT, which is the one people are surprised by. A hint
+# reads like a comment and is not: the cloud's interpreter CLASSIFIES against it, so
+# editing one changes which goals route where — and, since the hints are the whole of what
+# the interpreter believes is possible, whether a goal is refused at all. v7 rewrote all
+# six to draw their edges ("getting the HOUSE ready … booking the TRIP is NOT this"),
+# which is why the demo's out-of-domain closer lands.
 # NB: every gate uses `if ! diff` and NOT `diff && echo PASS` — under `set -e`, a
 # command in a && list does NOT trigger errexit unless it is the LAST one, so
 # `diff && echo PASS` silently swallows the failure and the gate can never fail.
