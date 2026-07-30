@@ -268,6 +268,9 @@ public sealed class GoalAgent
             var goalId = goal.Dispatch.GoalId;
             using var scope = _trace.BeginGoalScope(goalId, goal.Dispatch.CorrelationId);
             using var policy = _safety.EnterGoal(goalId);
+            // v6-M3: the world tick fans out over every active goal, and this is where
+            // one goal learns another spent the shared budget yesterday.
+            await _safety.ReResolveAsync(goalId, ct);
 
             // A monitored goal finishes when its window closes — the calendar decides, not the agent.
             if (await CompleteIfWindowPassedAsync(goal, ct))
@@ -787,7 +790,11 @@ public sealed class GoalAgent
         // Arm THIS goal's hard constraints and enter its scope: every kernel call
         // made inside this async flow is checked against them and nothing else.
         // (Previously one shared field — a second goal overwrote it mid-plan.)
-        using var policy = _safety.BeginGoal(dispatch.GoalId, dispatch.Constraints.Hard);
+        // v6-M3: resolve before arming — the product narrows the dispatched ceiling
+        // against the world (the household envelope minus what is already spent), so
+        // this goal plans against what is actually left, not what the account allows
+        // in the abstract.
+        using var policy = await _safety.BeginGoalAsync(dispatch.GoalId, dispatch.Constraints.Hard, ct);
         _safety.SetTrace(_trace);
 
         _logger.LogInformation("plan_start domain={Domain} model_clock={Today}", dispatch.Domain, _clock.Today);
@@ -1501,6 +1508,11 @@ public sealed class GoalAgent
         // an appliance). It used to arm nothing at all and silently inherited
         // whatever policy the last plan run left behind.
         using var policy = _safety.EnterGoal(approval.GoalId);
+        // v6-M3: re-resolve first. This plan may have been made days ago, and another
+        // goal's approved order has spent part of the shared envelope since — so the
+        // ceiling this actuation is checked against is recomputed here, not inherited
+        // from planning time. This is the last gate before money actually moves.
+        await _safety.ReResolveAsync(approval.GoalId, ct);
         _safety.SetTrace(_trace);
         await _trace.PhaseAsync("executing");
         // The human answered, so every task waiting on that answer moves. This is
@@ -1560,13 +1572,37 @@ public sealed class GoalAgent
             var args = ToKernelArguments(proposal.Args);
             _logger.LogInformation("execute_proposal {ProposalId} {Module}.{Function}", proposal.ProposalId, proposal.Module, proposal.Function);
             var invokeResult = await _kernel.InvokeAsync(function, args, ct);
+            var resultText = invokeResult.ToString();
+
+            // THE FILTER REFUSED IT. The plugin never ran — the gate did its job — but
+            // saying "executed" here would tell the user the action happened, with the
+            // refusal buried in a detail string nobody reads. Approving something the
+            // policy forbids has to come back as a block, and the approval must NOT be
+            // marked executed: unlike a deferred pre-check ("not yet"), re-applying it
+            // will never work, because nothing about the world is going to change the
+            // answer. This is where the v6 window constraints actually bite, since
+            // side-effecting tools are not exposed during planning.
+            if (SafetyFilter.IsRefusal(resultText))
+            {
+                _logger.LogWarning("proposal_blocked {ProposalId} {Module}.{Function}: {Detail}",
+                    proposal.ProposalId, proposal.Module, proposal.Function, resultText);
+                executed.Add(new ExecutedEffect
+                {
+                    ProposalId = proposal.ProposalId,
+                    Action = $"{proposal.Module}.{proposal.Function}",
+                    Result = ExecutionResults.BlockedSafety,
+                    Detail = resultText
+                });
+                continue;
+            }
+
             _approvals.MarkExecuted(proposal.ProposalId);
             executed.Add(new ExecutedEffect
             {
                 ProposalId = proposal.ProposalId,
                 Action = $"{proposal.Module}.{proposal.Function}",
-                Result = "executed",
-                Detail = invokeResult.ToString()
+                Result = ExecutionResults.Executed,
+                Detail = resultText
             });
         }
 
@@ -1605,6 +1641,9 @@ public sealed class GoalAgent
         // A control tick can re-plan a slice of this goal (trigger_event →
         // ProposeDailyAdaptationAsync), so enter its policy scope too.
         using var policy = _safety.EnterGoal(control.GoalId);
+        // v6-M3: the world moved (that is what a tick means), so recompute this goal's
+        // ceiling before adapting against it.
+        await _safety.ReResolveAsync(control.GoalId, ct);
         await _trace.PhaseAsync("monitoring");
 
         if (control.Command == ControlCommands.TriggerEvent)

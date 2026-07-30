@@ -62,6 +62,20 @@ public interface IDomainObserver
     IReadOnlyList<WorldChange> Observe(GoalRecord goal);
 
     /// <summary>
+    /// Same question, for observers that must READ the world to answer it.
+    ///
+    /// <para>
+    /// Most changes are already legible from the goal's snapshot plus the clock: a
+    /// pending update dated today has arrived. But some only exist as a difference
+    /// between then and now — v6-M3's case is another goal spending the shared budget,
+    /// which no future-dated record announces. Those observers override this; everyone
+    /// else inherits the synchronous answer and is unaffected.
+    /// </para>
+    /// </summary>
+    Task<IReadOnlyList<WorldChange>> ObserveAsync(GoalRecord goal, CancellationToken ct = default)
+        => Task.FromResult(Observe(goal));
+
+    /// <summary>
     /// The presenter's fire-able event catalog for this domain, or null if it has
     /// none. Advertised on plan_ready so the UI can offer the chips.
     /// </summary>

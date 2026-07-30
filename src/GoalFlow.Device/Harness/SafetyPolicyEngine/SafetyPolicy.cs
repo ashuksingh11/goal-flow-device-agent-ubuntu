@@ -155,6 +155,13 @@ public sealed class SafetyPolicy
                 Constraint = Required(node, "constraint", path),
                 Args = Strings(node, "args")
             },
+            "date_window_block" => new DateWindowBlockRule
+            {
+                Modules = modules,
+                Functions = functions,
+                Constraint = Required(node, "constraint", path),
+                Args = Strings(node, "args")
+            },
             _ => throw new InvalidOperationException(
                 $"{path}: unknown rule kind '{kind}'. The engine implements the kinds; a pack may only instantiate them.")
         };

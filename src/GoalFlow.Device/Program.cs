@@ -59,6 +59,12 @@ services.AddSingleton<IClock>(_ => options.Date is { } start
 services.AddFamilyHub(options.DataDir);
 
 // Harness components (generic — no product types).
+// ArmedPolicies is registered BEFORE the filter and depends on nothing: the filter
+// enforces the armed policy, capability plugins only read it (v6). Injecting the
+// filter itself into a plugin would close a cycle through CapabilityManager and
+// deadlock the container at startup — see ArmedPolicies.
+services.AddSingleton<ArmedPolicies>();
+services.AddSingleton<IActivePolicy>(sp => sp.GetRequiredService<ArmedPolicies>());
 services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
@@ -160,6 +166,36 @@ if (options.VerifySafetyRules)
 if (options.VerifyGrades)
 {
     Environment.ExitCode = ProgramHelpers.VerifyGrades(provider);
+    return;
+}
+
+// v6-M2 GATE: the cap the planner is told about IS the cap it will be enforced
+// against — one number, from the account, per goal.
+if (options.VerifyActivePolicy)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyActivePolicyAsync(
+        provider.GetRequiredService<ArmedPolicies>(),
+        provider.GetRequiredService<BudgetPlugin>(),
+        options.DataDir);
+    return;
+}
+
+// v6-M3 GATE: two goals share one wallet — approving one order narrows the other
+// goal's ceiling, and the other goal notices. MUTATES the world (it places an
+// order), so run it against a throwaway --data dir.
+if (options.VerifyEnvelope)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyEnvelopeAsync(provider, options.DataDir);
+    return;
+}
+
+// v6 GATE: the last gate before a real side effect must report a refusal AS a
+// refusal. Needs the agent (it drives the real approval path), so it sits after the
+// kernel is built. MUTATES the world (the allowed proposal really runs) — use a
+// throwaway --data dir.
+if (options.VerifyApprovalBlock)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyApprovalBlockAsync(provider, agent, tasks);
     return;
 }
 
@@ -361,6 +397,15 @@ internal sealed record CliOptions
     /// <summary>--verify-grades — assert the grade ratchet holds and AX is unproposable (M1 gate).</summary>
     public bool VerifyGrades { get; init; }
 
+    /// <summary>--verify-active-policy — assert the budget cap comes from the goal's armed policy, not device data (v6-M2 gate).</summary>
+    public bool VerifyActivePolicy { get; init; }
+
+    /// <summary>--verify-envelope — assert one goal's approved order narrows another's ceiling (v6-M3 gate).</summary>
+    public bool VerifyEnvelope { get; init; }
+
+    /// <summary>--verify-approval-block — assert a refused proposal is reported blocked, not executed (v6 gate).</summary>
+    public bool VerifyApprovalBlock { get; init; }
+
     /// <summary>--verify-task-lifecycle — assert the task DAG, legal moves and derived progress (M2 gate).</summary>
     public bool VerifyTaskLifecycle { get; init; }
 
@@ -418,6 +463,9 @@ internal sealed record CliOptions
                 "--verify-policy-isolation" => options with { VerifyPolicyIsolation = true },
                 "--verify-safety-rules" => options with { VerifySafetyRules = true },
                 "--verify-grades" => options with { VerifyGrades = true },
+                "--verify-active-policy" => options with { VerifyActivePolicy = true },
+                "--verify-envelope" => options with { VerifyEnvelope = true },
+                "--verify-approval-block" => options with { VerifyApprovalBlock = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
                 "--verify-suggestions" => options with { VerifySuggestions = true },
@@ -854,6 +902,18 @@ public static int VerifySafetyRules(SafetyFilter safety)
     var noPork = new JsonObject { ["dietary"] = new JsonArray("no_pork") };
     var budget = new JsonObject { ["budget_cap"] = 120.0 };
     var quiet = new JsonObject { ["quiet_hours"] = new JsonObject { ["start"] = "21:30", ["end"] = "07:00" } };
+    // v6: the two window kinds the cloud now resolves PER DOMAIN. An energy goal
+    // carries peak_hours; a vacation goal carries away_window; a dinner carries
+    // neither, which is why the "no peak_hours on this goal" rows below matter as
+    // much as the blocking ones — the scoping is half the design.
+    var peak = new JsonObject { ["peak_hours"] = new JsonObject { ["start"] = "17:00", ["end"] = "21:00" } };
+    // The away window BRACKETS TODAY, deliberately. With a window sitting in the
+    // future, the "a bare 22:00 is not a date" row would pass no matter how loose the
+    // date parsing was — today would fall outside the window and be allowed anyway.
+    // Straddling today is what makes that row test the trap it was written for.
+    var today = DateOnly.FromDateTime(DateTime.Today);
+    string Day(int offset) => today.AddDays(offset).ToString("yyyy-MM-dd");
+    var away = new JsonObject { ["away_window"] = new JsonObject { ["start"] = Day(-1), ["end"] = Day(6) } };
 
     (string Label, JsonObject Hard, string Module, string Function, KernelArguments Args, bool ShouldBlock)[] cases =
     [
@@ -879,6 +939,36 @@ public static int VerifySafetyRules(SafetyFilter safety)
         ("quiet_hours allows an 18:00 run",  quiet,          "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = "18:00" }, false),
         // Rule bindings come from policy.json: the cap is bound to ShoppingList only.
         ("budget rule is NOT bound to Reminders", budget,    "Reminders",    "Create", new KernelArguments { ["estimatedTotal"] = 130.0 }, false),
+
+        // v6 PEAK TARIFF — the same rule kind as quiet hours, a different window.
+        ("peak_hours blocks an 18:00 run",   peak,           "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = "18:00" }, true),
+        ("peak_hours allows a 23:00 run",    peak,           "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = "23:00" }, false),
+        // THE SCOPING: 18:00 is inside the peak window, but a guest dinner's dispatch
+        // does not carry peak_hours — so the same call that an energy goal must not
+        // make is ordinary here. A rule that fired on every goal would have taken the
+        // dinner demo down with it.
+        ("no peak_hours on this goal -> 18:00 allowed", quiet, "Appliance",  "RunProgram", new KernelArguments { ["atTime"] = "18:00" }, false),
+        ("peak rule is NOT bound to Notify", peak,           "Notify",       "Announce",   new KernelArguments { ["time"] = "18:00" }, false),
+
+        // v6 AWAY WINDOW — the house is empty from yesterday until today+6.
+        ("away blocks a mid-trip dishwasher run", away,      "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = $"{Day(2)}T09:00" }, true),
+        ("away blocks a mid-trip announcement",   away,      "Notify",       "Announce",   new KernelArguments { ["date"] = Day(2) }, true),
+        // Endpoints are EXCLUSIVE: the family is home part of both travel days, and
+        // "run the dishwasher before you leave" is the vacation plan's own best move.
+        // Blocking it would veto the plan the goal exists to produce.
+        ("away ALLOWS the departure-day run",     away,      "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = $"{Day(-1)}T07:00" }, false),
+        ("away ALLOWS the return-day run",        away,      "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = $"{Day(6)}T20:00" }, false),
+        ("away ALLOWS a run before the trip",     away,      "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = $"{Day(-3)}T20:00" }, false),
+        // The parse trap, and the reason the window above straddles today:
+        // DateTime.TryParse resolves a bare "22:00" to TODAY — which IS inside this
+        // window — so a loose parse would block a quiet-hours-shaped argument that
+        // names no date at all. Only an ISO date prefix counts as a date.
+        ("away ignores a time-only argument",     away,      "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = "22:00" }, false),
+        // The same trap, long enough to get past a length check: DateTime.TryParse
+        // turns "22:00:00.000" into TODAY at 22:00 and blocks a call that names no
+        // date. This is the row that fails if the ISO-prefix parse is ever relaxed.
+        ("away ignores a long time-only argument", away,     "Appliance",    "RunProgram", new KernelArguments { ["atTime"] = "22:00:00.000" }, false),
+        ("away rule is NOT bound to ShoppingList", away,     "ShoppingList", "Add",        new KernelArguments { ["date"] = Day(2) }, false),
     ];
 
     var failures = 0;
@@ -901,6 +991,387 @@ public static int VerifySafetyRules(SafetyFilter safety)
     return failures == 0 ? 0 : 1;
 
     static KernelArguments Items(params string[] items) => new() { ["items"] = items };
+}
+
+/// <summary>
+/// v6 GATE: approving something the policy forbids comes back as BLOCKED, not executed.
+///
+/// <para>
+/// THE BUG THIS PINS. Side-effecting tools are not exposed during planning, so the
+/// window constraints (quiet hours, peak tariff, the away window) can only bite at
+/// ACTUATION — the moment a person taps Approve. That path invoked the function, took
+/// whatever came back, called MarkExecuted and reported <c>"executed"</c>. The filter
+/// worked perfectly: the plugin never ran, and the refusal sat in a detail string
+/// nobody reads. The user was told the action had happened.
+/// </para>
+///
+/// <para>
+/// A gate that blocks correctly and then reports success is worse than one that fails
+/// loudly, so this drives the REAL <see cref="GoalAgent.ApplyApprovalAsync"/> — same
+/// kernel, same filter, same ledger — and checks both halves: the refused proposal is
+/// reported blocked and is NOT marked executed (re-applying it can never work), while
+/// an allowed one alongside it still goes through.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider, GoalAgent agent, TaskManager tasks)
+{
+    var failures = new List<string>();
+    var approvals = provider.GetRequiredService<ApprovalCoordinator>();
+    var safety = provider.GetRequiredService<SafetyFilter>();
+    var clock = provider.GetRequiredService<IClock>();
+
+    // The family is away from tomorrow for a week.
+    var away = new JsonObject
+    {
+        ["start"] = clock.Today.AddDays(1).ToString("yyyy-MM-dd"),
+        ["end"] = clock.Today.AddDays(8).ToString("yyyy-MM-dd"),
+    };
+    var hard = new JsonObject { ["away_window"] = away };
+    var dispatch = ProgramHelpers.BuildLocalDispatch("verify the approval gate", "vacation_prep", clock) with
+    {
+        GoalId = "approval-block",
+        Constraints = new TaskConstraints { Hard = hard },
+    };
+    tasks.CreateGoal(dispatch, [new TaskRecord { TaskId = "t1", GoalId = dispatch.GoalId, Title = "prep" }], new JsonObject());
+
+    // p1 runs the dishwasher mid-trip (forbidden); p2 adds to the shopping list (fine).
+    approvals.Register(new ProposalItem
+    {
+        ProposalId = "p1",
+        Action = "run the dishwasher while away",
+        Module = "Appliance",
+        Function = "RunProgram",
+        Args = new JsonObject
+        {
+            ["appliance"] = "dishwasher",
+            ["program"] = "eco",
+            ["atTime"] = $"{clock.Today.AddDays(4):yyyy-MM-dd}T09:00",
+        },
+        Tier = ApprovalTiers.Firm,
+        Reason = "cleanup",
+    });
+    approvals.Register(new ProposalItem
+    {
+        ProposalId = "p2",
+        Action = "add tinned goods to the list",
+        Module = "ShoppingList",
+        Function = "Add",
+        Args = new JsonObject { ["items"] = new JsonArray("rice"), ["reason"] = "restock" },
+        Tier = ApprovalTiers.Light,
+        Reason = "restock",
+    });
+
+    using (safety.BeginGoal(dispatch.GoalId, hard))
+    {
+        var status = await agent.ApplyApprovalAsync(new Approval
+        {
+            GoalId = dispatch.GoalId,
+            CorrelationId = "c-approval-block",
+            Payload = new ApprovalPayload
+            {
+                Decisions =
+                [
+                    new ApprovalDecision { ProposalId = "p1", Approved = true },
+                    new ApprovalDecision { ProposalId = "p2", Approved = true },
+                ],
+            },
+        });
+
+        var executed = status.Payload?.Executed ?? [];
+        var blocked = executed.FirstOrDefault(e => e.ProposalId == "p1");
+        if (blocked is null)
+        {
+            failures.Add("the refused proposal must still be REPORTED — silence loses it entirely");
+        }
+        else
+        {
+            if (blocked.Result != ExecutionResults.BlockedSafety)
+            {
+                failures.Add($"a proposal the filter refused must come back blocked, got '{blocked.Result}' — the user is being told it happened");
+            }
+
+            if (blocked.Detail?.Contains("away_window", StringComparison.Ordinal) != true)
+            {
+                failures.Add($"the block must say WHICH constraint refused it, got '{blocked.Detail}'");
+            }
+        }
+
+        if (approvals.ExecutedIds().Contains("p1"))
+        {
+            failures.Add("a blocked proposal must NOT be marked executed — unlike a deferred pre-check, re-applying it can never work");
+        }
+
+        var allowed = executed.FirstOrDefault(e => e.ProposalId == "p2");
+        if (allowed?.Result != ExecutionResults.Executed)
+        {
+            failures.Add($"one blocked proposal must not take the others down with it, got '{allowed?.Result}'");
+        }
+
+        if (!approvals.ExecutedIds().Contains("p2"))
+        {
+            failures.Add("the allowed proposal must be marked executed");
+        }
+    }
+
+    foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
+    Console.Out.WriteLine(failures.Count == 0
+        ? "gate 21 (approval: a refusal is reported as a refusal): PASS"
+        : $"gate 21 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// v6-M3 GATE: two goals share one wallet.
+///
+/// <para>
+/// Per-goal caps cannot see each other: a $200 party and a $120 grocery week each fit
+/// their own ceiling and together blow a $600 month. The envelope is the shared pool,
+/// and the proof it works is not that a number appears on a contract — it is that
+/// APPROVING ONE GOAL'S ORDER NARROWS ANOTHER GOAL'S CEILING, and that the second goal
+/// then notices.
+/// </para>
+///
+/// <para>
+/// Deterministic and offline: it drives the real resolver, the real armed-policy store
+/// and the real observer against a throwaway copy of the world, with no LLM anywhere.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyEnvelopeAsync(IServiceProvider provider, string dataDir)
+{
+    var failures = new List<string>();
+    var resolver = provider.GetRequiredService<IPolicyResolver>();
+    var armed = provider.GetRequiredService<ArmedPolicies>();
+    var safety = provider.GetRequiredService<SafetyFilter>();
+    var store = provider.GetRequiredService<IProductApiAdapter>();
+    var shopping = provider.GetRequiredService<ShoppingListPlugin>();
+    var observer = provider.GetServices<IDomainObserver>().First(o => o.Domain == "grocery_cost");
+
+    JsonObject Envelope(double cap) => new() { ["cap"] = cap, ["period"] = "monthly" };
+    JsonObject Hard(double goalCap) => new() { ["budget_cap"] = goalCap, ["budget_envelope"] = Envelope(600.0) };
+    async Task<double> SpentAsync() => (await store.LoadResolvedAsync("budget"))["spent"]?.GetValue<double>() ?? 0;
+
+    var spent0 = await SpentAsync();
+
+    // 1. The envelope narrows a cap that exceeds what is left, and leaves alone one
+    //    that does not. A trip's $1500 cannot mean $1500 when the month holds $600.
+    var trip = await resolver.ResolveAsync(Hard(1500.0));
+    if (trip["budget_cap"]?.GetValue<double>() is not { } tripCap || Math.Abs(tripCap - (600.0 - spent0)) > 0.001)
+    {
+        failures.Add($"a $1500 trip cap must narrow to the ${600.0 - spent0:0.00} left in the envelope, got {trip["budget_cap"]}");
+    }
+
+    var week = await resolver.ResolveAsync(Hard(120.0));
+    if (week["budget_cap"]?.GetValue<double>() is not 120.0)
+    {
+        failures.Add($"a $120 week fits inside the remaining envelope and must be left alone, got {week["budget_cap"]}");
+    }
+
+    // 2. No envelope on the dispatch: nothing to narrow against, cap untouched.
+    var noEnvelope = await resolver.ResolveAsync(new JsonObject { ["budget_cap"] = 120.0 });
+    if (noEnvelope["budget_cap"]?.GetValue<double>() is not 120.0)
+    {
+        failures.Add($"without an envelope the dispatched cap stands, got {noEnvelope["budget_cap"]}");
+    }
+
+    // 3. THE CROSS-GOAL EFFECT. Arm a grocery goal, let a DIFFERENT goal place an
+    //    order, then re-resolve: the grocery goal's ceiling must have moved, without
+    //    anyone touching the grocery goal.
+    using (armed.Arm("goal-grocery", Hard(120.0), await resolver.ResolveAsync(Hard(120.0))))
+    {
+        var before = armed.ActiveHard()?["budget_cap"]?.GetValue<double>() ?? -1;
+
+        using (armed.Arm("goal-party", Hard(200.0)))
+        {
+            await shopping.PlaceOrder(500.0);
+        }
+
+        var spentAfter = await SpentAsync();
+        if (Math.Abs(spentAfter - (spent0 + 500.0)) > 0.001)
+        {
+            failures.Add($"an approved order must consume the household budget: spent {spent0} -> {spentAfter}, expected {spent0 + 500.0}");
+        }
+
+        await safety.ReResolveAsync("goal-grocery");
+        var after = armed.ActiveHard()?["budget_cap"]?.GetValue<double>() ?? -1;
+        var expected = Math.Max(0, Math.Round(600.0 - spentAfter, 2));
+        if (Math.Abs(after - expected) > 0.001)
+        {
+            failures.Add($"the grocery goal's ceiling must fall to the ${expected:0.00} left after another goal spent, got {after}");
+        }
+
+        if (after >= before)
+        {
+            failures.Add($"another goal's approved order must SHRINK this goal's headroom: {before} -> {after}");
+        }
+
+        // Re-resolving twice must not move it again (narrowing is idempotent) …
+        await safety.ReResolveAsync("goal-grocery");
+        if (Math.Abs((armed.ActiveHard()?["budget_cap"]?.GetValue<double>() ?? -1) - after) > 0.001)
+        {
+            failures.Add("re-resolving twice moved the ceiling again");
+        }
+
+        // … and — the row that actually catches resolving from the wrong block — the
+        // ceiling must be able to CLIMB BACK. Narrowing is a min(), so re-narrowing an
+        // already-narrowed cap looks harmless; it only shows up when the envelope frees
+        // up (a refund, a new billing period) and a ceiling computed from the last
+        // effective value can never recover.
+        var refunded = await store.LoadResolvedAsync("budget");
+        refunded["spent"] = spent0;
+        await store.SaveAsync("budget", refunded);
+        await safety.ReResolveAsync("goal-grocery");
+        var recovered = armed.ActiveHard()?["budget_cap"]?.GetValue<double>() ?? -1;
+        if (Math.Abs(recovered - 120.0) > 0.001)
+        {
+            failures.Add($"once the envelope frees up the ceiling must return to the dispatched $120, got {recovered}");
+        }
+
+        // Put the spend back so the observer rows below see the squeezed world.
+        refunded["spent"] = spentAfter;
+        await store.SaveAsync("budget", refunded);
+
+        // 4. AND THE OTHER GOAL NOTICES. A ceiling that quietly shrinks is a plan that
+        //    fails at approval time; the point is that the goal re-plans first.
+        var goal = new GoalRecord
+        {
+            Dispatch = new Dispatch
+            {
+                GoalId = "goal-grocery",
+                CorrelationId = "c",
+                Domain = "grocery_cost",
+                Objective = "keep the kitchen stocked for less",
+                Constraints = new TaskConstraints { Hard = Hard(120.0) },
+                TimeWindow = new TimeWindow { Start = "2026-07-29", End = "2026-08-05" }
+            },
+            Tasks = [],
+            WorldSnapshot = new JsonObject { ["budget"] = new JsonObject { ["spent"] = spent0 } }
+        };
+
+        var changes = await observer.ObserveAsync(goal);
+        var squeeze = changes.FirstOrDefault(c => c.Kind == "budget.envelope_squeezed");
+        if (squeeze is null)
+        {
+            failures.Add("the grocery goal must notice that another goal spent the shared envelope");
+        }
+        else if (!squeeze.Material || string.IsNullOrWhiteSpace(squeeze.Steer))
+        {
+            failures.Add("the squeeze must be material and carry a steer, or nothing re-plans");
+        }
+
+        // 5. NOT NOISE. Before the envelope is squeezed past this goal's own cap,
+        //    another goal's spending is not this goal's problem — an agent that
+        //    interrupts a family over $2 of someone else's shopping gets switched off.
+        var quiet = new GoalRecord
+        {
+            Dispatch = goal.Dispatch,
+            Tasks = [],
+            WorldSnapshot = new JsonObject { ["budget"] = new JsonObject { ["spent"] = await SpentAsync() } }
+        };
+        if ((await observer.ObserveAsync(quiet)).Any(c => c.Kind == "budget.envelope_squeezed"))
+        {
+            failures.Add("no new spending since the plan means no squeeze to report");
+        }
+    }
+
+    foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
+    Console.Out.WriteLine(failures.Count == 0
+        ? "gate 20 (household envelope: two goals, one wallet): PASS"
+        : $"gate 20 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// v6-M2 GATE: the budget cap the planner is TOLD about is the goal's armed cap —
+/// the same number the SafetyFilter will enforce — and the device no longer keeps a
+/// copy of its own.
+///
+/// <para>
+/// The bug this guards is not a crash. Until v6, data/budget.json carried
+/// <c>cap: 120.0</c> beside the cloud's <c>constraints.hard.budget_cap</c>: one
+/// policy, two copies, hand-synced. The planner read the device's copy, the filter
+/// enforced the cloud's, and nothing compared them — so a party goal capped at $200
+/// by the account was planned against $120, and a trip capped at $1500 was planned
+/// against $120 as well. Every plan still came back. It was just planned against the
+/// wrong household.
+/// </para>
+///
+/// <para>
+/// Deterministic and offline: it arms policies directly and calls the plugin, no LLM
+/// and no kernel in the loop.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyActivePolicyAsync(ArmedPolicies armed, BudgetPlugin budget, string dataDir)
+{
+    var failures = new List<string>();
+
+    async Task<JsonObject> StatusAsync()
+        => JsonNode.Parse(await budget.GetBudgetStatus())?.AsObject() ?? new JsonObject();
+
+    // 1. The de-dup itself. A `cap` back in the world file is the regression: it
+    //    would read like the authority while enforcing nothing.
+    var budgetFile = Path.Combine(dataDir, "budget.json");
+    if (File.Exists(budgetFile)
+        && JsonNode.Parse(File.ReadAllText(budgetFile))?.AsObject() is { } world
+        && world["cap"] is not null)
+    {
+        failures.Add($"{budgetFile} carries its own 'cap' again — policy belongs to the account, not the device");
+    }
+
+    // 2. No goal scope: no cap. Reporting 0 would tell the planner it is already
+    //    over budget on a goal that simply has no ceiling.
+    var unscoped = await StatusAsync();
+    if (unscoped["cap"] is not null)
+    {
+        failures.Add($"outside a goal scope there is no cap to report, got {unscoped["cap"]}");
+    }
+
+    if (unscoped["spent"]?.GetValue<double>() is not > 0)
+    {
+        failures.Add("spent is device world state and must still be reported");
+    }
+
+    // 3. Inside a goal, the cap is that goal's armed cap — and headroom is measured
+    //    from it.
+    var spent = unscoped["spent"]!.GetValue<double>();
+    using (armed.Arm("goal-party", new JsonObject { ["budget_cap"] = 200.0 }))
+    {
+        var status = await StatusAsync();
+        if (status["cap"]?.GetValue<double>() is not 200.0)
+        {
+            failures.Add($"a party goal must be planned against its armed $200 cap, got {status["cap"]}");
+        }
+
+        if (status["remaining"]?.GetValue<double>() is not { } remaining || Math.Abs(remaining - (200.0 - spent)) > 0.001)
+        {
+            failures.Add($"remaining must be the armed cap minus what is spent, got {status["remaining"]}");
+        }
+    }
+
+    // 4. A DIFFERENT goal, a different cap — the number is per goal, not a global.
+    using (armed.Arm("goal-trip", new JsonObject { ["budget_cap"] = 1500.0 }))
+    {
+        var status = await StatusAsync();
+        if (status["cap"]?.GetValue<double>() is not 1500.0)
+        {
+            failures.Add($"a trip goal must be planned against its armed $1500 cap, got {status["cap"]}");
+        }
+    }
+
+    // 5. A goal with no cap at all (energy saving) reports none, rather than 0.
+    using (armed.Arm("goal-energy", new JsonObject { ["quiet_hours"] = new JsonObject { ["start"] = "21:30", ["end"] = "07:00" } }))
+    {
+        var status = await StatusAsync();
+        if (status["cap"] is not null)
+        {
+            failures.Add($"a goal with no budget_cap has no ceiling to report, got {status["cap"]}");
+        }
+    }
+
+    foreach (var failure in failures) Console.Error.WriteLine($"  FAIL {failure}");
+    Console.Out.WriteLine(failures.Count == 0
+        ? "gate 19 (active policy: one cap, from the account): PASS"
+        : $"gate 19 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
 }
 
 /// <summary>

@@ -96,6 +96,21 @@ public static class ExecutionResults
     /// v3-M3.
     /// </summary>
     public const string DeferredPrecheck = "deferred_precheck";
+
+    /// <summary>
+    /// It did NOT run: the safety filter refused it at actuation time. A pre-check
+    /// says "not yet"; this says "never, as asked" — the approval does NOT stand, and
+    /// re-applying it changes nothing.
+    ///
+    /// <para>
+    /// v6: before this existed, a refused proposal was reported as
+    /// <see cref="Executed"/> with the refusal buried in its detail string. The gate
+    /// itself worked — the plugin never ran — but the ledger marked it executed and
+    /// the user was told the action had happened. A safety filter that blocks
+    /// correctly and then reports success is worse than one that fails loudly.
+    /// </para>
+    /// </summary>
+    public const string BlockedSafety = "blocked_safety";
 }
 
 /// <summary>
