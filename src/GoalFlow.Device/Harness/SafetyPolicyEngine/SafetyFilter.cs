@@ -119,6 +119,31 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
         _armed.ReArm(goalId, await ResolveAsync(goalId, dispatched, ct));
     }
 
+    /// <summary>
+    /// Replaces an armed goal's DISPATCHED constraints with a new block from the account,
+    /// then re-resolves (v7).
+    ///
+    /// <para>
+    /// The only caller is the cross-goal path: another goal was approved, the account
+    /// re-resolved this one's constraints, and sent the result down. Everything else uses
+    /// <see cref="ReResolveAsync"/>, which recomputes what is enforced from an UNCHANGED
+    /// dispatched block. The split matters — re-resolving from a replaced block would let
+    /// the device's own narrowing accumulate, and replacing on a re-resolve would let the
+    /// device author policy. Neither is allowed, so they are two methods.
+    /// </para>
+    /// </summary>
+    public async Task ReDispatchAsync(string goalId, JsonObject hard, CancellationToken ct = default)
+    {
+        if (_armed.DispatchedFor(goalId) is null)
+        {
+            _logger.LogWarning("constraints_redispatch_skipped goal={GoalId} — no armed policy", goalId);
+            return;
+        }
+
+        _armed.ReDispatch(goalId, hard);
+        await ReResolveAsync(goalId, ct);
+    }
+
     private async Task<JsonObject> ResolveAsync(string goalId, JsonObject dispatched, CancellationToken ct)
     {
         if (_resolver is null)

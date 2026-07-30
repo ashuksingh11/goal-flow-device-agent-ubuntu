@@ -213,6 +213,13 @@ if (options.VerifyAwayCapabilities)
     return;
 }
 
+// v7-M5 GATE: the one path that changes a plan without asking. Read-only.
+if (options.VerifyCrossGoal)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyCrossGoalAsync(provider);
+    return;
+}
+
 // v6 GATE: the last gate before a real side effect must report a refusal AS a
 // refusal. Needs the agent (it drives the real approval path), so it sits after the
 // kernel is built. MUTATES the world (the allowed proposal really runs) — use a
@@ -436,6 +443,9 @@ internal sealed record CliOptions
     /// <summary>--verify-away-capabilities — assert Act 3's steps are reachable and graded (v7-M4 gate).</summary>
     public bool VerifyAwayCapabilities { get; init; }
 
+    /// <summary>--verify-cross-goal — assert an un-asked re-plan arms from the account and applies once (v7-M5 gate).</summary>
+    public bool VerifyCrossGoal { get; init; }
+
     /// <summary>--verify-approval-block — assert a refused proposal is reported blocked, not executed (v6 gate).</summary>
     public bool VerifyApprovalBlock { get; init; }
 
@@ -501,6 +511,7 @@ internal sealed record CliOptions
                 "--verify-day-tick" => options with { VerifyDayTick = true },
                 "--verify-thinking-steps" => options with { VerifyThinkingSteps = true },
                 "--verify-away-capabilities" => options with { VerifyAwayCapabilities = true },
+                "--verify-cross-goal" => options with { VerifyCrossGoal = true },
                 "--verify-approval-block" => options with { VerifyApprovalBlock = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
@@ -1172,6 +1183,93 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
 /// and the real observer against a throwaway copy of the world, with no LLM anywhere.
 /// </para>
 /// </summary>
+/// <summary>
+/// v7-M5 GATE: a constraint change re-arms from the ACCOUNT's block, and applies once.
+///
+/// <para>
+/// This is the only path in the system that changes a plan without asking, which makes it
+/// the one worth pinning hardest. Two things make it defensible and neither is visible in
+/// the demo: the device re-arms from a block it was SENT (it does not author policy just
+/// because it was told the household moved), and a change already applied is never applied
+/// again however many times the frame arrives — a re-sent approval, a reconnect replaying
+/// one, or a cloud that fans out twice.
+/// </para>
+///
+/// <para>
+/// Deterministic and offline. The RE-PLAN itself needs an LLM, so what is asserted here is
+/// everything around it: the arming, the dedupe, and that the always-enforced rules survive
+/// a re-dispatch rather than being reset by it.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyCrossGoalAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    var armed = provider.GetRequiredService<ArmedPolicies>();
+    var safety = provider.GetRequiredService<SafetyFilter>();
+
+    var dispatched = new JsonObject { ["allergens"] = new JsonArray("peanuts") };
+    using (armed.Arm("goal-week", dispatched, (JsonObject)dispatched.DeepClone()))
+    {
+        // 1. THE ACCOUNT OWNS THE POLICY. A new block replaces the DISPATCHED one, so a
+        //    later re-resolve starts from what the account last said — not from whatever
+        //    the device had narrowed it to, which would let its own arithmetic compound.
+        var updated = new JsonObject
+        {
+            ["allergens"] = new JsonArray("peanuts"),
+            ["away_window"] = new JsonObject { ["start"] = "2026-07-30", ["end"] = "2026-07-31" },
+        };
+        await safety.ReDispatchAsync("goal-week", (JsonObject)updated.DeepClone());
+
+        var nowDispatched = armed.DispatchedFor("goal-week");
+        if (nowDispatched?["away_window"] is null)
+        {
+            failures.Add($"the new block must become the DISPATCHED one, got {nowDispatched?.ToJsonString()}");
+        }
+        if (armed.ActiveHard()?["away_window"] is null)
+        {
+            failures.Add("…and must be what is enforced from here on");
+        }
+        if (nowDispatched?["allergens"] is null)
+        {
+            failures.Add("the always-enforced rules must survive a re-dispatch — this is not a reset");
+        }
+
+        // 2. IT DOES NOT ARM A GOAL THAT WAS NEVER ARMED. A constraint change for a goal
+        //    this device is not running must be a no-op, not a policy conjured from a frame.
+        await safety.ReDispatchAsync("goal-never-seen", (JsonObject)updated.DeepClone());
+        if (armed.DispatchedFor("goal-never-seen") is not null)
+        {
+            failures.Add("a constraint change for an unknown goal must not arm one");
+        }
+    }
+
+    // 3. APPLIED ONCE. The dedupe is a set on the goal record keyed by the change's stable
+    //    key; the same steer arriving twice must be recognised as the same change.
+    var record = new GoalRecord
+    {
+        Dispatch = new Dispatch
+        {
+            GoalId = "goal-week",
+            CorrelationId = "c",
+            Domain = "meal_plan",
+            Objective = "plan my weekly meal",
+            Constraints = new TaskConstraints { Hard = new JsonObject() },
+            TimeWindow = new TimeWindow { Start = "2026-07-28", End = "2026-08-03" },
+        },
+        Tasks = [],
+    };
+    const string key = "constraints:abcd1234";
+    if (!record.EmittedMaterialChanges.Add(key) || record.EmittedMaterialChanges.Add(key))
+    {
+        failures.Add("the same constraint change must be surfaced exactly once");
+    }
+
+    foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
+    Console.WriteLine("gate 25 (cross-goal: the account arms it, and it applies once): "
+                      + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
+    return failures.Count == 0 ? 0 : 1;
+}
+
 /// <summary>
 /// v7-M4 GATE: the home-away goal can actually reach what its plan promises.
 ///

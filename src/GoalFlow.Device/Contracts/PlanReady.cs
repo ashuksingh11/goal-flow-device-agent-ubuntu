@@ -118,6 +118,32 @@ public sealed record PlanItem
     public IReadOnlyList<string> Why { get; init; } = [];
 
     public IReadOnlyList<string> Tags { get; init; } = [];
+
+    /// <summary>
+    /// v7: <see cref="PlanItemStatuses.Planned"/> (or absent) or
+    /// <see cref="PlanItemStatuses.Skipped"/> — this day is deliberately empty.
+    ///
+    /// <para>
+    /// THE ALTERNATIVE WAS TO DELETE THE ROW, and that is worse. A patch that REMOVES the
+    /// two days a family is away leaves a plan that is simply shorter: nothing on screen
+    /// says why, nothing connects it to the goal that caused it, and the change reads as
+    /// data loss rather than a decision. A skipped row keeps the day visible, keeps its
+    /// date, and carries the reason.
+    /// </para>
+    /// </summary>
+    public string? Status { get; init; }
+
+    /// <summary>Why it is skipped, in the user's terms — "you're away · from Get my home ready".</summary>
+    public string? StatusReason { get; init; }
+}
+
+/// <summary>The <see cref="PlanItem.Status"/> values. Absent means planned.</summary>
+public static class PlanItemStatuses
+{
+    public const string Planned = "planned";
+
+    /// <summary>Deliberately empty — still rendered, styled down, with its reason.</summary>
+    public const string Skipped = "skipped";
 }
 
 /// <summary>

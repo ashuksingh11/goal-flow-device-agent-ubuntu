@@ -1244,7 +1244,7 @@ public sealed class GoalAgent
         plan — do not rewrite rows the change doesn't touch. Reply with a MINIMAL
         JSON patch and nothing else (no prose, no Markdown, no code fence):
         {
-          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "day": 1, "title": "...", "detail": "...", "why": ["short reason"] } ],
+          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "day": 1, "title": "...", "detail": "...", "why": ["short reason"], "status": "planned|skipped", "status_reason": "only when skipped" } ],
           "remove": ["<id to drop>"],
           "impact_delta": [ { "label": "waste", "value": "-2 items" } ],
           "rationale": "one sentence explaining the change"
@@ -1279,12 +1279,116 @@ public sealed class GoalAgent
         return proposal;
     }
 
-    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, GoalRecord active, WorldChange change, CancellationToken ct, string? eventId = null)
+    /// <summary>
+    /// v7 — ANOTHER GOAL CHANGED THIS ONE, and the user already said yes.
+    ///
+    /// <para>
+    /// The account re-resolved this goal's constraints because a DIFFERENT goal was
+    /// approved (the family is away Thursday and Friday, so a meal week has two days it
+    /// should not be planning dinners for). This is the only adaptation path that does not
+    /// open an approval, and the reason is not convenience: every other change in the
+    /// system is something the WORLD did, so a person decides what to do about it — this
+    /// one is something the person already decided, arriving at a goal that had not heard.
+    /// Asking again would be asking the same question twice.
+    /// </para>
+    ///
+    /// <para>
+    /// So the plan changes and the board SAYS so. The status carries the new plan, the
+    /// changed ids and a sentence in the user's terms; the card shows one line and the
+    /// detail page a dismissible notice. Informational, not an approval — there is
+    /// nothing left to decide.
+    /// </para>
+    /// </summary>
+    private async Task<(Status Status, Proposal? Adaptation)> ApplyConstraintChangeAsync(
+        Control control, string? correlationId, CancellationToken ct)
+    {
+        var active = _tasks.GetGoal(control.GoalId);
+        if (active is null)
+        {
+            return (BuildMonitoringStatus(control.GoalId, correlationId, false,
+                "constraints changed, but no active goal is being monitored", null), null);
+        }
+
+        // POLICY PUSHES DOWN, and this is still the account's block — the device re-arms
+        // from what it was sent and authors nothing.
+        if (control.Payload?.Hard is { } hard)
+        {
+            await _safety.ReDispatchAsync(control.GoalId, (JsonObject)hard.DeepClone(), ct);
+            _logger.LogInformation("constraints_redispatched goal={GoalId} keys={Keys}",
+                control.GoalId, string.Join(",", hard.Select(p => p.Key)));
+        }
+
+        var steer = control.Payload?.Steer;
+        if (string.IsNullOrWhiteSpace(steer))
+        {
+            return (BuildMonitoringStatus(control.GoalId, correlationId, false,
+                "constraints changed, but no steer was sent — leaving the plan alone", null), null);
+        }
+
+        var note = control.Payload?.Note ?? "Your household rules changed and this plan was updated.";
+        var change = new WorldChange
+        {
+            // Stable and value-derived, so the same change arriving twice (a re-sent
+            // approval, a reconnect) adapts once.
+            Key = $"constraints:{Hash(steer)}",
+            Kind = "constraints.changed",
+            Description = note,
+            AffectedPlanItems = [],
+            // Deliberately NO TargetItemId: this is not a one-day swap, and leaving it
+            // null is what lets NormalizeAdaptationPatch keep every row the model returns
+            // instead of collapsing the patch to a single upsert.
+            RecommendedAction = "update the plan",
+            Steer = steer,
+            Material = true
+        };
+
+        if (!active.EmittedMaterialChanges.Add(change.Key))
+        {
+            return (BuildMonitoringStatus(control.GoalId, correlationId, false,
+                "this constraint change was already applied", null), null);
+        }
+
+        await _trace.ThinkingStepAsync("Another goal changed this one", note);
+        await _trace.PhaseAsync("adapting");
+        var proposal = await AdaptWithHarnessAsync(control.GoalId, change, () =>
+            ProposeDailyAdaptationAsync(control.GoalId, active, change, ct,
+                instruction: BuildConstraintAdaptInstruction(active.Plan, change),
+                requiresApproval: false), ct);
+
+        if (proposal is null)
+        {
+            return (BuildMonitoringStatus(control.GoalId, correlationId, false,
+                $"{note} Nothing in the plan needed to move.", null), null);
+        }
+
+        // APPLIED HERE, not on an approval that is never coming.
+        var applied = ApplyPendingPatch(proposal.Payload.ProposalId);
+        var status = BuildMonitoringStatus(control.GoalId, correlationId, true, note, null);
+        return (status with
+        {
+            TaskStatus = TaskStatuses.Monitoring,
+            Payload = status.Payload with
+            {
+                UpdatedPlan = applied.Updated,
+                ChangedIds = applied.ChangedIds,
+                ImpactDelta = applied.ImpactDelta,
+                // The board reads this to decide the card's line. Informational: the
+                // plan HAS changed, and there is nothing to approve.
+                PlanChangedNote = note
+            }
+        }, null);
+    }
+
+    /// <summary>A short stable key from a string — dedupe only, never security.</summary>
+    private static string Hash(string text)
+        => Convert.ToHexString(System.Security.Cryptography.MD5.HashData(System.Text.Encoding.UTF8.GetBytes(text)))[..8];
+
+    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, GoalRecord active, WorldChange change, CancellationToken ct, string? eventId = null, string? instruction = null, bool requiresApproval = true)
     {
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
         var history = new ChatHistory();
         history.AddSystemMessage(AdaptSystemPrompt);
-        history.AddUserMessage(BuildAdaptInstruction(active.Plan, change));
+        history.AddUserMessage(instruction ?? BuildAdaptInstruction(active.Plan, change));
 
         PlanPatch? patch = null;
         string? lastError = null;
@@ -1332,7 +1436,7 @@ public sealed class GoalAgent
             Function = PlanPatchFunction,
             Tier = ApprovalTiers.Adapt,
             Reason = patch.Rationale,
-            RequiresApproval = true
+            RequiresApproval = requiresApproval
         });
         _pendingPatches[proposalId] = (goalId, patch);
         _logger.LogInformation("adaptation_proposed {ProposalId} kind={Kind} upsert={Upsert} remove={Remove}", proposalId, change.Kind, patch.Upsert.Count, patch.Remove.Count);
@@ -1349,10 +1453,46 @@ public sealed class GoalAgent
                 Trigger = change.Description,
                 EventId = eventId,
                 Tier = ApprovalTiers.Adapt,
-                RequiresApproval = true,
+                RequiresApproval = requiresApproval,
                 Patch = patch
             }
         };
+    }
+
+    /// <summary>
+    /// The multi-row instruction for a constraint change (v7).
+    ///
+    /// <para>
+    /// Separate from <see cref="BuildAdaptInstruction"/> because that one says "change
+    /// ONLY the Day N dinner" — correct for a world event that lands on one day, and
+    /// exactly wrong here: an away window covers several days and usually moves the ones
+    /// around it too. It also has to teach the model the `status` field, which is the
+    /// point of the whole exercise: a skipped day is KEPT, greyed, with its reason, so
+    /// the change is visible instead of the plan just being shorter.
+    /// </para>
+    /// </summary>
+    private static string BuildConstraintAdaptInstruction(IReadOnlyList<PlanItem> plan, WorldChange change)
+    {
+        var planLines = string.Join("\n", plan.Select(p =>
+            $"- Day {p.Day} | {p.Id} | {p.When ?? "-"} | {p.Title}"));
+        return $"""
+            CURRENT PLAN (day | id | date | title):
+            {planLines}
+
+            WHAT CHANGED: {change.Description}
+            HOW TO ADAPT: {change.Steer}
+
+            Rules for this patch:
+            - Upsert EVERY row that needs to change, reusing each row's exact existing id.
+              This is not a single-day swap.
+            - To mark a day as deliberately empty, upsert it with "status":"skipped", a
+              short "title" saying so, and a "status_reason" in the user's own terms.
+              NEVER put it in "remove": a deleted row makes the plan silently shorter and
+              nothing on screen says why.
+            - Keep each row's original date in "when". You are re-planning days, not moving them.
+            - Leave every unaffected row completely alone — do not restate it.
+            - Give each changed row a "why" that names the real cause.
+            """;
     }
 
     private static string BuildAdaptInstruction(IReadOnlyList<PlanItem> plan, WorldChange change)
@@ -1764,6 +1904,13 @@ public sealed class GoalAgent
         // ceiling before adapting against it.
         await _safety.ReResolveAsync(control.GoalId, ct);
         await _trace.PhaseAsync("monitoring");
+
+        // v7 — THE CROSS-GOAL PATH. Another goal changed the household, the user already
+        // approved that change, and this goal has not heard about it yet.
+        if (control.Command == ControlCommands.ConstraintsChanged)
+        {
+            return await ApplyConstraintChangeAsync(control, correlationId, ct);
+        }
 
         if (control.Command == ControlCommands.TriggerEvent)
         {
