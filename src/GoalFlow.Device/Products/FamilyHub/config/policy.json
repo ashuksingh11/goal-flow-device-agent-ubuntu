@@ -44,7 +44,17 @@
       }
     },
     {
-      "$comment": "The budget guardrail: only the call that actually spends money.",
+      "$comment": [
+        "The budget guardrail: only the call that actually spends money.",
+        "",
+        "DORMANT SINCE v7, ON PURPOSE. The household store no longer holds a budget_cap",
+        "entry, so no dispatch carries the key and this rule never fires in the demo. It",
+        "stays because a rule reads constraints.hard and does nothing when its key is",
+        "absent — there is no cost to keeping it — and because deleting it would leave",
+        "numeric_cap, one of the engine's five rule KINDS, with no instance anywhere and",
+        "therefore no coverage in gate 6. Seed a budget_cap and this works again",
+        "unchanged."
+      ],
       "kind": "numeric_cap",
       "modules": ["ShoppingList"],
       "functions": ["PlaceOrder"],
@@ -52,7 +62,13 @@
       "args": ["estimatedTotal", "estimated_total"]
     },
     {
-      "$comment": "Quiet hours: things that make noise in the house.",
+      "$comment": [
+        "Quiet hours: things that make noise in the house.",
+        "Dormant since v7 for the same reason as the cap above — no quiet_hours entry in",
+        "the store. time_window_block still has a live instance (peak tariff, below), so",
+        "this one is redundancy rather than sole coverage; it is kept for symmetry with",
+        "the cap and because quiet hours are the first thing anyone re-seeds."
+      ],
       "kind": "time_window_block",
       "modules": ["Appliance", "Notify"],
       "constraint": "quiet_hours",
