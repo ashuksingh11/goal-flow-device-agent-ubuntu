@@ -47,6 +47,10 @@ public sealed class VacationPrepObserver : IDomainObserver
             ["vacation"] = vacation,
             ["security"] = await _store.LoadResolvedAsync("security", ct),
             ["appliances"] = await _store.LoadResolvedAsync("appliances", ct),
+            // v7: what is still due to arrive at an empty house. Part of this goal's
+            // slice for the same reason security is — it is a thing the trip has to
+            // settle before it can claim the house is ready.
+            ["deliveries"] = await _store.LoadResolvedAsync("deliveries", ct),
             ["calendar"] = await _store.LoadResolvedAsync("calendar", ct)
         };
     }

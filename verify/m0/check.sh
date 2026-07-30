@@ -33,7 +33,7 @@ if ! diff -u verify/m0/capabilities.golden.json <(head -1 /tmp/m0-dump.txt); the
 fi
 echo "gate 1 (capabilities frame): PASS"
 
-# GATE 2 — the grounding tool set is byte-identical, SAME ORDER, exactly 20.
+# GATE 2 — the grounding tool set is byte-identical, SAME ORDER, exactly 21.
 # Order matters: this list IS the tools array handed to the model.
 # Was 13 through M6 (the read functions of the 7 implemented plugins). M7 grew it:
 #   +4  implemented the FamilyProfiles and Budget stubs (GetProfiles, GetMember,
@@ -43,7 +43,10 @@ echo "gate 1 (capabilities frame): PASS"
 # they are proposable actions, not grounding tools. v7 added:
 #   +2  the Workout plugin's GetWeeklyRoutine and GetRecentActivity — the evidence
 #       behind the cloud's soft "workout-friendly" preference on meal goals
-# so 18 -> 20, both APPENDED. That matters and it is why the diff is worth reading
+# so 18 -> 20, both APPENDED. v7-M4 added one more:
+#   +1  Deliveries.ListDeliveries — Hold and Resume are side-effecting, so they are
+#       proposable actions rather than grounding tools (the same split as Notify)
+# so 20 -> 21. That matters and it is why the diff is worth reading
 # rather than regenerating: Workout belongs next to FamilyProfiles conceptually, and
 # putting it there would have shifted every tool after it. This list is the order the
 # model sees, so a reorder is a behaviour change dressed as tidying.
@@ -53,8 +56,8 @@ if ! diff -u verify/m0/grounding.golden.txt <(tail -n +2 /tmp/m0-dump.txt); then
   echo "gate 2 FAIL: the planner's tool set changed (content or ORDER)." >&2
   exit 1
 fi
-test "$(wc -l < verify/m0/grounding.golden.txt)" -eq 20
-echo "gate 2 (grounding set, 20 fns in order): PASS"
+test "$(wc -l < verify/m0/grounding.golden.txt)" -eq 21
+echo "gate 2 (grounding set, 21 fns in order): PASS"
 
 # GATE 3 — product-string debt inside Harness/ can only shrink.
 # The "Harness/ has zero product strings" invariant is FALSE on day one by

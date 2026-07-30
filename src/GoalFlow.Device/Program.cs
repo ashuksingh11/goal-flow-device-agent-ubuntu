@@ -205,6 +205,14 @@ if (options.VerifyThinkingSteps)
     return;
 }
 
+// v7-M4 GATE: the home-away goal can reach what its plan promises. MUTATES the world
+// (it really holds and resumes a delivery, and schedules a clean) — throwaway --data dir.
+if (options.VerifyAwayCapabilities)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyAwayCapabilitiesAsync(provider);
+    return;
+}
+
 // v6 GATE: the last gate before a real side effect must report a refusal AS a
 // refusal. Needs the agent (it drives the real approval path), so it sits after the
 // kernel is built. MUTATES the world (the allowed proposal really runs) — use a
@@ -425,6 +433,9 @@ internal sealed record CliOptions
     /// <summary>--verify-thinking-steps — assert a step is whole and narration is v6-identical (v7-M3 gate).</summary>
     public bool VerifyThinkingSteps { get; init; }
 
+    /// <summary>--verify-away-capabilities — assert Act 3's steps are reachable and graded (v7-M4 gate).</summary>
+    public bool VerifyAwayCapabilities { get; init; }
+
     /// <summary>--verify-approval-block — assert a refused proposal is reported blocked, not executed (v6 gate).</summary>
     public bool VerifyApprovalBlock { get; init; }
 
@@ -489,6 +500,7 @@ internal sealed record CliOptions
                 "--verify-envelope" => options with { VerifyEnvelope = true },
                 "--verify-day-tick" => options with { VerifyDayTick = true },
                 "--verify-thinking-steps" => options with { VerifyThinkingSteps = true },
+                "--verify-away-capabilities" => options with { VerifyAwayCapabilities = true },
                 "--verify-approval-block" => options with { VerifyApprovalBlock = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
@@ -1160,6 +1172,121 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
 /// and the real observer against a throwaway copy of the world, with no LLM anywhere.
 /// </para>
 /// </summary>
+/// <summary>
+/// v7-M4 GATE: the home-away goal can actually reach what its plan promises.
+///
+/// <para>
+/// A plan step is only real if a function exists behind it. Act 3 narrates pausing
+/// deliveries, handing the house to SmartThings, arming security and coming back to a
+/// clean house — so this pins that each of those is a callable thing with the right
+/// grade, not a sentence the planner was told to write.
+/// </para>
+///
+/// <para>
+/// The row that matters most is the REFUSAL. Holding a repeat prescription to tidy up
+/// the porch is the obvious failure of a goal told to "pause non-essential deliveries",
+/// and it is not caught by reading: it is caught by the function saying no. Deterministic
+/// code, same shape as the Safety engine, for the same reason.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyAwayCapabilitiesAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    var deliveries = provider.GetRequiredService<DeliveriesPlugin>();
+    var appliances = provider.GetRequiredService<ApplianceControlPlugin>();
+    var clock = provider.GetRequiredService<IClock>();
+    var until = clock.Today.AddDays(3).ToString("yyyy-MM-dd");
+
+    // 1. THE REFUSAL. An essential delivery cannot be held, however it is asked for.
+    try
+    {
+        await deliveries.Hold("repeat prescription", until);
+        failures.Add("holding an essential delivery (medication) must be refused, and was not");
+    }
+    catch (InvalidOperationException ex)
+    {
+        if (!ex.Message.Contains("essential", StringComparison.OrdinalIgnoreCase))
+        {
+            failures.Add($"the refusal must say WHY, got: {ex.Message}");
+        }
+    }
+
+    // 2. A non-essential one holds, and records what it was held until — the away window
+    //    is the whole point, so a hold with no end date is a subscription quietly killed.
+    var held = JsonNode.Parse(await deliveries.Hold("milk subscription", until))?.AsObject();
+    if (held?["status"]?.GetValue<string>() != "held" || held["until"]?.GetValue<string>() != until)
+    {
+        failures.Add($"a non-essential delivery must hold until a date, got {held?.ToJsonString()}");
+    }
+
+    // 3. …and comes back. Return readiness is not decoration: an unresumable hold means
+    //    the family is still without milk a week after they got home.
+    var resumed = JsonNode.Parse(await deliveries.Resume("milk subscription"))?.AsObject();
+    if (resumed?["status"]?.GetValue<string>() != "resumed")
+    {
+        failures.Add($"a held delivery must resume, got {resumed?.ToJsonString()}");
+    }
+    var after = JsonNode.Parse(await deliveries.ListDeliveries())?.AsArray()
+        .Select(n => n?.AsObject()).OfType<JsonObject>()
+        .FirstOrDefault(d => d["id"]?.GetValue<string>() == "del-milk");
+    if (after?["held"]?.GetValue<bool>() != false || after.ContainsKey("held_until"))
+    {
+        failures.Add($"resuming must clear both the flag and the date, got {after?.ToJsonString()}");
+    }
+
+    // 4. THE GRADES. Hold is A2 — an outward-facing commitment to a third party, not the
+    //    same kind of act as adding milk to a list — so it must land as its own approval
+    //    rather than riding the batch.
+    var registry = provider.GetRequiredService<CapabilityManager>();
+    var gradeKernel = Kernel.CreateBuilder().Build();
+    gradeKernel.Plugins.AddFromObject(deliveries, "Deliveries");
+    gradeKernel.Plugins.AddFromObject(provider.GetRequiredService<SecurityPlugin>(), "Security");
+    var catalog = gradeKernel.Plugins
+        .ToDictionary(p => p.Name, p => registry.DescribePlugin(p).Functions ?? []);
+
+    foreach (var (module, function, wantTier) in new[]
+    {
+        ("Deliveries", "Hold", ApprovalTiers.Firm),
+        ("Deliveries", "Resume", ApprovalTiers.Light),
+        ("Security", "ArmSecurity", ApprovalTiers.Light),
+    })
+    {
+        var fn = catalog.TryGetValue(module, out var fns)
+            ? fns.FirstOrDefault(f => f.Name == function)
+            : null;
+        if (fn is null) failures.Add($"{module}.{function} must exist — Act 3 plans a step onto it");
+        else if (fn.Tier != wantTier) failures.Add($"{module}.{function} must be tier {wantTier}, got {fn.Tier}");
+    }
+
+    // 5. THE ROBOT VACUUM EXISTS. ApplianceControlPlugin's own [Description] has
+    //    advertised a vacuum since v2 while the world held none — and the planner reads
+    //    that description, so an over-claim invites a step the device then cannot run.
+    var list = JsonNode.Parse(await appliances.ListAppliances())?.AsArray();
+    var rvc = list?.Select(n => n?.AsObject()).OfType<JsonObject>()
+        .FirstOrDefault(a => a["id"]?.GetValue<string>() == "rvc");
+    if (rvc is null)
+    {
+        failures.Add("the robot vacuum must exist — return readiness schedules a clean through Appliance.RunProgram");
+    }
+    else if (rvc["programs"]?.AsArray().Count is null or 0)
+    {
+        failures.Add("the vacuum needs programs, or Appliance.RunProgram refuses every clean it is asked for");
+    }
+    else
+    {
+        var program = rvc["programs"]!.AsArray()[0]!.GetValue<string>();
+        var run = JsonNode.Parse(await appliances.RunProgram("rvc", program, $"{until}T11:00"))?.AsObject();
+        if (run?["status"]?.GetValue<string>() != "scheduled")
+        {
+            failures.Add($"the vacuum must be schedulable through the EXISTING RunProgram, got {run?.ToJsonString()}");
+        }
+    }
+
+    foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
+    Console.WriteLine("gate 24 (away capabilities: reachable, graded, refusing): " + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
+    return failures.Count == 0 ? 0 : 1;
+}
+
 /// <summary>
 /// v7-M3 GATE: the run says what it DID, and a v6 client cannot tell the difference.
 ///

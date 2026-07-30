@@ -742,8 +742,22 @@ public sealed class GoalAgent
         "guest_dinner" =>
             "a menu that honors guest dietary constraints, plus a prep timeline whose plan item \"when\" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders. "
             + "Prefer concrete appliance proposals when the grounded appliances support them: Appliance.PreheatOven before an oven-warmed dish, Appliance.RunProgram for dishwasher cleanup before quiet_hours, and Appliance.Defrost only when a frozen item needs thawing.",
+        // v7: TWO phases, and the second one is the point. A checklist that ends at the
+        // front door has planned a departure, not a trip — the family comes back to a
+        // house that has been shut for two days, a fridge that was deliberately emptied,
+        // and every subscription still paused. Return readiness is what makes this a goal
+        // with an end rather than a list with a deadline.
         "vacation_prep" =>
-            "a pre-departure checklist, NOT meals: finish or freeze the perishables that would spoil while the house is empty, clear the shopping list of standing orders, set appliances to eco or off, run the dishwasher before leaving, then lock up and arm security for the away period. Security.LockAllDoors and Security.ArmSecurity belong here.",
+            "TWO phases, in order. "
+            + "BEFORE LEAVING: finish or freeze the perishables that would spoil while the house is empty, "
+            + "hold the non-essential standing deliveries for the away window (Deliveries.Hold — never the essential ones), "
+            + "hand the house to the SmartThings away routine by setting appliances to eco or off, "
+            + "run the dishwasher before leaving, then lock up and arm security "
+            + "(Security.LockAllDoors and Security.ArmSecurity belong here). "
+            + "RETURN READINESS, dated on or after the return: resume the held deliveries (Deliveries.Resume), "
+            + "run the robot vacuum so the house is clean to come back to (Appliance.RunProgram on \"rvc\"), "
+            + "and plan the first meal back against a fridge that was deliberately emptied. "
+            + "NOT meals for the away days — nobody is home to eat them.",
         "birthday_party" =>
             "invitations and headcount, cake and supplies costed inside the budget cap, and a day-of schedule.",
         "grocery_cost" =>
@@ -779,7 +793,11 @@ public sealed class GoalAgent
           Security.ArmSecurity args {"mode":"away"}
           Notify.SendNotification args {"member":"Priya","message":"..."}
           Notify.Announce args {"message":"...","date":"YYYY-MM-DD","time":"HH:mm"}
+          Deliveries.Hold args {"delivery":"milk subscription","until":"YYYY-MM-DD"}
+          Deliveries.Resume args {"delivery":"milk subscription"}
         - Do not invent proposal functions such as Appliance.Preheat, Reminders.Add, or Reminder.Create.
+        - Deliveries.Hold REFUSES an essential delivery (medication and the like). Read the
+          `essential` flag from the grounded list and never propose holding one.
         - PLAN SHAPE for this goal's domain ({{dispatch.Domain}}) — {{PlanShapeRule(dispatch.Domain)}}
         - Do not propose ingredients or recipes that violate hard constraints.
         - Propose AT MOST 5 side-effecting actions. NEVER emit duplicate proposals. Consolidate a

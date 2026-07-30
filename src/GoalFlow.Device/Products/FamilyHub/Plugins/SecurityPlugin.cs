@@ -7,8 +7,9 @@ using Microsoft.SemanticKernel;
 namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
-/// CAPABILITY MODULE (home security): doors, cameras, alarm. SK plugin, name
-/// "Security". Backed by data/security.json through <see cref="IProductApiAdapter"/>.
+/// CAPABILITY MODULE (home security over SmartThings): doors, cameras, alarm. SK plugin,
+/// name "Security". Backed by data/security.json through <see cref="IProductApiAdapter"/>,
+/// and gated by the <c>smartthings_connected</c> precheck like every other actuator here.
 ///
 /// This is the vacation-prep centrepiece — "get the house ready, we're away" turns
 /// into lock every door and arm the cameras. Locking is A0/Auto (always safe, always
@@ -16,7 +17,7 @@ namespace GoalFlow.Device.Products.FamilyHub;
 /// camera/AI-vision prechecks so a goal can't claim the house is watched when the
 /// camera is dark.
 /// </summary>
-[Description("Home security: lock doors, arm cameras and the alarm, check the security posture.")]
+[Description("SmartThings home security: lock doors, arm the cameras and alarm, check the security posture.")]
 public sealed class SecurityPlugin
 {
     private readonly IProductApiAdapter _store;
@@ -24,7 +25,7 @@ public sealed class SecurityPlugin
     public SecurityPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
-    [Description("Returns the current security posture: which doors are locked, which cameras are armed, and the alarm state.")]
+    [Description("Returns the current SmartThings security posture: which doors are locked, which cameras are armed, and the alarm state.")]
     public async Task<string> GetSecurityStatus(CancellationToken ct = default)
     {
         var doc = await _store.LoadResolvedAsync("security", ct);
@@ -38,7 +39,7 @@ public sealed class SecurityPlugin
 
     [KernelFunction]
     [SideEffect(ApprovalTiers.Auto)]
-    [Description("Locks every exterior door. Safe and reversible — auto tier.")]
+    [Description("Locks every exterior door over SmartThings. Safe and reversible — auto tier.")]
     public async Task<string> LockAllDoors(CancellationToken ct = default)
     {
         var doc = await _store.LoadResolvedAsync("security", ct);
@@ -54,7 +55,7 @@ public sealed class SecurityPlugin
 
     [KernelFunction]
     [SideEffect(ApprovalTiers.Light)]
-    [Description("Arms the alarm and cameras in the given mode (e.g. \"away\"). Requires the cameras to be operational.")]
+    [Description("Arms the SmartThings alarm and cameras in the given mode (e.g. \"away\") — this is the away routine's security step. Requires the cameras to be operational.")]
     public async Task<string> ArmSecurity(
         [Description("Alarm mode, e.g. \"away\" or \"night\".")] string mode,
         CancellationToken ct = default)
