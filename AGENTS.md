@@ -126,6 +126,12 @@ wired separately in each host.
     goal from a block the ACCOUNT re-resolved (`SafetyFilter.ReDispatchAsync`, distinct
     from `ReResolveAsync`) and applies the re-plan WITHOUT an approval — the only path
     that does. Gates 25 (device) and 17 (cloud, `verify_crossgoal.py`).
+  - **...and the days it empties stay empty.** A row with `status: "skipped"` is immune to
+    world events: `MealPlanObserver` demotes a change aimed at one to informational (still
+    told, never re-planned) and `GoalAgent.DropSkippedRows` drops any patch row whose
+    incumbent is skipped — except from `constraints.changed`, the path that writes them.
+    Gate 26. Found in the field, not by a gate: the tick after the cross-goal moment used
+    to cook dinner on a day nobody was home.
   - `TaskManager/` — THE GOAL LEDGER (v3-M2). `TaskManager` + `GoalRecord` +
     `TaskRecord` + `TaskState`: the task DAG, a validated lifecycle (illegal moves
     are refused, not applied), retries, and **derived** progress — which is what
@@ -183,7 +189,7 @@ the global Advance-day world tick, guest prep-timeline + appliance gating, and c
 enforcement resolved per goal, including the household envelope across goals and the
 date-window block for an empty house.
 
-Verify with `./verify/v7-m5/check.sh` — it chains gates 1–25 and needs no API key.
+Verify with `./verify/v7-m6/check.sh` — it chains gates 1–26 and needs no API key.
 
 ## Conventions & gotchas
 

@@ -220,6 +220,13 @@ if (options.VerifyCrossGoal)
     return;
 }
 
+// v7 GATE: ...and the tick that comes after it must not undo it. Read-only.
+if (options.VerifyAwayImmune)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyAwayImmuneAsync(provider);
+    return;
+}
+
 // v6 GATE: the last gate before a real side effect must report a refusal AS a
 // refusal. Needs the agent (it drives the real approval path), so it sits after the
 // kernel is built. MUTATES the world (the allowed proposal really runs) — use a
@@ -440,6 +447,9 @@ internal sealed record CliOptions
     /// <summary>--verify-thinking-steps — assert a step is whole and narration is v6-identical (v7-M3 gate).</summary>
     public bool VerifyThinkingSteps { get; init; }
 
+    /// <summary>--verify-away-immune — assert a world event cannot re-plan a day marked away (v7 gate).</summary>
+    public bool VerifyAwayImmune { get; init; }
+
     /// <summary>--verify-away-capabilities — assert Act 3's steps are reachable and graded (v7-M4 gate).</summary>
     public bool VerifyAwayCapabilities { get; init; }
 
@@ -512,6 +522,7 @@ internal sealed record CliOptions
                 "--verify-thinking-steps" => options with { VerifyThinkingSteps = true },
                 "--verify-away-capabilities" => options with { VerifyAwayCapabilities = true },
                 "--verify-cross-goal" => options with { VerifyCrossGoal = true },
+                "--verify-away-immune" => options with { VerifyAwayImmune = true },
                 "--verify-approval-block" => options with { VerifyApprovalBlock = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
@@ -1656,6 +1667,122 @@ public static async Task<int> VerifyDayTickAsync(IServiceProvider provider)
 
     foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
     Console.WriteLine("gate 22 (day tick: two changes, one approval): " + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
+    return failures.Count == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// --verify-away-immune (v7 gate 26) — A DAY THE HOUSEHOLD EMPTIED STAYS EMPTY.
+///
+/// <para>
+/// The bug this exists for: the family approved "we're away Sunday and Monday", the meal
+/// week marked both days skipped, and the next Advance day fired "the paneer spoiled"
+/// against Sunday — whose steer says "change tonight's dinner" — so the model cooked
+/// dinner on a day nobody is home. The cross-goal moment is the demo's headline, and the
+/// very next tick quietly undid half of it.
+/// </para>
+///
+/// <para>
+/// Two independent layers, because one is a judgement and the other is a guarantee: the
+/// observer stops RAISING the change as material (so no LLM call, no approval), and
+/// <c>DropSkippedRows</c> stops any patch from LANDING on a skipped row whatever raised
+/// it. The gate asserts both, plus the thing that makes it humane — the change is still
+/// TOLD. A family that is away still wants to know their fridge lost something.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyAwayImmuneAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    var observer = provider.GetServices<IDomainObserver>().First(o => o.Domain == "meal_plan");
+    var clock = provider.GetRequiredService<IClock>();
+
+    // A week whose Day 3 is away — exactly the shape the cross-goal moment leaves behind.
+    // day2-shortage in the feed targets Day 3, so this is the collision, not a contrivance.
+    PlanItem[] Week() => Enumerable.Range(1, 7)
+        .Select(day => new PlanItem
+        {
+            Id = $"d{day}",
+            Day = day,
+            Title = day == 3 ? "Away — no meal planned" : $"Dinner {day}",
+            Status = day == 3 ? PlanItemStatuses.Skipped : PlanItemStatuses.Planned,
+            StatusReason = day == 3 ? "you're away · from Vacation Home Prep" : null
+        })
+        .ToArray();
+
+    var goal = new GoalRecord
+    {
+        Dispatch = new Dispatch
+        {
+            GoalId = "goal-week",
+            CorrelationId = "c",
+            Domain = "meal_plan",
+            Objective = "plan my weekly meal",
+            Constraints = new TaskConstraints { Hard = new JsonObject() },
+            TimeWindow = new TimeWindow
+            {
+                Start = clock.Today.ToString("yyyy-MM-dd"),
+                End = clock.Today.AddDays(6).ToString("yyyy-MM-dd")
+            }
+        },
+        Tasks = [],
+        Plan = Week(),
+        WorldSnapshot = await observer.CaptureAsync()
+    };
+
+    // Advance INTO day 3 — two presses of Advance day, which is where the demo is when
+    // the trip starts.
+    if (clock is SimulatedClock sim) { sim.AdvanceDay(); sim.AdvanceDay(); }
+
+    var changes = await observer.ObserveAsync(goal);
+    var shortage = changes.FirstOrDefault(c => c.Kind == "inventory.shortage");
+    if (shortage is null)
+    {
+        failures.Add("the day-3 shortage must still be OBSERVED — the fix is to stop it re-planning, not to hide it");
+    }
+    else
+    {
+        if (shortage.Material)
+        {
+            failures.Add("a change aimed at an away day must not be material — there is no dinner that day to change");
+        }
+        if (!shortage.Description.Contains("away", StringComparison.OrdinalIgnoreCase))
+        {
+            failures.Add($"the day summary has to say WHY nothing changed, got: {shortage.Description}");
+        }
+    }
+
+    // The other half: whatever raises a change, a patch may not land on a skipped row.
+    // Asserted directly rather than through an LLM, because a guarantee that only holds
+    // when the model cooperates is not a guarantee.
+    var worldChange = new WorldChange
+    {
+        Key = "k", Kind = "inventory.shortage", Description = "d",
+        AffectedPlanItems = ["d3"], Material = true
+    };
+    var attempted = new PlanItem[]
+    {
+        new() { Id = "d3", Day = 3, Title = "Paneer-free Rajma" },
+        new() { Id = "d5", Day = 5, Title = "Something else" }
+    };
+    var kept = GoalAgent.DropSkippedRows(Week(), worldChange, attempted);
+    if (kept.Any(r => r.Id == "d3"))
+    {
+        failures.Add("a patch upsert aimed at a skipped row must be dropped, whatever produced it");
+    }
+    if (!kept.Any(r => r.Id == "d5"))
+    {
+        failures.Add("dropping the away row must not drop the rest of the patch with it");
+    }
+
+    // ...EXCEPT the change that writes them. If a constraint change could not touch a
+    // skipped row, a cancelled trip could never give the family their week back.
+    var constraintChange = worldChange with { Kind = "constraints.changed" };
+    if (GoalAgent.DropSkippedRows(Week(), constraintChange, attempted).Count != 2)
+    {
+        failures.Add("a constraints.changed patch MAY write skipped rows — it is the path that sets and clears them");
+    }
+
+    foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
+    Console.WriteLine("gate 26 (an away day stays away): " + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
     return failures.Count == 0 ? 0 : 1;
 }
 

@@ -1407,6 +1407,20 @@ public sealed class GoalAgent
             if (TryParsePlanPatch(raw, out var parsedPatch, out var error) && (parsedPatch.Upsert.Count > 0 || parsedPatch.Remove.Count > 0))
             {
                 patch = NormalizeAdaptationPatch(active.Plan, change, parsedPatch);
+                // Normalising can empty a patch that arrived non-empty — every row the
+                // model wanted to change turned out to be a day the household already
+                // emptied (DropSkippedRows). Nothing to propose, and raising an approval
+                // for a no-op would be the plan asking permission to stay the same.
+                if (patch.Upsert.Count == 0 && patch.Remove.Count == 0)
+                {
+                    _logger.LogInformation(
+                        "adaptation_patch_empty_after_normalize kind={Kind} — every target row is skipped",
+                        change.Kind);
+                    await _trace.ThinkingStepAsync(
+                        "Nothing to change",
+                        "the day this affects is already empty — you're away");
+                    return null;
+                }
                 break;
             }
 
@@ -1520,8 +1534,51 @@ public sealed class GoalAgent
             """;
     }
 
+    /// <summary>
+    /// The kind of change that is ALLOWED to write a skipped row — because it is the
+    /// change that writes them. Everything else must leave them alone; see
+    /// <see cref="DropSkippedRows"/>.
+    /// </summary>
+    private const string ConstraintChangeKind = "constraints.changed";
+
+    /// <summary>
+    /// A row the household has already emptied is not available to be re-planned.
+    ///
+    /// <para>
+    /// v7 bug: the family approved "we're away Sunday and Monday", the meal week marked
+    /// both days <c>skipped</c> — and then the next day tick fired "the paneer spoiled"
+    /// against Sunday, whose steer says "change tonight's dinner", and the model duly
+    /// cooked dinner on a day nobody is home. The world event was real; the day was not
+    /// available. Materiality is decided per-observer, but the guarantee has to hold for
+    /// every path that can produce a patch, so it is enforced here — the one funnel every
+    /// adaptation passes through — and not only where the change is raised.
+    /// </para>
+    ///
+    /// <para>
+    /// The single exception is the constraint change itself: that is the path that SETS
+    /// skipped rows, and it is also the only path that may legitimately clear them (the
+    /// trip is called off, the window moves). Anything else touching one is a mistake.
+    /// </para>
+    /// </summary>
+    internal static IReadOnlyList<PlanItem> DropSkippedRows(
+        IReadOnlyList<PlanItem> plan, WorldChange change, IReadOnlyList<PlanItem> upsert)
+    {
+        if (string.Equals(change.Kind, ConstraintChangeKind, StringComparison.Ordinal))
+        {
+            return upsert;
+        }
+
+        return upsert.Where(row =>
+        {
+            var existing = plan.FirstOrDefault(item => string.Equals(item.Id, row.Id, StringComparison.Ordinal));
+            return existing?.Status != PlanItemStatuses.Skipped;
+        }).ToArray();
+    }
+
     private static PlanPatch NormalizeAdaptationPatch(IReadOnlyList<PlanItem> plan, WorldChange change, PlanPatch patch)
     {
+        patch = patch with { Upsert = DropSkippedRows(plan, change, patch.Upsert) };
+
         if (change.TargetItemId is null || patch.Upsert.Count == 0)
         {
             return patch with { Upsert = AssignPatchDays(plan, patch.Upsert) };
