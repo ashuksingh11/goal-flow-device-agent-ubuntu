@@ -42,8 +42,10 @@ public sealed class RecipePlugin
     /// </para>
     /// </summary>
     [KernelFunction]
-    [Description("Returns the ENTIRE recipe box (it is small — one call is enough; do not call repeatedly). " +
-                 "preferTags only re-orders the result and the reply reports which of your tags actually exist.")]
+    [Description("Returns the ENTIRE recipe box, each recipe COMPLETE — ingredients, tags, allergen 'contains' " +
+                 "and prep_minutes. One call is enough: do not call it again, and do NOT follow it with GetRecipe, " +
+                 "which can only repeat what you already have. preferTags only re-orders the result, and the reply " +
+                 "reports which of your tags actually exist.")]
     public async Task<string> FindRecipes(
         [Description("Tags to prefer. The reply lists the box's real tag vocabulary under 'available_tags'; anything else is reported back as unmatched.")] string[]? preferTags = null,
         [Description("Ingredients or allergen groups that must NOT appear, e.g. [\"peanut\",\"mushrooms\"].")] string[]? excludeIngredients = null,
@@ -89,8 +91,22 @@ public sealed class RecipePlugin
         return Json(result);
     }
 
+    /// <summary>
+    /// One recipe, for the caller who has not fetched the box.
+    ///
+    /// <para>
+    /// v7.2: the description now says outright that this is redundant after FindRecipes,
+    /// because a planner was calling it once per recipe — seven extra round-trips fetching
+    /// fields it was already holding. That is not a foolish reading of the old wording
+    /// ("returns one recipe in full") — it just never said the other tool had already done
+    /// this. A tool description is the only documentation the model gets, and one that
+    /// omits its relationship to the tool beside it will be used as if it had none.
+    /// </para>
+    /// </summary>
     [KernelFunction]
-    [Description("Returns one recipe in full: ingredients, allergen 'contains' list, tags, prep minutes.")]
+    [Description("Returns ONE recipe in full: ingredients, allergen 'contains' list, tags, prep minutes. " +
+                 "Use this only if you have NOT called FindRecipes — that returns every recipe with these " +
+                 "same fields already, so calling this afterwards just re-fetches what you have.")]
     public async Task<string> GetRecipe(
         [Description("Recipe name or id, e.g. \"spinach dal rice bowl\" or \"rcp-001\".")] string nameOrId,
         CancellationToken ct = default)

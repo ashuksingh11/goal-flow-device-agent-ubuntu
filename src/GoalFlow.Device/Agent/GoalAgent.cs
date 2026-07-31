@@ -395,6 +395,63 @@ public sealed class GoalAgent
     private const int MaxComposeAttempts = 3;
 
     /// <summary>
+    /// COMPLETION-TOKEN CEILINGS, and why they are this size.
+    ///
+    /// <para>
+    /// These caps cover REASONING PLUS OUTPUT, and on a reasoning model the reasoning is by
+    /// far the larger half — measured on `openai/gpt-oss-120b`, roughly 5-9k characters of
+    /// reasoning behind 1-2k characters of plan. They were originally sized as if the number
+    /// bought output, which is how compose ended up asking for a seven-day plan inside 6000
+    /// tokens and getting back nothing at all: `Completion tokens: 6000` exactly, twice in a
+    /// row, finish_reason=length, empty content. The user's error — "Planner did not return
+    /// any content for the JSON plan" — is a starved budget wearing the mask of a modelling
+    /// failure, and no amount of retrying fixes it because every retry has the same ceiling
+    /// AND a longer prompt. With headroom, the same call lands at 5809 tokens and returns a
+    /// plan.
+    /// </para>
+    ///
+    /// <para>
+    /// ONLY COMPOSE WAS RAISED. The same reasoning does NOT justify raising every ceiling —
+    /// see <see cref="GroundingMaxTokens"/>, where trying it made things markedly worse.
+    /// Compose is different because it was demonstrably FAILING at its old limit; a limit
+    /// that is merely being reached is not the same as one that is too low.
+    /// </para>
+    ///
+    /// <para>
+    /// They are ceilings, not reservations: a call that finishes in 2k tokens is billed for
+    /// 2k. The cost of raising them is only paid by the calls that would otherwise have
+    /// failed and been retried at full price anyway.
+    /// </para>
+    /// </summary>
+    private const int ComposeMaxTokens = 16000;
+
+    /// <summary>
+    /// Grounding keeps its ORIGINAL, much smaller ceiling — measured, after raising it was
+    /// tried and was worse.
+    ///
+    /// <para>
+    /// Grounding hits this cap exactly on every run, which looks like damage: the summary is
+    /// cut off mid-thought. Raising it to 6000 to "fix" that took the phase from 77s to 253s
+    /// and hit the new cap too, because the model simply expands its reasoning to fill
+    /// whatever budget it is given. The plan was no better. So the cap is not a truncation
+    /// to be repaired, it is a BRAKE — the only thing bounding how long a reasoning model
+    /// will deliberate over a fridge — and compose does fine on the summary it yields.
+    /// </para>
+    ///
+    /// <para>
+    /// Which is why this constant is not simply "the same number as before": the number is
+    /// unchanged and the reason for it is now written down, so the next person to notice the
+    /// cap being hit does not repeat the experiment.
+    /// </para>
+    /// </summary>
+    private const int GroundingMaxTokens = 2500;
+
+    /// <summary>The daily adaptation's original ceiling, kept: it is a small patch, it has
+    /// never been observed to run out, and the grounding experiment above is the argument
+    /// against raising a limit that is not failing.</summary>
+    private const int AdaptMaxTokens = 2000;
+
+    /// <summary>
     /// How long ONE provider call may take before it is treated as a hang.
     ///
     /// <para>
@@ -615,7 +672,7 @@ public sealed class GoalAgent
             {
                 try
                 {
-                    content = await GetComposeContentAsync(chat, history, ct);
+                    content = (await GetComposeContentAsync(chat, history, ComposeSiteDecompose, ct)).Raw;
                     break;
                 }
                 catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
@@ -979,7 +1036,7 @@ public sealed class GoalAgent
                 AllowParallelCalls = true
             }),
             Temperature = 0.2,
-            MaxTokens = 2500
+            MaxTokens = GroundingMaxTokens
         };
 
         var toolsBefore = _trace.ToolCallCount;
@@ -1204,10 +1261,10 @@ public sealed class GoalAgent
                 history.AddUserMessage(BuildPlanningRetryInstruction(lastError ?? "Planner did not return a valid JSON object."));
             }
 
-            string raw;
+            ComposeContent composed;
             try
             {
-                raw = await GetComposeContentAsync(chat, history, ct);
+                composed = await GetComposeContentAsync(chat, history, ComposeSiteCompose, ct);
             }
             catch (Exception ex) when (IsTransientProviderError(ex, ct))
             {
@@ -1224,6 +1281,7 @@ public sealed class GoalAgent
                 continue;
             }
 
+            var raw = composed.Raw;
             if (!string.IsNullOrWhiteSpace(raw))
             {
                 // Raw plan JSON must NOT hit the thinking wire channel (ugly if
@@ -1235,6 +1293,14 @@ public sealed class GoalAgent
             if (TryParseModelPlan(raw, out var modelPlan, out var error))
             {
                 return modelPlan;
+            }
+
+            // JSON mode that returns UNPARSEABLE content has failed just as surely as JSON
+            // mode that returns nothing — the measured symptom was a lone `{`. Counting only
+            // the empty case would leave the truncating model paying the toll forever.
+            if (composed.UsedResponseFormat)
+            {
+                await DisableJsonModeAsync(ComposeSiteCompose, "returned content that would not parse as JSON");
             }
 
             lastError = error;
@@ -1249,12 +1315,83 @@ public sealed class GoalAgent
         throw new JsonException(failure);
     }
 
-    private async Task<string> GetComposeContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
+    /// <summary>The two call sites that ask for a JSON object, tracked separately — see _jsonMode.</summary>
+    private const string ComposeSiteDecompose = "decompose";
+    private const string ComposeSiteCompose = "compose";
+
+    /// <summary>What one compose call produced, and whether json_object was used to get it.</summary>
+    private readonly record struct ComposeContent(string Raw, bool UsedResponseFormat);
+
+    /// <summary>
+    /// Does this model/provider pair honour <c>response_format: json_object</c>? Learned,
+    /// not configured — see <see cref="GetComposeContentAsync"/>.
+    /// </summary>
+    private enum JsonModeHealth { Untried = 0, Works = 1, Broken = 2 }
+
+    /// <summary>
+    /// Per-PROCESS, PER-CALL-SITE memory of the answer. Planning is serialized by
+    /// <c>_planLock</c>, so a plain dictionary is enough; it is deliberately not persisted,
+    /// because the operator can change OPENROUTER_MODEL between runs and a stale verdict
+    /// would outlive the model it was about.
+    ///
+    /// <para>
+    /// PER-SITE, and the measurement is why. Decompose and compose issue the same KIND of
+    /// call and get different answers: decompose's history is short and json_object works,
+    /// compose's carries the whole grounding tool loop and it does not. A single verdict
+    /// shared between them would let compose's failure switch off a mode decompose was using
+    /// happily — a fix that quietly degrades the call that was never broken.
+    /// </para>
+    /// </summary>
+    private readonly Dictionary<string, JsonModeHealth> _jsonMode = new(StringComparer.Ordinal);
+
+    private JsonModeHealth JsonModeFor(string site)
+        => _jsonMode.TryGetValue(site, out var health) ? health : JsonModeHealth.Untried;
+
+    /// <summary>
+    /// The compose call, and the one place that decides whether to ask for JSON mode.
+    ///
+    /// <para>
+    /// THE COST THIS REMOVES. `openai/gpt-oss-120b` through OpenRouter answers THIS compose
+    /// request, carrying <c>response_format: json_object</c>, with EMPTY content — a measured
+    /// run spent 188 completion tokens producing nothing at all — or occasionally with a
+    /// truncated object (`{`). Either way the fallback below re-composes with a strict prompt
+    /// and no response_format, and THAT call returns the plan. The old code paid the toll on
+    /// every plan, forever: a wasted round-trip of ~20s and its tokens, plus a
+    /// `planner_notice` in the user's transcript describing a failure that had become routine.
+    /// </para>
+    ///
+    /// <para>
+    /// AND IT IS NOT SIMPLY "THIS MODEL CANNOT DO JSON MODE" — measured, because the obvious
+    /// conclusion was wrong. The same model, same parameters, same task on a SHORT prompt
+    /// honours json_object four times out of four (finish=stop, ~1-2k chars of content). The
+    /// failure needs the compose history: two calls a few seconds apart, 5646 vs 5651 prompt
+    /// tokens, differing ONLY in response_format — 188 tokens and nothing, versus 3677 tokens
+    /// and a plan. What compose carries that the probe does not is the whole grounding
+    /// auto-invoke loop, tool calls and tool results included. Do not "fix" this by observing
+    /// that the model handles json_object fine in isolation. It does. It does not handle it
+    /// here.
+    /// </para>
+    ///
+    /// <para>
+    /// That is exactly why the verdict is learned FROM THE REAL CALL rather than configured:
+    /// the only measurement that predicts this one is this one. The first compose of the
+    /// process still tries JSON mode — it genuinely helps where it works, and hard-coding it
+    /// off would punish models that honour it — but one that fails is not asked again, and
+    /// every later plan goes straight to the strict path.
+    /// </para>
+    /// </summary>
+    private async Task<ComposeContent> GetComposeContentAsync(
+        IChatCompletionService chat, ChatHistory history, string site, CancellationToken ct)
     {
+        if (JsonModeFor(site) == JsonModeHealth.Broken)
+        {
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
+        }
+
         var jsonSettings = new OpenAIPromptExecutionSettings
         {
             Temperature = 0.1,
-            MaxTokens = 6000,
+            MaxTokens = ComposeMaxTokens,
             ResponseFormat = "json_object"
         };
 
@@ -1265,21 +1402,37 @@ public sealed class GoalAgent
             var content = response.Content ?? "";
             if (!string.IsNullOrWhiteSpace(content))
             {
-                return content;
+                _jsonMode[site] = JsonModeHealth.Works;
+                return new ComposeContent(content, true);
             }
 
-            var note = "planner_notice: provider returned empty content with JSON response_format; retrying compose with strict JSON prompt only.";
-            _logger.LogWarning("{Note}", note);
-            await _trace.ThinkingAsync(note);
-            return await GetStrictComposeContentAsync(chat, history, ct);
+            await DisableJsonModeAsync(site, "returned empty content");
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
         }
         catch (Exception ex) when (LooksLikeResponseFormatRejection(ex))
         {
-            var note = $"planner_notice: provider rejected JSON response_format; retrying compose with strict JSON prompt only. Error: {ex.Message}";
-            _logger.LogWarning(ex, "{Note}", note);
-            await _trace.ThinkingAsync(note);
-            return await GetStrictComposeContentAsync(chat, history, ct);
+            await DisableJsonModeAsync(site, $"rejected the parameter ({ex.Message})");
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
         }
+    }
+
+    /// <summary>
+    /// Record that JSON mode does not work here, and say so ONCE.
+    ///
+    /// Once, because the note is only news the first time: after that it describes a
+    /// decision already taken, and a transcript that repeats "retrying compose…" on every
+    /// plan teaches the reader to ignore planner notices — including the ones that matter.
+    /// </summary>
+    private async Task DisableJsonModeAsync(string site, string what)
+    {
+        if (JsonModeFor(site) == JsonModeHealth.Broken)
+        {
+            return;
+        }
+        _jsonMode[site] = JsonModeHealth.Broken;
+        var note = $"planner_notice: this model {what} for JSON response_format on the {site} call — using a strict JSON prompt instead, for this and every later plan.";
+        _logger.LogWarning("json_mode_disabled site={Site} reason={Reason}", site, what);
+        await _trace.ThinkingAsync(note);
     }
 
     private async Task<string> GetStrictComposeContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
@@ -1287,7 +1440,7 @@ public sealed class GoalAgent
         var strictSettings = new OpenAIPromptExecutionSettings
         {
             Temperature = 0.1,
-            MaxTokens = 6000
+            MaxTokens = ComposeMaxTokens
         };
         using var cts = Deadline(ct, _llmCallBudget);
         var response = await chat.GetChatMessageContentAsync(history, strictSettings, _kernel, cts.Token);
@@ -1687,7 +1840,7 @@ public sealed class GoalAgent
         var settings = new OpenAIPromptExecutionSettings
         {
             Temperature = 0.2,
-            MaxTokens = 2000,
+            MaxTokens = AdaptMaxTokens,
             ResponseFormat = "json_object"
         };
         for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
