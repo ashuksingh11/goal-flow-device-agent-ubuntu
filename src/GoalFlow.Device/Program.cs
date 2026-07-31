@@ -68,6 +68,7 @@ services.AddSingleton<IActivePolicy>(sp => sp.GetRequiredService<ArmedPolicies>(
 services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
+services.AddSingleton<RepeatReadFilter>();
 services.AddSingleton<MonitorAdapt>();
 services.AddSingleton<PrecheckEngine>();
 
@@ -121,6 +122,7 @@ var agent = new GoalAgent(
     trace,
     provider.GetRequiredService<Grounding>(),
     provider.GetRequiredService<SafetyFilter>(),
+    provider.GetRequiredService<RepeatReadFilter>(),
     provider.GetRequiredService<ApprovalCoordinator>(),
     provider.GetRequiredService<MonitorAdapt>(),
     provider.GetRequiredService<CapabilityManager>(),
@@ -254,9 +256,9 @@ if (options.VerifyPrechecks)
     return;
 }
 
-if (options.VerifySuggestions)
+if (options.VerifyRepeatReads)
 {
-    Environment.ExitCode = await ProgramHelpers.VerifySuggestionsAsync(provider);
+    Environment.ExitCode = await ProgramHelpers.VerifyRepeatReadsAsync(provider, loggerFactory);
     return;
 }
 
@@ -283,30 +285,6 @@ if (options.ConnectUrl is { } url)
     var connectLogger = loggerFactory.CreateLogger("Connect");
     await ws.ConnectAsync(capabilities);
 
-    // Proactive suggestions (v3-M8): scan local state and offer goals the family
-    // hasn't asked for. Emitted on connect (so the board shows them immediately) and
-    // after every control tick — advance_day / reset move the world, which can make
-    // new food expire or a restock no longer needed, so the list is recomputed rather
-    // than left stale.
-    var suggesters = provider.GetServices<ISuggester>().ToArray();
-    async Task EmitSuggestionsAsync()
-    {
-        try
-        {
-            var items = new List<SuggestionItem>();
-            foreach (var suggester in suggesters)
-            {
-                items.AddRange(await suggester.ScanAsync());
-            }
-            await ws.SendAsync(new SuggestionsMessage { Items = items });
-            connectLogger.LogInformation("suggestions emitted count={Count}", items.Count);
-        }
-        catch (Exception ex)
-        {
-            connectLogger.LogError(ex, "suggestion scan failed");
-        }
-    }
-    await EmitSuggestionsAsync();
     // Handle each frame on a BACKGROUND task so the receive loop keeps pumping —
     // planning takes 30-60s of LLM calls, and blocking the loop here means the
     // device can't answer WS pings, so the cloud's keepalive closes the socket
@@ -344,9 +322,6 @@ if (options.ConnectUrl is { } url)
                             await ws.SendAsync(status);
                             if (proposal is not null) await ws.SendAsync(proposal);
                         }
-                        // The world moved (advance_day / reset / set_date) — re-scan so a
-                        // suggestion that just came true or went stale is reflected.
-                        await EmitSuggestionsAsync();
                         break;
                 }
             }
@@ -465,11 +440,11 @@ internal sealed record CliOptions
     /// <summary>--verify-prechecks — assert the runtime gates pass, block and defer correctly (M3 gate).</summary>
     public bool VerifyPrechecks { get; init; }
 
-    /// <summary>--verify-suggestions — assert the proactive scan is deterministic and well-formed (M8 gate).</summary>
-    public bool VerifySuggestions { get; init; }
-
     /// <summary>--verify-trace-isolation — assert concurrent goals don't collide on goal_id/seq (M5 gate).</summary>
     public bool VerifyTraceIsolation { get; init; }
+
+    /// <summary>--verify-repeat-reads — no read is asked twice, and an unsatisfiable query says so (v7.1 gate 28).</summary>
+    public bool VerifyRepeatReads { get; init; }
 
     /// <summary>--verify-deadline — assert a stalled provider stream aborts rather than wedging a goal (M6 gate).</summary>
     public bool VerifyDeadline { get; init; }
@@ -526,8 +501,8 @@ internal sealed record CliOptions
                 "--verify-approval-block" => options with { VerifyApprovalBlock = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
-                "--verify-suggestions" => options with { VerifySuggestions = true },
                 "--verify-trace-isolation" => options with { VerifyTraceIsolation = true },
+                "--verify-repeat-reads" => options with { VerifyRepeatReads = true },
                 "--verify-deadline" => options with { VerifyDeadline = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
@@ -648,6 +623,117 @@ public static async Task<int> VerifyTraceIsolationAsync(ILoggerFactory loggerFac
 }
 
 /// <summary>
+/// v7.1 GATE 28: the same read is never asked twice, and a tool that cannot satisfy a
+/// query says so.
+///
+/// <para>
+/// WHAT THIS IS ABOUT. Grounding is one streaming call with auto-invoke, so every tool
+/// call inside it costs a round-trip to the model. A measured meal plan spent four and a
+/// half minutes calling <c>Recipes.FindRecipes</c> ten-plus times with arguments that
+/// differed only in the ORDER of the tag list — because the household prefers white meat,
+/// the box is entirely vegetarian, and the old filter answered a query it could not
+/// satisfy by returning everything in an unchanged order. Silence that looks like success
+/// is the worst thing a tool can hand an agent: its only recourse is to ask again.
+/// </para>
+///
+/// <para>
+/// NO LLM HERE. The filter is exercised through <c>kernel.InvokeAsync</c>, which runs the
+/// real invocation pipeline, so this gate tests the shipped path and not a mock of it.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyRepeatReadsAsync(IServiceProvider provider, ILoggerFactory loggerFactory)
+{
+    var failures = new List<string>();
+    void Check(bool ok, string what) { if (!ok) { failures.Add(what); Console.Error.WriteLine($"  FAIL {what}"); } }
+
+    // --- half one: FindRecipes reports what it could not match ---
+    var recipes = new RecipePlugin(provider.GetRequiredService<IProductApiAdapter>());
+
+    // `high_protein` is the exact word the planner reached for and the box does not use
+    // (its tag is `more_protein`); `soy_free` is simply invented. Both must come back named.
+    var hunted = await recipes.FindRecipes(["high_protein", "soy_free", "quick_prep"]);
+    var hdoc = System.Text.Json.Nodes.JsonNode.Parse(hunted)!.AsObject();
+    var unmatched = hdoc["unmatched_tags"]!.AsArray().Select(n => n!.GetValue<string>()).ToArray();
+    Check(unmatched.Contains("high_protein") && unmatched.Contains("soy_free"),
+        $"tags that exist in NO recipe are named back to the caller — got [{string.Join(",", unmatched)}]");
+    Check(hdoc["note"] is not null,
+        "an unsatisfiable query carries a note telling the caller not to search again — without it the model rephrases and loops");
+    Check(hdoc["available_tags"]!.AsArray().Count > 0,
+        "the reply publishes the box's real tag vocabulary, so the NEXT call can use words that exist");
+    Check(hdoc["recipes"]!.AsArray().Count > 0,
+        "an unmatched query still returns the box — the caller needs the facts, not only the refusal");
+
+    var real = await recipes.FindRecipes(["quick_prep"]);
+    var rdoc = System.Text.Json.Nodes.JsonNode.Parse(real)!.AsObject();
+    Check(rdoc["matched_tags"]!.AsArray().Count == 1 && rdoc["unmatched_tags"]!.AsArray().Count == 0,
+        "a tag that DOES exist is reported as matched, and raises no note");
+    Check(rdoc["note"] is null, "a satisfiable query is not lectured");
+
+    // v7.2 SEED: the household's preference must have something to prefer AND something to
+    // turn down. Through v7 every recipe was vegetarian, so `prefer_white_meat` could not
+    // move a single dinner and the considered/rejected line had nothing true to say.
+    var pref = await recipes.FindRecipes(["white_meat"]);
+    var pdoc = System.Text.Json.Nodes.JsonNode.Parse(pref)!.AsObject();
+    Check(pdoc["unmatched_tags"]!.AsArray().Count == 0,
+        "white_meat is a REAL tag now — the standing household preference can actually bite");
+    var box = pdoc["recipes"]!.AsArray().Select(n => n!.AsObject()).ToArray();
+    string[] TagsOf(System.Text.Json.Nodes.JsonObject r) =>
+        r["tags"]!.AsArray().Select(t => t!.GetValue<string>()).ToArray();
+    Check(box.Count(r => TagsOf(r).Contains("white_meat")) >= 3,
+        "the box carries white-meat dishes, so the preference has something to CHOOSE");
+    Check(box.Count(r => TagsOf(r).Contains("red_meat")) >= 2,
+        "...and red-meat dishes, so it has something to REJECT — a preference that only ever agrees is undemonstrable");
+    Check(TagsOf(box[0]).Contains("white_meat"),
+        "preferring white_meat sorts a white-meat dish to the front");
+    Check(box.All(r => !TagsOf(r).Contains("pork")) && box.All(r => !r["ingredients"]!.AsArray()
+            .Any(i => i!.GetValue<string>().Contains("pork", StringComparison.OrdinalIgnoreCase))),
+        "no pork in the seed — that 'no' belongs to the hard rule, and a hard rule must not need luck");
+
+    // --- half two: the repeat guard, through the real kernel pipeline ---
+    var filter = new RepeatReadFilter(loggerFactory.CreateLogger<RepeatReadFilter>());
+    filter.Reset();
+
+    var runs = 0;
+    var builder = Kernel.CreateBuilder();
+    builder.Services.AddSingleton<IFunctionInvocationFilter>(filter);
+    var kernel = builder.Build();
+    kernel.Plugins.AddFromFunctions("Probe", [
+        KernelFunctionFactory.CreateFromMethod(
+            (string tags) => { runs++; return $"{{\"asked\":\"{tags}\"}}"; },
+            functionName: "Read")
+    ]);
+
+    var args = new KernelArguments { ["tags"] = "[\"a\",\"b\"]" };
+    var first = (await kernel.InvokeAsync("Probe", "Read", args)).GetValue<string>() ?? "";
+    var again = (await kernel.InvokeAsync("Probe", "Read", args)).GetValue<string>() ?? "";
+    Check(runs == 1, $"an identical read runs the tool ONCE — it ran {runs} times");
+    Check(!first.Contains("repeat_of_previous_call"), "the first call is answered by the tool, untouched");
+    Check(again.Contains("repeat_of_previous_call") && again.Contains("\"asked\""),
+        "the repeat is answered from the memo AND still carries the data — a bare scolding would invite another call");
+
+    // The loop this gate exists for permuted the tag list, so order must not create a
+    // "new" question. This is the assertion that would have caught the real bug.
+    await kernel.InvokeAsync("Probe", "Read", new KernelArguments { ["tags"] = "[\"b\",\"a\"]" });
+    Check(runs == 1, $"the SAME tags in a different ORDER is the same question — the tool ran {runs} times");
+
+    // A genuinely different question must still get through, or the guard is a muzzle.
+    await kernel.InvokeAsync("Probe", "Read", new KernelArguments { ["tags"] = "[\"c\"]" });
+    Check(runs == 2, $"a different question still reaches the tool — ran {runs} times, expected 2");
+
+    Check(filter.SuppressedCount == 2, $"the filter counts what it suppressed — got {filter.SuppressedCount}");
+
+    // A new goal starts with no memory, or yesterday's world answers for today's.
+    filter.Reset();
+    await kernel.InvokeAsync("Probe", "Read", args);
+    Check(runs == 3, $"Reset() clears the memo for the next goal — ran {runs} times, expected 3");
+
+    Console.Out.WriteLine(failures.Count == 0
+        ? "gate 28 (no read asked twice; an unsatisfiable query says so): PASS"
+        : $"gate 28 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
+}
+
+/// <summary>
 /// M3 GATE: the Pre-check Engine — is the world ready?
 ///
 /// <para>
@@ -657,47 +743,6 @@ public static async Task<int> VerifyTraceIsolationAsync(ILoggerFactory loggerFac
 /// that does nothing does.
 /// </para>
 /// </summary>
-/// <summary>
-/// --verify-suggestions (M8 gate 18): the proactive scan is deterministic and
-/// well-formed. Runs the real ISuggester chain against the seed inventory and asserts
-/// the shape a demo depends on — the same suggestions every run, each acceptable into a
-/// goal. A scan is only useful if it's repeatable; an LLM here would make the board
-/// flicker between runs, which is why the suggester is a scan, and why this can gate it.
-/// </summary>
-public static async Task<int> VerifySuggestionsAsync(IServiceProvider provider)
-{
-    var failures = new List<string>();
-    void Check(bool ok, string what) { if (!ok) { failures.Add(what); Console.WriteLine($"  FAIL {what}"); } }
-
-    var suggesters = provider.GetServices<ISuggester>().ToArray();
-    Check(suggesters.Length > 0, "at least one suggester is registered");
-
-    var items = new List<SuggestionItem>();
-    foreach (var s in suggesters) items.AddRange(await s.ScanAsync());
-
-    // Determinism: two scans of unchanged state produce the identical list.
-    var again = new List<SuggestionItem>();
-    foreach (var s in suggesters) again.AddRange(await s.ScanAsync());
-    Check(items.Count == again.Count && items.Zip(again).All(p => p.First.Id == p.Second.Id),
-        "the scan is deterministic — same suggestions on a repeat with unchanged state");
-
-    var byKind = items.ToDictionary(i => i.Kind, i => i);
-    Check(byKind.ContainsKey("expiring"), "an 'expiring' suggestion is produced from the seed inventory");
-    Check(byKind.ContainsKey("restock"), "a 'restock' suggestion is produced from the seed inventory");
-
-    // Well-formed: every suggestion must be acceptable into a goal, so goal_text and id
-    // are non-empty — an empty goal_text would submit a blank user_goal.
-    foreach (var it in items)
-    {
-        Check(!string.IsNullOrWhiteSpace(it.Id), $"suggestion has an id ({it.Kind})");
-        Check(!string.IsNullOrWhiteSpace(it.GoalText), $"suggestion '{it.Id}' carries a goal_text to submit on accept");
-        Check(!string.IsNullOrWhiteSpace(it.Title), $"suggestion '{it.Id}' has a title");
-    }
-
-    Console.WriteLine(failures.Count == 0 ? "gate 18 (proactive suggestions scan): PASS" : $"gate 18 (proactive suggestions scan): FAIL: {failures.Count}");
-    return failures.Count == 0 ? 0 : 1;
-}
-
 public static async Task<int> VerifyPrechecksAsync(IServiceProvider provider, string dataDir)
 {
     var failures = new List<string>();

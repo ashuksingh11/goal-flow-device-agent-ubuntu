@@ -189,7 +189,9 @@ the global Advance-day world tick, guest prep-timeline + appliance gating, and c
 enforcement resolved per goal, including the household envelope across goals and the
 date-window block for an empty house.
 
-Verify with `./verify/v7-m6/check.sh` — it chains gates 1–26 and needs no API key.
+Verify with `./verify/v7-m7/check.sh` — it chains gates 1–28 and needs no API key.
+(Gate 18 is retired: proactive suggestions were removed in v7.1, so `verify/m8`
+is an empty link kept because v6-m2 chains it.)
 
 ## Conventions & gotchas
 

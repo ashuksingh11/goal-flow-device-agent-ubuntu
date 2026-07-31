@@ -70,6 +70,7 @@ public sealed class GoalAgent
     private readonly Trace _trace;
     private readonly Grounding _grounding;
     private readonly SafetyFilter _safety;
+    private readonly RepeatReadFilter _repeatReads;
     private readonly ApprovalCoordinator _approvals;
     private readonly MonitorAdapt _monitor;
     private readonly CapabilityManager _capabilities;
@@ -114,6 +115,7 @@ public sealed class GoalAgent
         Trace trace,
         Grounding grounding,
         SafetyFilter safety,
+        RepeatReadFilter repeatReads,
         ApprovalCoordinator approvals,
         MonitorAdapt monitor,
         CapabilityManager capabilities,
@@ -127,6 +129,7 @@ public sealed class GoalAgent
         _trace = trace;
         _grounding = grounding;
         _safety = safety;
+        _repeatReads = repeatReads;
         _approvals = approvals;
         _monitor = monitor;
         _capabilities = capabilities;
@@ -162,6 +165,9 @@ public sealed class GoalAgent
 
         builder.Services.AddSingleton(services.GetRequiredService<ILoggerFactory>());
         builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<SafetyFilter>());
+        // AFTER the safety filter, deliberately: the gate has already run on anything this
+        // sees, so a memoized answer is never an unchecked one.
+        builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<RepeatReadFilter>());
         builder.Services.AddSingleton(services.GetRequiredService<IProductApiAdapter>());
 
         foreach (var capability in services.GetRequiredService<CapabilityManager>().Descriptors)
@@ -673,13 +679,55 @@ public sealed class GoalAgent
         - capabilities: which listed modules the step will likely use. Advisory.
         - Do NOT state world facts (what is in the fridge, who is busy). You cannot
           see the world here; a later pass grounds each step against it.
+        - The steps must be steps of the contract's DOMAIN. The household's standing
+          food rules ride on EVERY contract — allergens, dietary, sodium — and they are
+          there to be enforced, not to be planned around. A home being made ready for a
+          trip is not a meal week however many food rules are attached to it, so do not
+          write meal, recipe, or grocery steps unless the domain is genuinely about food.
         """;
 
-    /// <summary>The decompose instruction: the contract + what this device can actually do.</summary>
+    /// <summary>
+    /// What the STEPS of one domain are about — the decompose half of
+    /// <see cref="PlanShapeRule"/>, and the reason it is a separate string.
+    ///
+    /// <para>
+    /// v7.1 bug: compose was domain-shaped and decompose was not. The contract was
+    /// serialized into both, but only compose was told what shape to make, so the only
+    /// domain signal decompose had was a `domain` field competing with a `hard` block
+    /// spelling out the family's allergens and dietary rules — on EVERY goal, because
+    /// household constraints are household-wide. A toolless model reading that broke
+    /// "get my home ready" into meal-planning steps, and the board dutifully showed
+    /// them. Naming the shape here is what closes it.
+    /// </para>
+    ///
+    /// <para>
+    /// Deliberately NOT <see cref="PlanShapeRule"/> reused: that string describes plan
+    /// ITEMS ("EXACTLY 7 dinner plan items", "plan the first meal back") and feeding it
+    /// to a pass that is choosing task titles would pull the count and the vocabulary of
+    /// the plan into the task DAG — including, for vacation_prep, the word "meal".
+    /// </para>
+    /// </summary>
+    internal static string DecomposeShapeRule(string domain) => domain switch
+    {
+        "meal_plan" => "the steps of planning a week of dinners for the household.",
+        "guest_dinner" => "the steps of hosting a dinner for guests, from menu to the table.",
+        "vacation_prep" =>
+            "the steps of getting a home ready for the family to LEAVE and ready for them "
+            + "to COME BACK — perishables, standing deliveries, appliances, security, and "
+            + "the return. Not dinners: nobody is home.",
+        "birthday_party" => "the steps of putting on a birthday party.",
+        "grocery_cost" => "the steps of bringing the grocery spend down.",
+        "energy_saving" => "the steps of cutting the home's energy use.",
+        _ => "infer the steps from the objective — concrete work toward THAT outcome, and nothing else.",
+    };
+
+    /// <summary>The decompose instruction: the contract, its domain shape, and what this device can actually do.</summary>
     private string BuildDecomposeInstruction(Dispatch dispatch)
         => $"""
         Task Contract:
         {ContractJson.Serialize(dispatch)}
+
+        This contract's domain is "{dispatch.Domain}". Its steps are {DecomposeShapeRule(dispatch.Domain)}
 
         Capabilities available on this device:
         {string.Join("\n", _capabilities.Descriptors.Where(d => d.Available).Select(d => $"- {d.Name}"))}
@@ -859,6 +907,9 @@ public sealed class GoalAgent
         // in the abstract.
         using var policy = await _safety.BeginGoalAsync(dispatch.GoalId, dispatch.Constraints.Hard, ct);
         _safety.SetTrace(_trace);
+        // Fresh memory of what this goal has already read. Scoped to the run, so nothing
+        // a previous plan (or a previous simulated day) learned can answer for this one.
+        _repeatReads.Reset(_trace);
 
         _logger.LogInformation("plan_start domain={Domain} model_clock={Today}", dispatch.Domain, _clock.Today);
         // PRE-CHECK GATE 1: can this goal be planned at all? Before a single token
@@ -915,8 +966,17 @@ public sealed class GoalAgent
         {
             FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(GroundingFunctions(), autoInvoke: true, options: new FunctionChoiceBehaviorOptions
             {
+                // Invocation stays SERIAL: the SafetyFilter arms and records per goal, and
+                // the trace numbers tool_call/tool_result in sequence. Neither wants two
+                // functions running at once, and grounding is not CPU-bound anyway.
                 AllowConcurrentInvocation = false,
-                AllowParallelCalls = false
+                // ...but the model may now ASK for several reads in one assistant turn.
+                // This was false from the first SK milestone, with no recorded reason, and
+                // it meant every single read cost its own full round-trip to a reasoning
+                // model. A meal plan reads inventory, the calendar, the workout routine,
+                // expiring items and the recipe box — five sequential round-trips to learn
+                // five independent facts, none of which depends on another.
+                AllowParallelCalls = true
             }),
             Temperature = 0.2,
             MaxTokens = 2500
