@@ -175,10 +175,18 @@ public sealed class GoalAgent
     {
         var builder = Kernel.CreateBuilder();
 
+        // The HttpClient is how `provider` reaches OpenRouter (SK 1.43 has no ExtraBody). It is
+        // NULL unless a provider preference is configured, and then SK builds its own exactly as
+        // before — which is what keeps every gate's request body unchanged. See
+        // OpenRouterBodyHandler for why its Timeout must be infinite.
+        var http = OpenRouterBodyHandler.CreateClient(settings.Routing);
         builder.AddOpenAIChatCompletion(
             modelId: settings.ModelId,
             endpoint: new Uri(settings.BaseUrl),
-            apiKey: settings.ApiKey);
+            apiKey: settings.ApiKey,
+            orgId: null,
+            serviceId: null,
+            httpClient: http);
 
         builder.Services.AddSingleton(services.GetRequiredService<ILoggerFactory>());
         builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<SafetyFilter>());

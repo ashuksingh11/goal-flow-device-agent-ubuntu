@@ -35,9 +35,18 @@ public sealed record LlmCallSite(string Name)
 }
 
 /// <summary>
-/// The two OpenRouter body fields that decide how fast this agent runs, neither of which appears
-/// in an <see cref="OpenAIPromptExecutionSettings"/> object initializer: <c>provider</c> (routing
+/// The two OpenRouter body fields that decide how fast this agent runs: <c>provider</c> (routing
 /// preferences, process-wide) and <c>reasoning_effort</c> (per call site).
+///
+/// <para>
+/// THEY TRAVEL BY DIFFERENT ROADS. <c>reasoning_effort</c> is a real
+/// <see cref="OpenAIPromptExecutionSettings"/> property on SK 1.43, so it is set here.
+/// <c>provider</c> is not modelled by SK until 1.78, and both device repos are pinned to 1.43
+/// (Tizen 12 ships its own System.Text.Json 8.x as a platform assembly, and SK ≥ 1.61 wants
+/// 10.x — so the Hub cannot move, and Ubuntu matches it on purpose so the dev box exercises the
+/// SK the Hub runs). It therefore rides on the HttpClient instead, via
+/// <see cref="OpenRouterBodyHandler"/>, which works on any SK version.
+/// </para>
 ///
 /// <para>
 /// WHY THIS EXISTS — MEASURED, v8-M0. With no <c>provider</c> field OpenRouter load-balances
@@ -59,10 +68,10 @@ public sealed record LlmCallSite(string Name)
 /// </para>
 ///
 /// <para>
-/// UNSET IS A NO-OP, AND THAT IS LOAD-BEARING. <see cref="None"/> writes nothing at all — no
-/// <c>ExtraBody</c> dictionary, no <c>ReasoningEffort</c> — so the request body is byte-for-byte
-/// what it was before this type existed. Every gate in <c>verify/</c> runs with these variables
-/// unset and was written against that body.
+/// UNSET IS A NO-OP, AND THAT IS LOAD-BEARING. <see cref="None"/> writes nothing at all: no
+/// <c>ReasoningEffort</c>, and no handler is even installed, so SK builds its own HttpClient
+/// exactly as it did before this type existed and the request body is byte-for-byte unchanged.
+/// Every gate in <c>verify/</c> runs with these variables unset and was written against that body.
 /// </para>
 ///
 /// <para>
@@ -70,15 +79,17 @@ public sealed record LlmCallSite(string Name)
 /// <c>provider</c> is held as a <see cref="JsonElement"/> cloned off a parsed document — not a
 /// <see cref="JsonObject"/> — because a JsonObject built by PARSING materialises its child
 /// dictionary lazily on first read, which is an unsynchronised write the moment two goals plan at
-/// once. A cloned JsonElement owns a private, fully-parsed buffer with no lazy state, and SK only
-/// ever reads it.
+/// once. A cloned JsonElement owns a private, fully-parsed buffer with no lazy state.
 /// </para>
 ///
 /// <para>
-/// REQUIRES SK 1.78.0+ for <c>ExtraBody</c> (absent in 1.70 and earlier); <c>ReasoningEffort</c>
-/// goes back to 1.61. Both reach the wire through the one
-/// <c>ClientCore.CreateChatCompletionOptions</c> shared by the streaming and non-streaming paths,
-/// so this works for the grounding stream and the compose call alike.
+/// "CEREBRAS OR NOTHING" is expressed with the two knobs together:
+/// <c>OPENROUTER_PROVIDER_ORDER=cerebras</c> plus
+/// <c>OPENROUTER_PROVIDER_ALLOW_FALLBACKS=false</c>. That combination is what the demo ships,
+/// and the reason is measured: Cerebras plans a goal in 8-10s and the next-best provider takes
+/// 203-234s — slower than sending no preference at all. Falling back is not degrading gracefully
+/// here, it is stalling for four minutes in front of an audience, so the demo would rather fail
+/// visibly and be re-run.
 /// </para>
 /// </summary>
 public sealed class LlmRouting
@@ -117,17 +128,9 @@ public sealed class LlmRouting
     /// </summary>
     public T Apply<T>(T settings, LlmCallSite site) where T : OpenAIPromptExecutionSettings
     {
-        if (_provider is { } provider && ExtraBodyProperty is { } extraBody)
-        {
-            var bag = extraBody.GetValue(settings) as IDictionary<string, object?>;
-            if (bag is null)
-            {
-                bag = new Dictionary<string, object?>(StringComparer.Ordinal);
-                extraBody.SetValue(settings, bag);
-            }
-            bag["provider"] = provider;
-        }
-
+        // `provider` is NOT set here — it rides on the HttpClient, via OpenRouterBodyHandler,
+        // because SK 1.43 has no ExtraBody. reasoning_effort DOES exist on 1.43, so it stays a
+        // normal setting.
         if (EffortFor(site) is { } effort)
         {
             settings.ReasoningEffort = effort;
@@ -136,37 +139,8 @@ public sealed class LlmRouting
         return settings;
     }
 
-    /// <summary>
-    /// <c>OpenAIPromptExecutionSettings.ExtraBody</c>, or null on an SK line that predates it.
-    ///
-    /// <para>
-    /// REFLECTION, BECAUSE THE TWO DEVICE REPOS CANNOT AGREE ON AN SK VERSION. Ubuntu runs SK
-    /// 1.78, where <c>ExtraBody</c> exists and is <c>[Experimental("SKEXP0010")]</c>. Tizen is
-    /// pinned to 1.43 and cannot move: SK ≥ 1.61 depends on System.Text.Json 10.x, and Tizen 12
-    /// ships its own STJ 8.x as a platform assembly loaded before app-local ones, so the newer
-    /// package simply refuses to load on the Hub. A compile-time reference would therefore break
-    /// the Tizen build, and the core is deliberately kept byte-identical between the repos.
-    /// </para>
-    ///
-    /// <para>
-    /// <c>ReasoningEffort</c> needs no such treatment — it exists on both lines (checked).
-    /// </para>
-    ///
-    /// <para>
-    /// On Tizen the equivalent of provider pinning is the model slug itself: setting
-    /// <c>OPENROUTER_MODEL=openai/gpt-oss-120b:nitro</c> in <c>goalflow.conf</c> asks OpenRouter
-    /// to sort by throughput, which needs no request field and therefore no SK support. It is
-    /// less precise than naming providers in order, but it is the same idea and it is one line.
-    /// </para>
-    /// </summary>
-    private static readonly System.Reflection.PropertyInfo? ExtraBodyProperty =
-        typeof(OpenAIPromptExecutionSettings).GetProperty("ExtraBody");
-
-    /// <summary>
-    /// True when a <c>provider</c> preference was configured but this SK build cannot send it —
-    /// so the caller can say so instead of silently running unpinned.
-    /// </summary>
-    public bool ProviderUnsupported => _provider is not null && ExtraBodyProperty is null;
+    /// <summary>The configured OpenRouter <c>provider</c> block, or null when none is set.</summary>
+    public JsonElement? Provider => _provider;
 
     /// <summary>Per-site value first (including an explicit off), then the global default.</summary>
     public string? EffortFor(LlmCallSite site)
@@ -182,13 +156,7 @@ public sealed class LlmRouting
 
         var provider = _provider is { } p ? p.GetRawText() : "-";
         var efforts = string.Join(" ", LlmCallSite.All.Select(s => $"{s.Name}={EffortFor(s) ?? "-"}"));
-        // Loud, because the failure mode is silence: a Hub configured to prefer Cerebras but
-        // unable to say so would just run at unpinned speed and look like the config took.
-        var caveat = ProviderUnsupported
-            ? " !! this Semantic Kernel build has no ExtraBody, so the provider preference is NOT being sent"
-              + " — use OPENROUTER_MODEL=<model>:nitro instead"
-            : "";
-        return $"provider={provider} reasoning_effort[{efforts}]{caveat}";
+        return $"provider={provider} reasoning_effort[{efforts}]";
     }
 
     /// <summary>

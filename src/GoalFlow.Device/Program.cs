@@ -2751,14 +2751,21 @@ public static async Task<int> VerifyRequestShapeAsync(ILoggerFactory loggerFacto
         }
     });
 
-    var kernel = Kernel.CreateBuilder()
-        .AddOpenAIChatCompletion(modelId: "shape-test", endpoint: new Uri($"http://127.0.0.1:{port}"), apiKey: "test")
-        .Build();
-    var chat = kernel.GetRequiredService<Microsoft.SemanticKernel.ChatCompletion.IChatCompletionService>();
+    // Built PER ROUTING, not once: `provider` rides on the HttpClient now, so a kernel that was
+    // built from a different routing would not be testing the thing under test.
+    Microsoft.SemanticKernel.ChatCompletion.IChatCompletionService ChatFor(LlmRouting routing)
+        => Kernel.CreateBuilder()
+            .AddOpenAIChatCompletion(modelId: "shape-test", endpoint: new Uri($"http://127.0.0.1:{port}"),
+                apiKey: "test", orgId: null, serviceId: null,
+                httpClient: OpenRouterBodyHandler.CreateClient(routing))
+            .Build()
+            .GetRequiredService<Microsoft.SemanticKernel.ChatCompletion.IChatCompletionService>();
 
     async Task<System.Text.Json.JsonElement> SendAsync(LlmRouting routing, LlmCallSite site, bool streaming)
     {
         while (bodies.TryDequeue(out _)) { }
+        var chat = ChatFor(routing);
+        var kernel = new Kernel();
         var settings = routing.Apply(new Microsoft.SemanticKernel.Connectors.OpenAI.OpenAIPromptExecutionSettings { Temperature = 0.1, MaxTokens = 64 }, site);
         var history = new Microsoft.SemanticKernel.ChatCompletion.ChatHistory();
         history.AddUserMessage("shape");
@@ -2812,7 +2819,7 @@ public static async Task<int> VerifyRequestShapeAsync(ILoggerFactory loggerFacto
     Check(!routed.IsNoOp, "with the vars set it is no longer a no-op");
 
     var ground = await SendAsync(routed, LlmCallSite.Grounding, streaming: true);
-    Check(Has(ground, "provider"), "provider is a TOP-LEVEL body field, not nested under extra_body");
+    Check(Has(ground, "provider"), "provider is a TOP-LEVEL body field on the STREAMING path");
     if (Has(ground, "provider"))
     {
         var provider = ground.GetProperty("provider");
@@ -2823,17 +2830,46 @@ public static async Task<int> VerifyRequestShapeAsync(ILoggerFactory loggerFacto
             $"provider.order is [cerebras, groq] in that order (got [{string.Join(", ", order)}])");
         Check(provider.TryGetProperty("allow_fallbacks", out var af)
             && af.ValueKind == System.Text.Json.JsonValueKind.True,
-            "allow_fallbacks defaults to true — a busy Cerebras costs a provider, not the demo");
+            "allow_fallbacks defaults to true when it is not configured");
     }
     Check(Str(ground, "reasoning_effort") == "medium", "grounding STREAMS and still carries reasoning_effort");
     Check(ground.TryGetProperty("stream", out var streamFlag)
         && streamFlag.ValueKind == System.Text.Json.JsonValueKind.True,
-        "ExtraBody runs LAST in SK's options builder and did not clobber \"stream\": true");
+        "the handler ADDED provider without disturbing what SK wrote (\"stream\": true survives)");
 
     var compose = await SendAsync(routed, LlmCallSite.Compose, streaming: false);
     Check(Has(compose, "provider"), "compose carries provider too — routing is process-wide");
     Check(!Has(compose, "reasoning_effort"),
         "LLM_REASONING_EFFORT_COMPOSE=off suppresses the global default at that ONE site");
+
+    // --- "cerebras or nothing", which is what the demo ships ---
+    //
+    // The mechanism's DEFAULT is allow_fallbacks:true, but the demo turns it off, and the
+    // measurement is why: Cerebras plans a goal in 8-10s and the next-best provider takes
+    // 203-234s — slower than sending no preference at all. Falling back is not graceful
+    // degradation here, so a run that cannot have Cerebras should fail visibly instead.
+    var strictEnv = new Dictionary<string, string?>(StringComparer.Ordinal)
+    {
+        ["OPENROUTER_PROVIDER_ORDER"] = "cerebras",
+        ["OPENROUTER_PROVIDER_ALLOW_FALLBACKS"] = "false",
+    };
+    var strict = LlmRouting.FromEnvironment(k => strictEnv.TryGetValue(k, out var v) ? v : null);
+    var strictBody = await SendAsync(strict, LlmCallSite.Compose, streaming: false);
+    if (Has(strictBody, "provider"))
+    {
+        var sp = strictBody.GetProperty("provider");
+        var order = sp.TryGetProperty("order", out var so) && so.ValueKind == System.Text.Json.JsonValueKind.Array
+            ? so.EnumerateArray().Select(x => x.GetString()).ToArray()
+            : Array.Empty<string?>();
+        Check(order.Length == 1 && order[0] == "cerebras", "strict: exactly one provider is named");
+        Check(sp.TryGetProperty("allow_fallbacks", out var saf)
+            && saf.ValueKind == System.Text.Json.JsonValueKind.False,
+            "strict: ALLOW_FALLBACKS=false reaches the wire as false, so a busy Cerebras fails loudly");
+    }
+    else
+    {
+        Check(false, "strict: provider block reached the wire");
+    }
 
     // --- fail-soft: a bad value degrades to unset, it never throws ---
     var garbage = LlmRouting.FromEnvironment(k => k == "OPENROUTER_PROVIDER_JSON" ? "{not json" : null);

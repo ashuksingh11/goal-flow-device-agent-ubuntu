@@ -8,6 +8,16 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- PINNED TO 1.43.0 TO MATCH TIZEN, deliberately, and NOT a floating "1.*".
+         Tizen 12 ships its own System.Text.Json 8.x as a platform assembly loaded before
+         app-local ones, and SK >= 1.61 depends on STJ 10.x — so the Hub cannot move off 1.43.
+         Ubuntu used to float to whatever was newest (it had drifted 1.33 -> 1.78 unnoticed),
+         which meant the dev box compiled against APIs the Hub does not have. It now compiles
+         the same source against the same SK, so a Tizen port is a file copy and nothing else.
+         SK 1.43 still marks ResponseFormat / ReasoningEffort / the endpoint-taking
+         AddOpenAIChatCompletion overload [Experimental], which Roslyn reports as an ERROR;
+         this is the same NoWarn the Tizen csproj carries. -->
+    <NoWarn>$(NoWarn);SKEXP0001;SKEXP0010</NoWarn>
     <RootNamespace>GoalFlow.Device</RootNamespace>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
@@ -31,7 +41,7 @@
 
   <!-- TIZEN-LEAN: Semantic Kernel + Microsoft.Extensions.{Logging,DI} + BCL ONLY. -->
   <ItemGroup>
-    <PackageReference Include="Microsoft.SemanticKernel" Version="1.*" />
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.43.0" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="*" />
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="*" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="*" />
