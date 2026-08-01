@@ -530,7 +530,25 @@ internal sealed record CliOptions
     }
 }
 
-/// <summary>Minimal KEY=VALUE .env loader (BCL only; missing file is fine).</summary>
+/// <summary>
+/// Minimal KEY=VALUE .env loader (BCL only; missing file is fine).
+///
+/// <para>
+/// THE FILE DOES NOT OVERRIDE THE ENVIRONMENT. It used to, unconditionally, which made
+/// <c>FOO=bar dotnet run …</c> silently do nothing for any key that also appeared in
+/// <c>.env</c> — the command looked like it worked, the value was replaced before anything
+/// read it, and there was no message. It cost a bad measurement: a run exported with a
+/// <c>:nitro</c> model id was quietly executed with the plain one from the file and came back
+/// at 186s, looking like evidence about Semantic Kernel rather than about this loader.
+/// </para>
+///
+/// <para>
+/// It is also the precedence Tizen already uses — <c>DeviceConfig.Get</c> reads the
+/// environment first and falls back to <c>goalflow.conf</c>. Having the two devices disagree
+/// about which source wins is exactly the kind of difference that makes a port behave
+/// differently from the box it was tested on.
+/// </para>
+/// </summary>
 internal static class DotEnv
 {
     public static void Load(string path)
@@ -548,6 +566,12 @@ internal static class DotEnv
             if (idx <= 0) continue;
             var key = trimmed[..idx].Trim();
             var value = trimmed[(idx + 1)..].Trim().Trim('"');
+            // Already set for real? Leave it. A value on the command line is the more
+            // deliberate of the two.
+            if (Environment.GetEnvironmentVariable(key) is { Length: > 0 })
+            {
+                continue;
+            }
             Environment.SetEnvironmentVariable(key, value);
         }
     }
