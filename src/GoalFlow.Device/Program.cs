@@ -92,6 +92,14 @@ if (ProgramHelpers.TryParsePositiveInt(Environment.GetEnvironmentVariable("LLM_S
 // audience can watch the pipeline light up. 0/unset = OFF (real timing). Allow 0 explicitly.
 if (int.TryParse(Environment.GetEnvironmentVariable("HARNESS_DWELL_MS"), out var harnessDwell) && harnessDwell >= 0)
     settings = settings with { HarnessDwellMs = harnessDwell };
+// v8: OpenRouter provider routing + per-call-site reasoning_effort. Resolved ONCE here, so the
+// mechanism never reads the environment itself — Tizen has no environment variables and fills the
+// same record from goalflow.conf. Unset = LlmRouting.None = a request body identical to v7.
+settings = settings with
+{
+    Routing = LlmRouting.FromEnvironment(
+        Environment.GetEnvironmentVariable, loggerFactory.CreateLogger("llm-routing"))
+};
 var kernel = GoalAgent.BuildKernel(settings, provider);
 
 WsClient? liveWs = null;
@@ -259,6 +267,12 @@ if (options.VerifyPrechecks)
 if (options.VerifyRepeatReads)
 {
     Environment.ExitCode = await ProgramHelpers.VerifyRepeatReadsAsync(provider, loggerFactory);
+    return;
+}
+
+if (options.VerifyRequestShape)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyRequestShapeAsync(loggerFactory);
     return;
 }
 
@@ -448,6 +462,7 @@ internal sealed record CliOptions
 
     /// <summary>--verify-deadline — assert a stalled provider stream aborts rather than wedging a goal (M6 gate).</summary>
     public bool VerifyDeadline { get; init; }
+    public bool VerifyRequestShape { get; init; }
 
     public static CliOptions Parse(string[] args)
     {
@@ -504,6 +519,7 @@ internal sealed record CliOptions
                 "--verify-trace-isolation" => options with { VerifyTraceIsolation = true },
                 "--verify-repeat-reads" => options with { VerifyRepeatReads = true },
                 "--verify-deadline" => options with { VerifyDeadline = true },
+                "--verify-request-shape" => options with { VerifyRequestShape = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -2619,6 +2635,191 @@ public static async Task<int> VerifyDeadlineAsync(ILoggerFactory loggerFactory)
         "the same exception under genuine cancellation is NOT transient");
 
     Console.WriteLine(failures == 0 ? "gate 15 (provider deadline): PASS" : $"gate 15 (provider deadline): FAIL: {failures}");
+    return failures == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// Gate 29 (v8-M1) — the two OpenRouter body fields SK does not model, and the promise that
+/// they are INVISIBLE until someone asks for them.
+///
+/// <para>
+/// HALF THIS GATE IS ABOUT THE FIELDS BEING ABSENT, and that half matters more. Every other
+/// gate in <c>verify/</c> was written against a request body with no <c>provider</c> and no
+/// <c>reasoning_effort</c> in it, and not one of them would notice if we started sending them —
+/// they never reach the network. This one does, so "unset changes nothing" is a measured claim
+/// rather than a hope.
+/// </para>
+///
+/// <para>
+/// It asserts on the WIRE, not on the settings object, because the claim under test is a claim
+/// about SK's serializer: that <c>ExtraBody</c> lands as a top-level <c>provider</c> key and not
+/// nested under <c>extra_body</c>, and that it does so on the streaming path too. Asserting on
+/// <c>OpenAIPromptExecutionSettings</c> would prove only that we set a property.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyRequestShapeAsync(ILoggerFactory loggerFactory)
+{
+    var failures = 0;
+    void Check(bool ok, string what)
+    {
+        if (!ok) { failures++; Console.WriteLine($"  FAIL {what}"); }
+        else { Console.WriteLine($"  ok   {what}"); }
+    }
+
+    using var listener = new System.Net.HttpListener();
+    var port = 8600 + (Environment.ProcessId % 400);
+    listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+    listener.Start();
+
+    var bodies = new System.Collections.Concurrent.ConcurrentQueue<System.Text.Json.JsonElement>();
+    using var stop = new CancellationTokenSource();
+    var serve = Task.Run(async () =>
+    {
+        while (!stop.IsCancellationRequested)
+        {
+            System.Net.HttpListenerContext context;
+            try { context = await listener.GetContextAsync(); }
+            catch { return; }
+
+            string raw;
+            using (var reader = new StreamReader(context.Request.InputStream))
+            {
+                raw = await reader.ReadToEndAsync();
+            }
+
+            var streaming = false;
+            try
+            {
+                var parsed = System.Text.Json.JsonDocument.Parse(raw);
+                bodies.Enqueue(parsed.RootElement.Clone());
+                streaming = parsed.RootElement.TryGetProperty("stream", out var s)
+                    && s.ValueKind == System.Text.Json.JsonValueKind.True;
+            }
+            catch { /* an unparseable body fails the assertions below, which is the point */ }
+
+            context.Response.StatusCode = 200;
+            if (streaming)
+            {
+                // Mirror the real thing closely enough that the SDK commits to the stream:
+                // the deadline gate learned the hard way that a fixture the client REJECTS
+                // tests the rejection, not the behaviour under test.
+                context.Response.ContentType = "text/event-stream";
+                context.Response.SendChunked = true;
+                var body = context.Response.OutputStream;
+                var chunk = System.Text.Encoding.UTF8.GetBytes(
+                    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"shape-test\","
+                    + "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+                    + "data: [DONE]\n\n");
+                await body.WriteAsync(chunk);
+                await body.FlushAsync();
+            }
+            else
+            {
+                context.Response.ContentType = "application/json";
+                var body = System.Text.Encoding.UTF8.GetBytes(
+                    "{\"id\":\"c\",\"object\":\"chat.completion\",\"created\":1,\"model\":\"shape-test\","
+                    + "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"{}\"},\"finish_reason\":\"stop\"}]}");
+                await context.Response.OutputStream.WriteAsync(body);
+            }
+            context.Response.Close();
+        }
+    });
+
+    var kernel = Kernel.CreateBuilder()
+        .AddOpenAIChatCompletion(modelId: "shape-test", endpoint: new Uri($"http://127.0.0.1:{port}"), apiKey: "test")
+        .Build();
+    var chat = kernel.GetRequiredService<Microsoft.SemanticKernel.ChatCompletion.IChatCompletionService>();
+
+    async Task<System.Text.Json.JsonElement> SendAsync(LlmRouting routing, LlmCallSite site, bool streaming)
+    {
+        while (bodies.TryDequeue(out _)) { }
+        var settings = routing.Apply(new Microsoft.SemanticKernel.Connectors.OpenAI.OpenAIPromptExecutionSettings { Temperature = 0.1, MaxTokens = 64 }, site);
+        var history = new Microsoft.SemanticKernel.ChatCompletion.ChatHistory();
+        history.AddUserMessage("shape");
+        try
+        {
+            if (streaming)
+            {
+                await foreach (var _ in chat.GetStreamingChatMessageContentsAsync(history, settings, kernel)) { }
+            }
+            else
+            {
+                await Microsoft.SemanticKernel.ChatCompletion.ChatCompletionServiceExtensions.GetChatMessageContentAsync(chat, history, settings, kernel);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  (send failed: {ex.GetType().Name}: {ex.Message})");
+        }
+        return bodies.TryDequeue(out var body) ? body : default;
+    }
+
+    static bool Has(System.Text.Json.JsonElement body, string key)
+        => body.ValueKind == System.Text.Json.JsonValueKind.Object && body.TryGetProperty(key, out _);
+
+    static string? Str(System.Text.Json.JsonElement body, string key)
+        => body.ValueKind == System.Text.Json.JsonValueKind.Object && body.TryGetProperty(key, out var v)
+           && v.ValueKind == System.Text.Json.JsonValueKind.String ? v.GetString() : null;
+
+    // --- the no-op: this is the gate that protects every OTHER gate ---
+    var none = LlmRouting.FromEnvironment(_ => null);
+    Check(none.IsNoOp, "nothing set at all resolves to LlmRouting.None");
+
+    var plain = await SendAsync(none, LlmCallSite.Compose, streaming: false);
+    Check(plain.ValueKind == System.Text.Json.JsonValueKind.Object, "the fixture captured a request body");
+    Check(!Has(plain, "provider"), "unset: a non-streaming body carries NO provider key");
+    Check(!Has(plain, "reasoning_effort"), "unset: a non-streaming body carries NO reasoning_effort key");
+    Check(!Has(plain, "extra_body"), "unset: nothing leaks through as a literal extra_body key");
+
+    var plainStream = await SendAsync(none, LlmCallSite.Grounding, streaming: true);
+    Check(!Has(plainStream, "provider") && !Has(plainStream, "reasoning_effort"),
+        "unset: a STREAMING body carries neither");
+
+    // --- routed ---
+    var env = new Dictionary<string, string?>(StringComparer.Ordinal)
+    {
+        ["OPENROUTER_PROVIDER_ORDER"] = "cerebras,groq",
+        ["LLM_REASONING_EFFORT"] = "medium",
+        ["LLM_REASONING_EFFORT_COMPOSE"] = "off",
+    };
+    var routed = LlmRouting.FromEnvironment(k => env.TryGetValue(k, out var v) ? v : null);
+    Check(!routed.IsNoOp, "with the vars set it is no longer a no-op");
+
+    var ground = await SendAsync(routed, LlmCallSite.Grounding, streaming: true);
+    Check(Has(ground, "provider"), "provider is a TOP-LEVEL body field, not nested under extra_body");
+    if (Has(ground, "provider"))
+    {
+        var provider = ground.GetProperty("provider");
+        var order = provider.TryGetProperty("order", out var o) && o.ValueKind == System.Text.Json.JsonValueKind.Array
+            ? o.EnumerateArray().Select(x => x.GetString()).ToArray()
+            : Array.Empty<string?>();
+        Check(order.Length == 2 && order[0] == "cerebras" && order[1] == "groq",
+            $"provider.order is [cerebras, groq] in that order (got [{string.Join(", ", order)}])");
+        Check(provider.TryGetProperty("allow_fallbacks", out var af)
+            && af.ValueKind == System.Text.Json.JsonValueKind.True,
+            "allow_fallbacks defaults to true — a busy Cerebras costs a provider, not the demo");
+    }
+    Check(Str(ground, "reasoning_effort") == "medium", "grounding STREAMS and still carries reasoning_effort");
+    Check(ground.TryGetProperty("stream", out var streamFlag)
+        && streamFlag.ValueKind == System.Text.Json.JsonValueKind.True,
+        "ExtraBody runs LAST in SK's options builder and did not clobber \"stream\": true");
+
+    var compose = await SendAsync(routed, LlmCallSite.Compose, streaming: false);
+    Check(Has(compose, "provider"), "compose carries provider too — routing is process-wide");
+    Check(!Has(compose, "reasoning_effort"),
+        "LLM_REASONING_EFFORT_COMPOSE=off suppresses the global default at that ONE site");
+
+    // --- fail-soft: a bad value degrades to unset, it never throws ---
+    var garbage = LlmRouting.FromEnvironment(k => k == "OPENROUTER_PROVIDER_JSON" ? "{not json" : null);
+    Check(garbage.IsNoOp, "malformed OPENROUTER_PROVIDER_JSON is ignored, not thrown");
+    var badEffort = LlmRouting.FromEnvironment(k => k == "LLM_REASONING_EFFORT" ? "lo" : null);
+    Check(badEffort.IsNoOp, "an unknown reasoning_effort value is ignored, not thrown");
+
+    stop.Cancel();
+    listener.Stop();
+    try { await serve.WaitAsync(TimeSpan.FromSeconds(2)); } catch { /* shutting down */ }
+
+    Console.WriteLine(failures == 0 ? "gate 29 (request shape): PASS" : $"gate 29 (request shape): FAIL: {failures}");
     return failures == 0 ? 0 : 1;
 }
 

@@ -51,6 +51,16 @@ public sealed record AgentSettings
     /// on Tizen. Suggested demo value ~1200–1500.
     /// </summary>
     public int HarnessDwellMs { get; init; } = 0;
+
+    /// <summary>
+    /// v8 — the two OpenRouter body fields SK does not model: provider routing and per-call-site
+    /// <c>reasoning_effort</c>. <see cref="LlmRouting.None"/> unless the environment says
+    /// otherwise, and None sends nothing, so the request body is byte-identical to v7 — which is
+    /// what keeps every verify gate honest. Resolved ONCE, here, rather than read from the
+    /// environment at the call sites: Tizen has no environment variables and populates this same
+    /// record from <c>goalflow.conf</c>.
+    /// </summary>
+    public LlmRouting Routing { get; init; } = LlmRouting.None;
 }
 
 /// <summary>
@@ -140,8 +150,12 @@ public sealed class GoalAgent
         _llmCallBudget = TimeSpan.FromSeconds(Math.Max(MinTimeoutSeconds, settings.LlmCallTimeoutSeconds));
         _streamingCallBudget = TimeSpan.FromSeconds(Math.Max(MinTimeoutSeconds, settings.LlmStreamTimeoutSeconds));
         _harnessDwell = TimeSpan.FromMilliseconds(Math.Max(0, settings.HarnessDwellMs));
+        _routing = settings.Routing;
         _logger.LogInformation("llm_budgets model={Model} call_timeout_s={Call} stream_timeout_s={Stream} harness_dwell_ms={Dwell}",
             settings.ModelId, (int)_llmCallBudget.TotalSeconds, (int)_streamingCallBudget.TotalSeconds, (int)_harnessDwell.TotalMilliseconds);
+        // Its own line, and always logged: which provider served a run is the difference between
+        // a 1.5s compose and a 50s one, and "why was that run slow" is unanswerable without it.
+        _logger.LogInformation("llm_routing {Routing}", _routing.Describe());
     }
 
     /// <summary>
@@ -472,6 +486,9 @@ public sealed class GoalAgent
     private readonly TimeSpan _llmCallBudget;
     private readonly TimeSpan _streamingCallBudget;
 
+    /// <summary>v8: provider routing + per-call-site reasoning effort. See <see cref="LlmRouting"/>.</summary>
+    private readonly LlmRouting _routing;
+
     /// <summary>v5 presenter-mode demo pacing; <see cref="TimeSpan.Zero"/> = OFF (real timing).</summary>
     private readonly TimeSpan _harnessDwell;
 
@@ -672,7 +689,7 @@ public sealed class GoalAgent
             {
                 try
                 {
-                    content = (await GetComposeContentAsync(chat, history, ComposeSiteDecompose, ct)).Raw;
+                    content = (await GetComposeContentAsync(chat, history, LlmCallSite.Decompose, ct)).Raw;
                     break;
                 }
                 catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
@@ -1019,7 +1036,7 @@ public sealed class GoalAgent
         history.AddSystemMessage(_grounding.RenderPrompt(ground));
         history.AddUserMessage(BuildGroundingInstruction(dispatch));
 
-        var groundingSettings = new OpenAIPromptExecutionSettings
+        var groundingSettings = _routing.Apply(new OpenAIPromptExecutionSettings
         {
             FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(GroundingFunctions(), autoInvoke: true, options: new FunctionChoiceBehaviorOptions
             {
@@ -1037,7 +1054,7 @@ public sealed class GoalAgent
             }),
             Temperature = 0.2,
             MaxTokens = GroundingMaxTokens
-        };
+        }, LlmCallSite.Grounding);
 
         var toolsBefore = _trace.ToolCallCount;
         var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
@@ -1264,7 +1281,7 @@ public sealed class GoalAgent
             ComposeContent composed;
             try
             {
-                composed = await GetComposeContentAsync(chat, history, ComposeSiteCompose, ct);
+                composed = await GetComposeContentAsync(chat, history, LlmCallSite.Compose, ct);
             }
             catch (Exception ex) when (IsTransientProviderError(ex, ct))
             {
@@ -1300,7 +1317,7 @@ public sealed class GoalAgent
             // the empty case would leave the truncating model paying the toll forever.
             if (composed.UsedResponseFormat)
             {
-                await DisableJsonModeAsync(ComposeSiteCompose, "returned content that would not parse as JSON");
+                await DisableJsonModeAsync(LlmCallSite.Compose, "returned content that would not parse as JSON");
             }
 
             lastError = error;
@@ -1314,10 +1331,6 @@ public sealed class GoalAgent
         await _trace.ThinkingAsync($"planner_error: {failure}");
         throw new JsonException(failure);
     }
-
-    /// <summary>The two call sites that ask for a JSON object, tracked separately — see _jsonMode.</summary>
-    private const string ComposeSiteDecompose = "decompose";
-    private const string ComposeSiteCompose = "compose";
 
     /// <summary>What one compose call produced, and whether json_object was used to get it.</summary>
     private readonly record struct ComposeContent(string Raw, bool UsedResponseFormat);
@@ -1344,8 +1357,8 @@ public sealed class GoalAgent
     /// </summary>
     private readonly Dictionary<string, JsonModeHealth> _jsonMode = new(StringComparer.Ordinal);
 
-    private JsonModeHealth JsonModeFor(string site)
-        => _jsonMode.TryGetValue(site, out var health) ? health : JsonModeHealth.Untried;
+    private JsonModeHealth JsonModeFor(LlmCallSite site)
+        => _jsonMode.TryGetValue(site.Name, out var health) ? health : JsonModeHealth.Untried;
 
     /// <summary>
     /// The compose call, and the one place that decides whether to ask for JSON mode.
@@ -1381,19 +1394,19 @@ public sealed class GoalAgent
     /// </para>
     /// </summary>
     private async Task<ComposeContent> GetComposeContentAsync(
-        IChatCompletionService chat, ChatHistory history, string site, CancellationToken ct)
+        IChatCompletionService chat, ChatHistory history, LlmCallSite site, CancellationToken ct)
     {
         if (JsonModeFor(site) == JsonModeHealth.Broken)
         {
-            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, site, ct), false);
         }
 
-        var jsonSettings = new OpenAIPromptExecutionSettings
+        var jsonSettings = _routing.Apply(new OpenAIPromptExecutionSettings
         {
             Temperature = 0.1,
             MaxTokens = ComposeMaxTokens,
             ResponseFormat = "json_object"
-        };
+        }, site);
 
         try
         {
@@ -1402,17 +1415,17 @@ public sealed class GoalAgent
             var content = response.Content ?? "";
             if (!string.IsNullOrWhiteSpace(content))
             {
-                _jsonMode[site] = JsonModeHealth.Works;
+                _jsonMode[site.Name] = JsonModeHealth.Works;
                 return new ComposeContent(content, true);
             }
 
             await DisableJsonModeAsync(site, "returned empty content");
-            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, site, ct), false);
         }
         catch (Exception ex) when (LooksLikeResponseFormatRejection(ex))
         {
             await DisableJsonModeAsync(site, $"rejected the parameter ({ex.Message})");
-            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, site, ct), false);
         }
     }
 
@@ -1423,25 +1436,31 @@ public sealed class GoalAgent
     /// decision already taken, and a transcript that repeats "retrying compose…" on every
     /// plan teaches the reader to ignore planner notices — including the ones that matter.
     /// </summary>
-    private async Task DisableJsonModeAsync(string site, string what)
+    private async Task DisableJsonModeAsync(LlmCallSite site, string what)
     {
         if (JsonModeFor(site) == JsonModeHealth.Broken)
         {
             return;
         }
-        _jsonMode[site] = JsonModeHealth.Broken;
+        _jsonMode[site.Name] = JsonModeHealth.Broken;
         var note = $"planner_notice: this model {what} for JSON response_format on the {site} call — using a strict JSON prompt instead, for this and every later plan.";
-        _logger.LogWarning("json_mode_disabled site={Site} reason={Reason}", site, what);
+        _logger.LogWarning("json_mode_disabled site={Site} reason={Reason}", site.Name, what);
         await _trace.ThinkingAsync(note);
     }
 
-    private async Task<string> GetStrictComposeContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
+    /// <summary>
+    /// The strict-prompt fallback. Takes the SITE because it is a fallback SHAPE, not a fifth call
+    /// site: reached from decompose it is still decompose, reached from compose it is still
+    /// compose, and each must keep its own routing.
+    /// </summary>
+    private async Task<string> GetStrictComposeContentAsync(
+        IChatCompletionService chat, ChatHistory history, LlmCallSite site, CancellationToken ct)
     {
-        var strictSettings = new OpenAIPromptExecutionSettings
+        var strictSettings = _routing.Apply(new OpenAIPromptExecutionSettings
         {
             Temperature = 0.1,
             MaxTokens = ComposeMaxTokens
-        };
+        }, site);
         using var cts = Deadline(ct, _llmCallBudget);
         var response = await chat.GetChatMessageContentAsync(history, strictSettings, _kernel, cts.Token);
         return response.Content ?? "";
@@ -1837,12 +1856,12 @@ public sealed class GoalAgent
 
     private async Task<string> GetAdaptContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
     {
-        var settings = new OpenAIPromptExecutionSettings
+        var settings = _routing.Apply(new OpenAIPromptExecutionSettings
         {
             Temperature = 0.2,
             MaxTokens = AdaptMaxTokens,
             ResponseFormat = "json_object"
-        };
+        }, LlmCallSite.Adapt);
         for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
         {
             try
