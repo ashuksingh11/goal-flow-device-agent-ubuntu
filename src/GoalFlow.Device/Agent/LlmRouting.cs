@@ -210,9 +210,10 @@ public sealed class LlmRouting
                 return null;
             }
 
-            // allow_fallbacks defaults TRUE, deliberately. false turns "prefer these providers"
-            // into "these providers or a 404", and a plan that came from Groq instead of Cerebras
-            // is a demo that ran; a plan that failed because Cerebras was busy is not.
+            // The MECHANISM defaults true, but the demo ships it FALSE. Measured on the real
+            // pipeline: Cerebras plans a goal in 8-10s, the next-best provider takes 203-234s —
+            // slower than sending no preference at all. Falling back is not a degrade here, it
+            // is a four-minute stall in front of an audience.
             var allowFallbacks = !string.Equals(
                 Clean(read("OPENROUTER_PROVIDER_ALLOW_FALLBACKS")), "false", StringComparison.OrdinalIgnoreCase);
 

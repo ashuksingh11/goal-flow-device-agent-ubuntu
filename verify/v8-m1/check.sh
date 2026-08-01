@@ -17,10 +17,15 @@
 # they never reach the network. Gate 29 does, so "unset changes nothing" is measured rather
 # than assumed.
 #
-# It asserts on the WIRE, against a local HttpListener, because the claim under test is a
-# claim about SK's serializer: that ExtraBody lands as a TOP-LEVEL `provider` key rather than
-# nested under `extra_body`, and that it does so on the streaming path too — SK applies
-# ExtraBody LAST in its options builder, so a colliding key would silently clobber `stream`.
+# It asserts on the WIRE, against a local HttpListener, because `provider` does not go through
+# Semantic Kernel at all. Both device repos are pinned to SK 1.43, which has no ExtraBody, so
+# OpenRouterBodyHandler edits the JSON body on its way out — and the thing worth proving is
+# that it ADDS one top-level key without disturbing what SK wrote (`stream: true` survives),
+# on the streaming path as well as the plain one.
+#
+# It also pins the demo's strict form: order=[cerebras] with allow_fallbacks=false. That is
+# not caution — the next-best provider measured 203-234s on the real pipeline, slower than
+# sending no preference at all, so a fallback is a four-minute stall rather than a degrade.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 

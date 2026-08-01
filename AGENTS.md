@@ -194,10 +194,18 @@ Verify with `./verify/v8-m1/check.sh` — it chains gates 1–29 and needs no AP
 **Before anything else, check `OPENROUTER_PROVIDER_ORDER` is set (v8).** Unset, OpenRouter
 load-balances `gpt-oss-120b` across nineteen endpoints spanning 39x in throughput and lands
 on the slow ones: four identical runs measured 59s / 175s / 145s / 189s unpinned, and
-8.4s / 8.4s / 8.7s / 10.1s pinned to `cerebras,groq`. The agent logs `llm_routing ...` at
-startup — if it says `off`, that is why a run is slow. `Agent/LlmRouting.cs` is the whole
-mechanism; `LLM_REASONING_EFFORT` is built and ships OFF, and its doc comment explains why
-`low` must not be turned on without re-measuring.
+8.4s / 8.4s / 8.7s / 10.1s pinned. The agent logs `llm_routing ...` at startup — if it says
+`off`, that is why a run is slow.
+
+The shipped config is `OPENROUTER_PROVIDER_ORDER=cerebras` **plus
+`OPENROUTER_PROVIDER_ALLOW_FALLBACKS=false`**, and the second line is not caution, it is the
+measurement: the next-best provider takes 203-234s on the real pipeline, *slower than sending
+no preference at all*. Falling back here is a silent four-minute stall, not a graceful degrade.
+
+`Agent/LlmRouting.cs` holds the config and `reasoning_effort`; `Agent/OpenRouterBodyHandler.cs`
+is how `provider` actually reaches the wire — **both device repos are pinned to SK 1.43, which
+has no `ExtraBody`**, so it rides on the HttpClient instead. `LLM_REASONING_EFFORT` is built and
+ships OFF; its doc comment explains why `low` must not be turned on without re-measuring.
 
 `grounding_done` now carries `rounds=` and `suppressed=` alongside `elapsed_ms` — the round
 count is what used to vary invisibly between an 80s and a 240s grounding pass.
