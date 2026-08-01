@@ -117,14 +117,15 @@ public sealed class LlmRouting
     /// </summary>
     public T Apply<T>(T settings, LlmCallSite site) where T : OpenAIPromptExecutionSettings
     {
-        if (_provider is { } provider)
+        if (_provider is { } provider && ExtraBodyProperty is { } extraBody)
         {
-            // SKEXP0010: ExtraBody is [Experimental], which Roslyn reports as an ERROR, not a
-            // warning. Suppressed for this one statement so the diagnostic still fires if anyone
-            // reaches for an experimental SK API anywhere else.
-#pragma warning disable SKEXP0010
-            (settings.ExtraBody ??= new Dictionary<string, object?>(StringComparer.Ordinal))["provider"] = provider;
-#pragma warning restore SKEXP0010
+            var bag = extraBody.GetValue(settings) as IDictionary<string, object?>;
+            if (bag is null)
+            {
+                bag = new Dictionary<string, object?>(StringComparer.Ordinal);
+                extraBody.SetValue(settings, bag);
+            }
+            bag["provider"] = provider;
         }
 
         if (EffortFor(site) is { } effort)
@@ -134,6 +135,38 @@ public sealed class LlmRouting
 
         return settings;
     }
+
+    /// <summary>
+    /// <c>OpenAIPromptExecutionSettings.ExtraBody</c>, or null on an SK line that predates it.
+    ///
+    /// <para>
+    /// REFLECTION, BECAUSE THE TWO DEVICE REPOS CANNOT AGREE ON AN SK VERSION. Ubuntu runs SK
+    /// 1.78, where <c>ExtraBody</c> exists and is <c>[Experimental("SKEXP0010")]</c>. Tizen is
+    /// pinned to 1.43 and cannot move: SK ≥ 1.61 depends on System.Text.Json 10.x, and Tizen 12
+    /// ships its own STJ 8.x as a platform assembly loaded before app-local ones, so the newer
+    /// package simply refuses to load on the Hub. A compile-time reference would therefore break
+    /// the Tizen build, and the core is deliberately kept byte-identical between the repos.
+    /// </para>
+    ///
+    /// <para>
+    /// <c>ReasoningEffort</c> needs no such treatment — it exists on both lines (checked).
+    /// </para>
+    ///
+    /// <para>
+    /// On Tizen the equivalent of provider pinning is the model slug itself: setting
+    /// <c>OPENROUTER_MODEL=openai/gpt-oss-120b:nitro</c> in <c>goalflow.conf</c> asks OpenRouter
+    /// to sort by throughput, which needs no request field and therefore no SK support. It is
+    /// less precise than naming providers in order, but it is the same idea and it is one line.
+    /// </para>
+    /// </summary>
+    private static readonly System.Reflection.PropertyInfo? ExtraBodyProperty =
+        typeof(OpenAIPromptExecutionSettings).GetProperty("ExtraBody");
+
+    /// <summary>
+    /// True when a <c>provider</c> preference was configured but this SK build cannot send it —
+    /// so the caller can say so instead of silently running unpinned.
+    /// </summary>
+    public bool ProviderUnsupported => _provider is not null && ExtraBodyProperty is null;
 
     /// <summary>Per-site value first (including an explicit off), then the global default.</summary>
     public string? EffortFor(LlmCallSite site)
@@ -149,7 +182,13 @@ public sealed class LlmRouting
 
         var provider = _provider is { } p ? p.GetRawText() : "-";
         var efforts = string.Join(" ", LlmCallSite.All.Select(s => $"{s.Name}={EffortFor(s) ?? "-"}"));
-        return $"provider={provider} reasoning_effort[{efforts}]";
+        // Loud, because the failure mode is silence: a Hub configured to prefer Cerebras but
+        // unable to say so would just run at unpinned speed and look like the config took.
+        var caveat = ProviderUnsupported
+            ? " !! this Semantic Kernel build has no ExtraBody, so the provider preference is NOT being sent"
+              + " — use OPENROUTER_MODEL=<model>:nitro instead"
+            : "";
+        return $"provider={provider} reasoning_effort[{efforts}]{caveat}";
     }
 
     /// <summary>
