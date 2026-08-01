@@ -7,14 +7,20 @@ using Microsoft.SemanticKernel;
 namespace GoalFlow.Device.Products.FamilyHub;
 
 /// <summary>
-/// CAPABILITY MODULE (shared): other appliances via SmartThings — oven,
-/// dishwasher, robot vacuum, lights. SK plugin, name "Appliance".
-/// SIGNATURES ONLY in v2-M0; the guest_dinner domain (prep timeline,
-/// "preheat oven at 18:30") fleshes this out in a later milestone.
-/// Scheduled actions are checked by the SafetyFilter against quiet_hours and
-/// the unattended-appliance rule in constraints.hard.
+/// CAPABILITY MODULE (shared): the home's appliances over SmartThings — oven,
+/// dishwasher, washing machine, fridge, TV and robot vacuum. SK plugin, name
+/// "Appliance". Scheduled actions are checked by the SafetyFilter against the window
+/// rules in constraints.hard (peak tariff on an energy goal, the away window on a trip).
+///
+/// <para>
+/// v7 made the description honest. It claimed a vacuum from v2 onward while the world
+/// held none, which is not a harmless comment: the [Description] is what the planner
+/// reads to decide what it may reach for, so an over-claim invites a proposal the device
+/// then fails to execute. The vacuum exists now (data/appliances.json), and the list
+/// here matches the seed.
+/// </para>
 /// </summary>
-[Description("Controls SmartThings appliances: oven, dishwasher, vacuum, lights.")]
+[Description("Controls the home's SmartThings appliances: oven, dishwasher, washing machine, fridge, TV and robot vacuum.")]
 public sealed class ApplianceControlPlugin
 {
     private readonly IProductApiAdapter _store;
@@ -22,7 +28,7 @@ public sealed class ApplianceControlPlugin
     public ApplianceControlPlugin(IProductApiAdapter store) => _store = store;
 
     [KernelFunction]
-    [Description("Lists the appliances SmartThings can reach and their current state.")]
+    [Description("Lists the appliances SmartThings can reach, their current state, their supported programs and their energy draw.")]
     public async Task<string> ListAppliances(CancellationToken ct = default)
     {
         var doc = await _store.LoadResolvedAsync("appliances", ct);
@@ -57,7 +63,7 @@ public sealed class ApplianceControlPlugin
 
     [KernelFunction]
     [SideEffect(ApprovalTiers.Light)]
-    [Description("Runs an appliance program at a time (e.g. dishwasher eco cycle, vacuum the kitchen).")]
+    [Description("Runs a SmartThings appliance program at a time — a dishwasher eco cycle, a washer run, or a robot vacuum clean.")]
     public async Task<string> RunProgram(
         [Description("Appliance id or name, e.g. \"dishwasher\".")] string appliance,
         [Description("Program name, e.g. \"eco\".")] string program,

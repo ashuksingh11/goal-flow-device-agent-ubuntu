@@ -17,10 +17,13 @@ namespace GoalFlow.Device.Products.FamilyHub;
 /// </para>
 ///
 /// <para>
-/// MATERIALITY: every feed entry is material, and that is not laziness — the feed
-/// IS the materiality decision, curated so the demo shows four quiet days and one
-/// smart adaptation rather than a stream of noise. What is NOT material never
-/// enters the feed in the first place.
+/// MATERIALITY: the feed IS the materiality decision, curated so the demo shows quiet
+/// days and one smart adaptation rather than a stream of noise. Through v6 every entry
+/// was material and nothing else entered the feed. v7 adds the other case —
+/// <c>workout.activity_logged</c> is worth TELLING the family about and not worth
+/// re-planning for on its own — so the feed now carries both, and
+/// <see cref="IsMaterial"/> is where the difference is decided rather than at the point
+/// of writing an entry.
 /// </para>
 /// </summary>
 public sealed class MealPlanObserver : IDomainObserver
@@ -36,7 +39,7 @@ public sealed class MealPlanObserver : IDomainObserver
 
     public string Domain => "meal_plan";
 
-    public string Hint => "planning the week's dinners — healthy eating, using up what is in the fridge";
+    public string Hint => "planning the week's dinners at home — using up what is in the fridge, household dietary rules, the family's activity";
 
     public async Task<JsonObject> CaptureAsync(CancellationToken ct = default)
         => new()
@@ -113,13 +116,23 @@ public sealed class MealPlanObserver : IDomainObserver
         // day_offset and target day in lockstep: day == day_offset + 1). Show that real date
         // rather than an opaque "Day N" ordinal (v4.2).
         var whenLabel = FormatWhen(evDate) ?? $"Day {targetDay}";
+
+        // v7 — THE DAY IS ALREADY EMPTY. Another goal the family approved marked this day
+        // "away, no meal planned", and a world change cannot un-empty it: the paneer really
+        // did spoil, but there is no dinner on Sunday to move it to. So the change is still
+        // TOLD (it stays in "what happened today") and simply stops being something to
+        // re-plan for. Demoting rather than dropping it is the point — a family that is
+        // away still wants to know their fridge lost something.
+        var awayDay = targetItem?.Status == PlanItemStatuses.Skipped;
         return new WorldChange
         {
             // STABLE key — the feed keeps returning this event every day after its
             // date, so the key must not embed today or it would re-fire daily.
             Key = $"daily:{id}",
             Kind = kind,
-            Description = $"{whenLabel} - {summary}",
+            Description = awayDay
+                ? $"{whenLabel} - {summary} No dinner was planned — you're away."
+                : $"{whenLabel} - {summary}",
             AffectedPlanItems = affected,
             TargetDay = targetDay,
             TargetItemId = targetItem?.Id,
@@ -127,14 +140,23 @@ public sealed class MealPlanObserver : IDomainObserver
             RecommendedAction = ev["steer"]?.GetValue<string>(),
             Steer = ev["steer"]?.GetValue<string>(),
             Context = context,
-            Material = IsMaterial(kind)
+            Material = IsMaterial(kind) && !awayDay
         };
     }
 
     /// <summary>
-    /// Which meal-week changes are worth waking the family for. The daily feed is
-    /// curated, so every kind it can emit is material by construction; anything
-    /// unrecognised is not, so a stray entry stays quiet rather than nagging.
+    /// Which meal-week changes are worth RE-PLANNING for. Anything unrecognised is
+    /// not, so a stray entry stays quiet rather than nagging.
+    ///
+    /// <para>
+    /// A non-material kind is not ignored: it is still surfaced in the day summary
+    /// under Advance day, so the family is told it happened. It simply does not open
+    /// an approval. <c>workout.activity_logged</c> is the case that motivated the
+    /// distinction — knowing yesterday was a hard training day is worth saying, and
+    /// asking someone to approve a plan change because they went for a run is not.
+    /// The day it matters, it matters as a REASON inside another change's steer, which
+    /// is exactly how the fish delivery uses it.
+    /// </para>
     /// </summary>
     private static bool IsMaterial(string kind) => kind switch
     {
@@ -144,11 +166,28 @@ public sealed class MealPlanObserver : IDomainObserver
         "guest.headcount_added" => true,
         "appliance.unavailable" => true,
         "meal.lighter_requested" => true,
+        // Explicitly listed rather than left to the default: this one is a decision.
+        "workout.activity_logged" => false,
         _ => false
     };
 
+    /// <summary>
+    /// The plan row a feed entry edits — its own day when the plan still has one, and
+    /// otherwise the last row, because a change with nowhere to land is better aimed at
+    /// the end of the week than dropped.
+    ///
+    /// <para>
+    /// The fallback deliberately prefers the last row that is NOT skipped: an away day is
+    /// not a place to put a dinner, and landing there would demote a change that had a
+    /// perfectly good home two rows earlier.
+    /// </para>
+    /// </summary>
     private static PlanItem? FindTargetPlanItem(IReadOnlyList<PlanItem> plan, int requestedDay)
-        => plan.Count == 0 ? null : plan.FirstOrDefault(item => item.Day == requestedDay) ?? plan[^1];
+        => plan.Count == 0
+            ? null
+            : plan.FirstOrDefault(item => item.Day == requestedDay)
+              ?? plan.LastOrDefault(item => item.Status != PlanItemStatuses.Skipped)
+              ?? plan[^1];
 
     /// <summary>Formats an ISO date as a short human label, e.g. "Tue, Jul 22" (v4.2). Null-safe.</summary>
     private static string? FormatWhen(string? isoDate)

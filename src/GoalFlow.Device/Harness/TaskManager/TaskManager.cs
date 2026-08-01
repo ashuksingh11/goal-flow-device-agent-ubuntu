@@ -182,7 +182,13 @@ public sealed class GoalRecord
 
     public JsonObject WorldSnapshot { get; set; } = new();
 
-    /// <summary>Change keys already surfaced — the "exactly once" half of the materiality gate.</summary>
+    /// <summary>
+    /// Change keys already surfaced — the "exactly once" half of the materiality gate.
+    /// v7: also holds non-material keys, which are listed in the day summary and never
+    /// adapted. The name is now narrower than the contents; it is kept because the set
+    /// means "already surfaced", which is true of both kinds, and renaming it would
+    /// ripple through the tick for no behavioural gain.
+    /// </summary>
     public HashSet<string> EmittedMaterialChanges { get; } = new(StringComparer.Ordinal);
 
     /// <summary>

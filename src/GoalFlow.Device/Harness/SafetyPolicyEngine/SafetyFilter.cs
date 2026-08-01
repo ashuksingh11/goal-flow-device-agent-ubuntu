@@ -119,6 +119,31 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
         _armed.ReArm(goalId, await ResolveAsync(goalId, dispatched, ct));
     }
 
+    /// <summary>
+    /// Replaces an armed goal's DISPATCHED constraints with a new block from the account,
+    /// then re-resolves (v7).
+    ///
+    /// <para>
+    /// The only caller is the cross-goal path: another goal was approved, the account
+    /// re-resolved this one's constraints, and sent the result down. Everything else uses
+    /// <see cref="ReResolveAsync"/>, which recomputes what is enforced from an UNCHANGED
+    /// dispatched block. The split matters — re-resolving from a replaced block would let
+    /// the device's own narrowing accumulate, and replacing on a re-resolve would let the
+    /// device author policy. Neither is allowed, so they are two methods.
+    /// </para>
+    /// </summary>
+    public async Task ReDispatchAsync(string goalId, JsonObject hard, CancellationToken ct = default)
+    {
+        if (_armed.DispatchedFor(goalId) is null)
+        {
+            _logger.LogWarning("constraints_redispatch_skipped goal={GoalId} — no armed policy", goalId);
+            return;
+        }
+
+        _armed.ReDispatch(goalId, hard);
+        await ReResolveAsync(goalId, ct);
+    }
+
     private async Task<JsonObject> ResolveAsync(string goalId, JsonObject dispatched, CancellationToken ct)
     {
         if (_resolver is null)
@@ -208,6 +233,11 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
             var refusal = Refusal(violation);
             context.Result = new FunctionResult(context.Function, refusal);
             await (_trace?.ToolResultAsync(module, function, refusal) ?? Task.CompletedTask);
+            // v7: a block is the most interesting thing this engine ever does, and until
+            // now it reached the user only as a chip summary and a count on the plan card.
+            // Said out loud, in the run's own transcript, at the moment it happens.
+            await (_trace?.ThinkingStepAsync($"Blocked {module}.{function}", violation, ThinkingKinds.Notice)
+                   ?? Task.CompletedTask);
             return;
         }
 
@@ -220,10 +250,71 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
             _logger.LogWarning("safety_result_blocked {Module}.{Function}: {Violation}", module, function, resultViolation);
             resultText = Refusal(resultViolation);
             context.Result = new FunctionResult(context.Function, resultText);
+            await (_trace?.ThinkingStepAsync($"Blocked what {module}.{function} returned", resultViolation, ThinkingKinds.Notice)
+                   ?? Task.CompletedTask);
         }
 
         await (_trace?.ToolResultAsync(module, function, resultText) ?? Task.CompletedTask);
+
+        // v7 — THE STEP, not just the chip. The chip says the model CALLED something; this
+        // says what came back, which is the half that reads as reasoning. Together they are
+        // "it decided to look here, and found this". The label is the function's own
+        // [Description] because that is product-authored human text; the harness has none
+        // and must not grow any.
+        if (resultViolation is null)
+        {
+            var label = Describe(context.Function, module, function);
+            await (_trace?.ThinkingStepAsync(label, Compact(resultText)) ?? Task.CompletedTask);
+        }
     }
+
+    /// <summary>The function's own [Description] as a step headline, or "Module · Function".</summary>
+    private static string Describe(KernelFunction fn, string module, string function)
+    {
+        var described = (fn.Description ?? "").Trim().TrimEnd('.');
+        return described.Length > 0 ? described : $"{module} · {function}";
+    }
+
+    /// <summary>
+    /// A tool result as one short line. Counts where there is something to count, because
+    /// "23 items" is what a person reads off a step and the JSON behind it is not.
+    ///
+    /// <para>
+    /// Deliberately shape-based and never key-based: this is harness code, so it may not
+    /// learn that a document called "inventory" has a field called "items". It looks for
+    /// an array — at the root, or the first one it finds one level in — and otherwise
+    /// falls back to the text itself, clipped.
+    /// </para>
+    /// </summary>
+    private static string Compact(string? result)
+    {
+        var text = (result ?? "").Trim();
+        if (text.Length == 0) return "nothing came back";
+
+        try
+        {
+            var node = JsonNode.Parse(text);
+            if (node is JsonArray root) return Count(root.Count);
+            if (node is JsonObject obj)
+            {
+                foreach (var (key, value) in obj)
+                {
+                    if (value is JsonArray arr) return $"{Count(arr.Count)} · {key.Replace('_', ' ')}";
+                }
+                var scalars = obj.Count;
+                if (scalars > 0) return string.Join(" · ", obj.Take(3).Select(p => $"{p.Key.Replace('_', ' ')} {p.Value}"));
+            }
+        }
+        catch (JsonException)
+        {
+            // Not JSON — plenty of functions return prose, which is fine.
+        }
+
+        var firstLine = text.Split('\n')[0].Trim();
+        return firstLine.Length <= 120 ? firstLine : firstLine[..117] + "…";
+    }
+
+    private static string Count(int n) => n == 1 ? "1 item" : $"{n} items";
 
     /// <summary>
     /// The policy of the goal this call belongs to, or null if the flow is not

@@ -36,7 +36,7 @@ public sealed class VacationPrepObserver : IDomainObserver
 
     public string Domain => "vacation_prep";
 
-    public string Hint => "getting the home ready while the family is away — locking up, arming security, saving energy, pausing deliveries";
+    public string Hint => "getting the HOME ready while the family is away — using up perishables, pausing deliveries, appliances to eco, locking up and arming security, and having the house ready to come back to. It is about the house, not the trip: booking travel, hotels, flights or an itinerary is NOT this";
 
     public async Task<JsonObject> CaptureAsync(CancellationToken ct = default)
     {
@@ -47,6 +47,10 @@ public sealed class VacationPrepObserver : IDomainObserver
             ["vacation"] = vacation,
             ["security"] = await _store.LoadResolvedAsync("security", ct),
             ["appliances"] = await _store.LoadResolvedAsync("appliances", ct),
+            // v7: what is still due to arrive at an empty house. Part of this goal's
+            // slice for the same reason security is — it is a thing the trip has to
+            // settle before it can claim the house is ready.
+            ["deliveries"] = await _store.LoadResolvedAsync("deliveries", ct),
             ["calendar"] = await _store.LoadResolvedAsync("calendar", ct)
         };
     }

@@ -1,5 +1,24 @@
 {
-  "comment": "Recipes are date-free. 'contains' lists allergen/dietary groups the SafetyFilter screens against constraints.hard.",
+  "comment": [
+    "Recipes are date-free. 'contains' lists allergen/dietary groups the SafetyFilter screens",
+    "against constraints.hard (see Products/FamilyHub/config/policy.json).",
+    "",
+    "v7.2 — WHY THERE IS RED MEAT IN HERE ON PURPOSE. The household's standing preference is",
+    "prefer_white_meat / chicken_turkey_fish_over_red_meat. A preference with nothing to turn",
+    "down is invisible: through v7 every recipe was vegetarian, so 'prefers white meat' could",
+    "not shape a single dinner, and the planner's considered/rejected line had nothing real to",
+    "put in it. rcp-009 and rcp-010 exist to BE rejected — a soft preference doing visible",
+    "work, which is the difference between a chip that decorates and a chip that decides.",
+    "",
+    "Note the two kinds of 'no'. Red meat loses to a PREFERENCE — the planner weighs it and",
+    "explains itself. Pork would lose to a hard RULE and never reach the model at all (the",
+    "result_screen rule drops it upstream). Both are in the demo, and they are not the same",
+    "act: one is judgement, the other is a gate.",
+    "",
+    "Tags are a closed vocabulary — FindRecipes reports it back as 'available_tags', so a",
+    "planner asking for a word that is not here is told so rather than left to guess. Keep new",
+    "tags consistent with the ones already in use (more_protein, never high_protein)."
+  ],
   "recipes": [
     {
       "id": "rcp-001",
@@ -40,6 +59,46 @@
       "tags": ["vegetarian", "more_vegetables", "kid_friendly"],
       "contains": ["dairy", "gluten"],
       "prep_minutes": 30
+    },
+    {
+      "id": "rcp-006",
+      "name": "grilled chicken and vegetable traybake",
+      "ingredients": ["chicken breast", "bell peppers", "carrots", "onions", "olive oil"],
+      "tags": ["white_meat", "more_protein", "more_vegetables"],
+      "contains": [],
+      "prep_minutes": 40
+    },
+    {
+      "id": "rcp-007",
+      "name": "lemon herb fish with greens",
+      "ingredients": ["white fish fillet", "spinach", "lemon", "olive oil", "garlic"],
+      "tags": ["white_meat", "more_protein", "light", "quick_prep"],
+      "contains": ["fish"],
+      "prep_minutes": 20
+    },
+    {
+      "id": "rcp-008",
+      "name": "turkey stir-fry with peppers",
+      "ingredients": ["turkey mince", "bell peppers", "onions", "rice", "ginger"],
+      "tags": ["white_meat", "more_protein", "quick_prep"],
+      "contains": [],
+      "prep_minutes": 25
+    },
+    {
+      "id": "rcp-009",
+      "name": "beef chilli with rice",
+      "ingredients": ["beef mince", "kidney beans", "tomatoes", "onions", "rice"],
+      "tags": ["red_meat", "more_protein"],
+      "contains": [],
+      "prep_minutes": 45
+    },
+    {
+      "id": "rcp-010",
+      "name": "lamb rogan josh",
+      "ingredients": ["lamb shoulder", "yogurt", "tomatoes", "onions", "ginger"],
+      "tags": ["red_meat", "more_protein"],
+      "contains": ["dairy"],
+      "prep_minutes": 60
     }
   ]
 }

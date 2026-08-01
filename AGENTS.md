@@ -119,7 +119,19 @@ wired separately in each host.
     `ReResolveAsync` recomputes it on approval and each day tick, always from the
     DISPATCHED block so a freed-up envelope lets the ceiling climb back.
     `ShoppingList.PlaceOrder` accrues into `budget.spent`, which is what makes two
-    goals share a wallet. Gate: `verify/v6-m3/check.sh`.
+    goals share a wallet. Gate: `verify/v6-m3/check.sh`. **The household no longer holds
+    a budget entry (v7), so this mechanism is intact and unused** — the gates still
+    exercise it against synthetic policy blocks.
+  - **v7 — one goal changes another.** `control: constraints_changed` re-arms a running
+    goal from a block the ACCOUNT re-resolved (`SafetyFilter.ReDispatchAsync`, distinct
+    from `ReResolveAsync`) and applies the re-plan WITHOUT an approval — the only path
+    that does. Gates 25 (device) and 17 (cloud, `verify_crossgoal.py`).
+  - **...and the days it empties stay empty.** A row with `status: "skipped"` is immune to
+    world events: `MealPlanObserver` demotes a change aimed at one to informational (still
+    told, never re-planned) and `GoalAgent.DropSkippedRows` drops any patch row whose
+    incumbent is skipped — except from `constraints.changed`, the path that writes them.
+    Gate 26. Found in the field, not by a gate: the tick after the cross-goal moment used
+    to cook dinner on a day nobody was home.
   - `TaskManager/` — THE GOAL LEDGER (v3-M2). `TaskManager` + `GoalRecord` +
     `TaskRecord` + `TaskState`: the task DAG, a validated lifecycle (illegal moves
     are refused, not applied), retries, and **derived** progress — which is what
@@ -177,7 +189,9 @@ the global Advance-day world tick, guest prep-timeline + appliance gating, and c
 enforcement resolved per goal, including the household envelope across goals and the
 date-window block for an empty house.
 
-Verify with `./verify/v6-m3/check.sh` — it chains gates 1–21 and needs no API key.
+Verify with `./verify/v7-m7/check.sh` — it chains gates 1–28 and needs no API key.
+(Gate 18 is retired: proactive suggestions were removed in v7.1, so `verify/m8`
+is an empty link kept because v6-m2 chains it.)
 
 ## Conventions & gotchas
 

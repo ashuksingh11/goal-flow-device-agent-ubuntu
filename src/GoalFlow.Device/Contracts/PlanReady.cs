@@ -47,6 +47,39 @@ public sealed record PlanReadyPayload
 
     /// <summary>One-paragraph natural-language rationale for the plan.</summary>
     public string? Explanation { get; init; }
+
+    /// <summary>
+    /// How many options the planner weighed before choosing (v7). Optional — a model
+    /// that omits it costs a line of UI, not a plan.
+    /// </summary>
+    public int? Considered { get; init; }
+
+    /// <summary>
+    /// What it weighed and DISCARDED, with the reason each time (v7).
+    ///
+    /// <para>
+    /// This is the clearest evidence a person can be given that something reasoned
+    /// rather than looked up: a lookup table cannot reject. It is also the one thing
+    /// the run knows and could never show — the discarded branches vanished inside a
+    /// single compose call, so the plan arrived looking like the only plan there was.
+    /// </para>
+    ///
+    /// <para>
+    /// Model-authored and therefore SOFT: it is displayed, never enforced, and nothing
+    /// downstream reads it. A rejection reason that is wrong costs a wrong sentence.
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<RejectedOption>? Rejected { get; init; }
+}
+
+/// <summary>One option the planner considered and did not take, and why (v7).</summary>
+public sealed record RejectedOption
+{
+    /// <summary>What it was, e.g. "pork belly stir-fry".</summary>
+    public required string Option { get; init; }
+
+    /// <summary>Why it was not taken, e.g. "no pork".</summary>
+    public required string Reason { get; init; }
 }
 
 /// <summary>Small display catalog entry for a presenter-fired demo event.</summary>
@@ -85,6 +118,32 @@ public sealed record PlanItem
     public IReadOnlyList<string> Why { get; init; } = [];
 
     public IReadOnlyList<string> Tags { get; init; } = [];
+
+    /// <summary>
+    /// v7: <see cref="PlanItemStatuses.Planned"/> (or absent) or
+    /// <see cref="PlanItemStatuses.Skipped"/> — this day is deliberately empty.
+    ///
+    /// <para>
+    /// THE ALTERNATIVE WAS TO DELETE THE ROW, and that is worse. A patch that REMOVES the
+    /// two days a family is away leaves a plan that is simply shorter: nothing on screen
+    /// says why, nothing connects it to the goal that caused it, and the change reads as
+    /// data loss rather than a decision. A skipped row keeps the day visible, keeps its
+    /// date, and carries the reason.
+    /// </para>
+    /// </summary>
+    public string? Status { get; init; }
+
+    /// <summary>Why it is skipped, in the user's terms — "you're away · from Get my home ready".</summary>
+    public string? StatusReason { get; init; }
+}
+
+/// <summary>The <see cref="PlanItem.Status"/> values. Absent means planned.</summary>
+public static class PlanItemStatuses
+{
+    public const string Planned = "planned";
+
+    /// <summary>Deliberately empty — still rendered, styled down, with its reason.</summary>
+    public const string Skipped = "skipped";
 }
 
 /// <summary>

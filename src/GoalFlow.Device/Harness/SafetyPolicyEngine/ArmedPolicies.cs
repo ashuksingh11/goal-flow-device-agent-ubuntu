@@ -46,8 +46,13 @@ public sealed class ArmedPolicies : IActivePolicy
         /// What the CLOUD sent, kept verbatim. Re-resolution starts here every time —
         /// never from the last effective block, or the envelope would be subtracted
         /// again on each pass and the ceiling would walk itself down to zero.
+        ///
+        /// <para>
+        /// Settable only through <see cref="ReDispatch"/> (v7), and only when the account
+        /// sends a new block. The device does not author policy, so nothing else writes here.
+        /// </para>
         /// </summary>
-        public required JsonObject Dispatched { get; init; }
+        public required JsonObject Dispatched { get; set; }
 
         /// <summary>
         /// What is actually enforced: the dispatched block after the product's
@@ -87,6 +92,28 @@ public sealed class ArmedPolicies : IActivePolicy
         if (_policies.TryGetValue(goalId, out var policy))
         {
             policy.Hard = effective;
+        }
+    }
+
+    /// <summary>
+    /// Replaces the DISPATCHED block itself — the account re-resolved this goal's
+    /// constraints while it was running (v7).
+    ///
+    /// <para>
+    /// Distinct from <see cref="ReArm"/>, and the distinction is the one that took a bug
+    /// to learn: ReArm recomputes what is ENFORCED from an unchanged dispatched block, so
+    /// narrowing can be undone when the world frees up. This replaces the dispatched
+    /// block, which is only ever correct when the ACCOUNT sent a new one — the device must
+    /// still never author policy. Violations are kept: they happened, and a new constraint
+    /// arriving does not unmake them.
+    /// </para>
+    /// </summary>
+    public void ReDispatch(string goalId, JsonObject hard, JsonObject? effective = null)
+    {
+        if (_policies.TryGetValue(goalId, out var policy))
+        {
+            policy.Dispatched = hard;
+            policy.Hard = effective ?? hard;
         }
     }
 

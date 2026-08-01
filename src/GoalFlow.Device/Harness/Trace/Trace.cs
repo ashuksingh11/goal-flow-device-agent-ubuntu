@@ -99,14 +99,52 @@ public sealed class Trace
             ? Task.CompletedTask
             : EmitAsync(AgentEventKinds.Thinking, new JsonObject { ["text"] = text });
 
+    /// <summary>
+    /// Emits ONE labelled step of the work — a headline and its sub-line (v7).
+    ///
+    /// <para>
+    /// Unlike <see cref="ThinkingAsync"/> this is whole on arrival, never a fragment, so
+    /// a client renders it immediately instead of accumulating and guessing where one
+    /// thought ends. <c>text</c> carries "step — detail" so a client that knows nothing
+    /// about the new fields still reads a sentence.
+    /// </para>
+    /// </summary>
+    public Task ThinkingStepAsync(string step, string? detail = null, string kind = ThinkingKinds.Step)
+    {
+        if (string.IsNullOrWhiteSpace(step)) return Task.CompletedTask;
+        var text = string.IsNullOrWhiteSpace(detail) ? step : $"{step} — {detail}";
+        var payload = new JsonObject
+        {
+            ["text"] = text,
+            ["kind"] = kind,
+            ["step"] = step
+        };
+        if (!string.IsNullOrWhiteSpace(detail)) payload["detail"] = detail;
+        return EmitAsync(AgentEventKinds.Thinking, payload);
+    }
+
+    /// <summary>
+    /// Tool calls emitted since this process started (v7). Read as a delta around a
+    /// phase to report what that phase actually READ — the model chooses how many tools
+    /// to call, so it is a genuine per-run number rather than a constant dressed up as
+    /// one. Not per-goal: goals plan one at a time on this device, and a counter that
+    /// needed a scope would have to live on the goal record for a display string.
+    /// </summary>
+    public int ToolCallCount => _toolCalls;
+
+    private int _toolCalls;
+
     /// <summary>Emits a tool_call chip as the kernel is about to invoke {module}.{function}(args).</summary>
     public Task ToolCallAsync(string module, string function, JsonObject? args)
-        => EmitAsync(AgentEventKinds.ToolCall, new JsonObject
+    {
+        Interlocked.Increment(ref _toolCalls);
+        return EmitAsync(AgentEventKinds.ToolCall, new JsonObject
         {
             ["module"] = module,
             ["function"] = function,
             ["args"] = args?.DeepClone()
         });
+    }
 
     /// <summary>Emits a tool_result chip with a short human summary of what came back.</summary>
     public Task ToolResultAsync(string module, string function, string summary)

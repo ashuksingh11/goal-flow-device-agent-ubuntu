@@ -55,6 +55,25 @@
       "location": "living room",
       "supports": ["slideshow"],
       "energy": { "kwh_per_hour": 0.09, "standby_w": 12 }
+    },
+    {
+      "$comment": [
+        "v7. Added for the home-away goal's RETURN READINESS phase — a clean house to come",
+        "back to is the last thing that plan does. Reachable through the EXISTING",
+        "Appliance.RunProgram (it has `programs`, which is all that function requires), so",
+        "this is one JSON block and no new code.",
+        "",
+        "It also stops ApplianceControlPlugin's own [Description] from lying: it has",
+        "advertised 'oven, dishwasher, vacuum, lights' since v2 while this world held no",
+        "vacuum at all, and the planner reads that description."
+      ],
+      "id": "rvc",
+      "name": "robot vacuum",
+      "type": "robot_cleaner",
+      "state": "docked",
+      "location": "hallway",
+      "programs": ["quick", "spot", "deep"],
+      "energy": { "kwh_per_run": 0.08, "eco_kwh_per_run": 0.05, "standby_w": 2 }
     }
   ],
   "scheduled_actions": []

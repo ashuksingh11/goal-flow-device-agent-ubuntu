@@ -1,0 +1,72 @@
+{
+  "comment": [
+    "STANDING DELIVERIES (v7). The subscriptions and scheduled drops that keep arriving",
+    "whether or not anyone is home — the thing a home-away goal has to deal with before it",
+    "can claim the house is ready.",
+    "",
+    "WHY THIS IS ITS OWN FILE AND NOT A FIELD ON shopping_list.json. A shopping list is",
+    "what the family intends to buy; these are commitments already made to third parties.",
+    "Holding one is an outward-facing act with a date attached, and Deliveries.Hold is",
+    "graded A2 precisely because of that — it is not the same kind of thing as adding milk",
+    "to a list, and folding it into ShoppingList would have made one plugin mean two",
+    "things and one grade cover both.",
+    "",
+    "ESSENTIAL vs NOT is the household's call, recorded here rather than inferred. The",
+    "planner is told which is which; it does not get to decide that the medication drop is",
+    "non-essential because nobody will be in.",
+    "",
+    "See data/README.md for the generic-clock rule: `every_days` is a cadence and",
+    "`next_in_days` resolves against IClock.Today at read time, so 'the next one' is always",
+    "correctly in the future however long the seed sits here.",
+    "",
+    "RUNTIME-MUTATED: Hold and Resume write `held` and `held_until` back. Restore from git",
+    "before a recording, not after."
+  ],
+  "deliveries": [
+    {
+      "id": "del-milk",
+      "name": "milk subscription",
+      "vendor": "Daily Dairy",
+      "essential": false,
+      "every_days": 2,
+      "next_in_days": 1,
+      "note": "left on the porch — spoils in a few hours in summer",
+      "held": false
+    },
+    {
+      "id": "del-veg-box",
+      "name": "vegetable box",
+      "vendor": "GreenCrate",
+      "essential": false,
+      "every_days": 7,
+      "next_in_days": 3,
+      "note": "the whole week's produce; nothing in it keeps outdoors",
+      "held": false
+    },
+    {
+      "id": "del-parcel",
+      "name": "parcel — kitchen scales",
+      "vendor": "Marketplace",
+      "essential": false,
+      "every_days": null,
+      "next_in_days": 2,
+      "note": "one-off; needs a signature",
+      "held": false
+    },
+    {
+      "$comment": [
+        "The one that must NOT be paused, and the reason `essential` is a field rather than",
+        "something the planner judges. A plan that holds this to tidy up the porch is a plan",
+        "that got someone's medication stopped."
+      ],
+      "id": "del-pharmacy",
+      "name": "repeat prescription",
+      "vendor": "Pharmacy",
+      "essential": true,
+      "every_days": 28,
+      "next_in_days": 5,
+      "note": "Rohan's blood-pressure medication — never hold this",
+      "held": false
+    }
+  ]
+}

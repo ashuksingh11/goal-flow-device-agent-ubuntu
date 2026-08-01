@@ -70,6 +70,7 @@ public sealed class GoalAgent
     private readonly Trace _trace;
     private readonly Grounding _grounding;
     private readonly SafetyFilter _safety;
+    private readonly RepeatReadFilter _repeatReads;
     private readonly ApprovalCoordinator _approvals;
     private readonly MonitorAdapt _monitor;
     private readonly CapabilityManager _capabilities;
@@ -114,6 +115,7 @@ public sealed class GoalAgent
         Trace trace,
         Grounding grounding,
         SafetyFilter safety,
+        RepeatReadFilter repeatReads,
         ApprovalCoordinator approvals,
         MonitorAdapt monitor,
         CapabilityManager capabilities,
@@ -127,6 +129,7 @@ public sealed class GoalAgent
         _trace = trace;
         _grounding = grounding;
         _safety = safety;
+        _repeatReads = repeatReads;
         _approvals = approvals;
         _monitor = monitor;
         _capabilities = capabilities;
@@ -162,6 +165,9 @@ public sealed class GoalAgent
 
         builder.Services.AddSingleton(services.GetRequiredService<ILoggerFactory>());
         builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<SafetyFilter>());
+        // AFTER the safety filter, deliberately: the gate has already run on anything this
+        // sees, so a memoized answer is never an unchecked one.
+        builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<RepeatReadFilter>());
         builder.Services.AddSingleton(services.GetRequiredService<IProductApiAdapter>());
 
         foreach (var capability in services.GetRequiredService<CapabilityManager>().Descriptors)
@@ -282,6 +288,20 @@ public sealed class GoalAgent
             }
 
             var changes = await _monitor.ObserveAsync(goal, ct);
+
+            // v7 — TELLING IS NOT THE SAME AS ASKING. A change that is not material is
+            // still something that happened in this home, and until now it went nowhere:
+            // only the one material change reached the day summary, so a non-material
+            // observation was indistinguishable from a quiet day. Listed here, adapted
+            // never. Deduped through the same set as the material ones (the set means
+            // "already surfaced", which is true of both) so a listed change does not
+            // reappear on every subsequent tick.
+            foreach (var note in changes.Where(c => !c.Material && goal.EmittedMaterialChanges.Add(c.Key)))
+            {
+                _logger.LogInformation("world_change_note goal={GoalId} kind={Kind} key={Key}", goalId, note.Kind, note.Key);
+                AddDayEvent(events, note, goalId);
+            }
+
             var material = changes.FirstOrDefault(c => c.Material && goal.EmittedMaterialChanges.Add(c.Key));
             if (material is not null)
             {
@@ -350,7 +370,86 @@ public sealed class GoalAgent
         return Math.Max(1, _clock.Today.DayNumber - starts.Min().DayNumber + 1);
     }
 
+    /// <summary>
+    /// How many household rules this goal is being held to — the number the Safety
+    /// engine's verdict reports. Counts LIST entries individually (three allergens are
+    /// three rules a plan can trip) and each scalar window or ceiling as one.
+    /// </summary>
+    internal static int CountHardConstraints(Dispatch dispatch)
+        => dispatch.Constraints.Hard.Sum(pair => pair.Value is JsonArray list ? list.Count : 1);
+
+    /// <summary>
+    /// The planner's verdict pill. Says what it WEIGHED when the model reported it, which
+    /// is the difference between "it produced seven steps" and "it produced seven steps
+    /// out of seventeen options, and here is what it threw away".
+    /// </summary>
+    internal static string PlannerVerdict(int stepCount, int? considered, int rejected)
+    {
+        var steps = $"{stepCount} steps";
+        if (considered is > 0 && rejected > 0) return $"{steps} · {considered} considered, {rejected} rejected";
+        if (considered is > 0) return $"{steps} · {considered} considered";
+        if (rejected > 0) return $"{steps} · {rejected} rejected";
+        return steps;
+    }
+
     private const int MaxComposeAttempts = 3;
+
+    /// <summary>
+    /// COMPLETION-TOKEN CEILINGS, and why they are this size.
+    ///
+    /// <para>
+    /// These caps cover REASONING PLUS OUTPUT, and on a reasoning model the reasoning is by
+    /// far the larger half — measured on `openai/gpt-oss-120b`, roughly 5-9k characters of
+    /// reasoning behind 1-2k characters of plan. They were originally sized as if the number
+    /// bought output, which is how compose ended up asking for a seven-day plan inside 6000
+    /// tokens and getting back nothing at all: `Completion tokens: 6000` exactly, twice in a
+    /// row, finish_reason=length, empty content. The user's error — "Planner did not return
+    /// any content for the JSON plan" — is a starved budget wearing the mask of a modelling
+    /// failure, and no amount of retrying fixes it because every retry has the same ceiling
+    /// AND a longer prompt. With headroom, the same call lands at 5809 tokens and returns a
+    /// plan.
+    /// </para>
+    ///
+    /// <para>
+    /// ONLY COMPOSE WAS RAISED. The same reasoning does NOT justify raising every ceiling —
+    /// see <see cref="GroundingMaxTokens"/>, where trying it made things markedly worse.
+    /// Compose is different because it was demonstrably FAILING at its old limit; a limit
+    /// that is merely being reached is not the same as one that is too low.
+    /// </para>
+    ///
+    /// <para>
+    /// They are ceilings, not reservations: a call that finishes in 2k tokens is billed for
+    /// 2k. The cost of raising them is only paid by the calls that would otherwise have
+    /// failed and been retried at full price anyway.
+    /// </para>
+    /// </summary>
+    private const int ComposeMaxTokens = 16000;
+
+    /// <summary>
+    /// Grounding keeps its ORIGINAL, much smaller ceiling — measured, after raising it was
+    /// tried and was worse.
+    ///
+    /// <para>
+    /// Grounding hits this cap exactly on every run, which looks like damage: the summary is
+    /// cut off mid-thought. Raising it to 6000 to "fix" that took the phase from 77s to 253s
+    /// and hit the new cap too, because the model simply expands its reasoning to fill
+    /// whatever budget it is given. The plan was no better. So the cap is not a truncation
+    /// to be repaired, it is a BRAKE — the only thing bounding how long a reasoning model
+    /// will deliberate over a fridge — and compose does fine on the summary it yields.
+    /// </para>
+    ///
+    /// <para>
+    /// Which is why this constant is not simply "the same number as before": the number is
+    /// unchanged and the reason for it is now written down, so the next person to notice the
+    /// cap being hit does not repeat the experiment.
+    /// </para>
+    /// </summary>
+    private const int GroundingMaxTokens = 2500;
+
+    /// <summary>The daily adaptation's original ceiling, kept: it is a small patch, it has
+    /// never been observed to run out, and the grounding experiment above is the argument
+    /// against raising a limit that is not failing.</summary>
+    private const int AdaptMaxTokens = 2000;
 
     /// <summary>
     /// How long ONE provider call may take before it is treated as a hang.
@@ -573,7 +672,7 @@ public sealed class GoalAgent
             {
                 try
                 {
-                    content = await GetComposeContentAsync(chat, history, ct);
+                    content = (await GetComposeContentAsync(chat, history, ComposeSiteDecompose, ct)).Raw;
                     break;
                 }
                 catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
@@ -637,13 +736,55 @@ public sealed class GoalAgent
         - capabilities: which listed modules the step will likely use. Advisory.
         - Do NOT state world facts (what is in the fridge, who is busy). You cannot
           see the world here; a later pass grounds each step against it.
+        - The steps must be steps of the contract's DOMAIN. The household's standing
+          food rules ride on EVERY contract — allergens, dietary, sodium — and they are
+          there to be enforced, not to be planned around. A home being made ready for a
+          trip is not a meal week however many food rules are attached to it, so do not
+          write meal, recipe, or grocery steps unless the domain is genuinely about food.
         """;
 
-    /// <summary>The decompose instruction: the contract + what this device can actually do.</summary>
+    /// <summary>
+    /// What the STEPS of one domain are about — the decompose half of
+    /// <see cref="PlanShapeRule"/>, and the reason it is a separate string.
+    ///
+    /// <para>
+    /// v7.1 bug: compose was domain-shaped and decompose was not. The contract was
+    /// serialized into both, but only compose was told what shape to make, so the only
+    /// domain signal decompose had was a `domain` field competing with a `hard` block
+    /// spelling out the family's allergens and dietary rules — on EVERY goal, because
+    /// household constraints are household-wide. A toolless model reading that broke
+    /// "get my home ready" into meal-planning steps, and the board dutifully showed
+    /// them. Naming the shape here is what closes it.
+    /// </para>
+    ///
+    /// <para>
+    /// Deliberately NOT <see cref="PlanShapeRule"/> reused: that string describes plan
+    /// ITEMS ("EXACTLY 7 dinner plan items", "plan the first meal back") and feeding it
+    /// to a pass that is choosing task titles would pull the count and the vocabulary of
+    /// the plan into the task DAG — including, for vacation_prep, the word "meal".
+    /// </para>
+    /// </summary>
+    internal static string DecomposeShapeRule(string domain) => domain switch
+    {
+        "meal_plan" => "the steps of planning a week of dinners for the household.",
+        "guest_dinner" => "the steps of hosting a dinner for guests, from menu to the table.",
+        "vacation_prep" =>
+            "the steps of getting a home ready for the family to LEAVE and ready for them "
+            + "to COME BACK — perishables, standing deliveries, appliances, security, and "
+            + "the return. Not dinners: nobody is home.",
+        "birthday_party" => "the steps of putting on a birthday party.",
+        "grocery_cost" => "the steps of bringing the grocery spend down.",
+        "energy_saving" => "the steps of cutting the home's energy use.",
+        _ => "infer the steps from the objective — concrete work toward THAT outcome, and nothing else.",
+    };
+
+    /// <summary>The decompose instruction: the contract, its domain shape, and what this device can actually do.</summary>
     private string BuildDecomposeInstruction(Dispatch dispatch)
         => $"""
         Task Contract:
         {ContractJson.Serialize(dispatch)}
+
+        This contract's domain is "{dispatch.Domain}". Its steps are {DecomposeShapeRule(dispatch.Domain)}
 
         Capabilities available on this device:
         {string.Join("\n", _capabilities.Descriptors.Where(d => d.Available).Select(d => $"- {d.Name}"))}
@@ -706,8 +847,22 @@ public sealed class GoalAgent
         "guest_dinner" =>
             "a menu that honors guest dietary constraints, plus a prep timeline whose plan item \"when\" values include times where useful (YYYY-MM-DDTHH:mm), shopping proposals for missing ingredients, appliance prep proposals, and reminders. "
             + "Prefer concrete appliance proposals when the grounded appliances support them: Appliance.PreheatOven before an oven-warmed dish, Appliance.RunProgram for dishwasher cleanup before quiet_hours, and Appliance.Defrost only when a frozen item needs thawing.",
+        // v7: TWO phases, and the second one is the point. A checklist that ends at the
+        // front door has planned a departure, not a trip — the family comes back to a
+        // house that has been shut for two days, a fridge that was deliberately emptied,
+        // and every subscription still paused. Return readiness is what makes this a goal
+        // with an end rather than a list with a deadline.
         "vacation_prep" =>
-            "a pre-departure checklist, NOT meals: finish or freeze the perishables that would spoil while the house is empty, clear the shopping list of standing orders, set appliances to eco or off, run the dishwasher before leaving, then lock up and arm security for the away period. Security.LockAllDoors and Security.ArmSecurity belong here.",
+            "TWO phases, in order. "
+            + "BEFORE LEAVING: finish or freeze the perishables that would spoil while the house is empty, "
+            + "hold the non-essential standing deliveries for the away window (Deliveries.Hold — never the essential ones), "
+            + "hand the house to the SmartThings away routine by setting appliances to eco or off, "
+            + "run the dishwasher before leaving, then lock up and arm security "
+            + "(Security.LockAllDoors and Security.ArmSecurity belong here). "
+            + "RETURN READINESS, dated on or after the return: resume the held deliveries (Deliveries.Resume), "
+            + "run the robot vacuum so the house is clean to come back to (Appliance.RunProgram on \"rvc\"), "
+            + "and plan the first meal back against a fridge that was deliberately emptied. "
+            + "NOT meals for the away days — nobody is home to eat them.",
         "birthday_party" =>
             "invitations and headcount, cake and supplies costed inside the budget cap, and a day-of schedule.",
         "grocery_cost" =>
@@ -743,13 +898,24 @@ public sealed class GoalAgent
           Security.ArmSecurity args {"mode":"away"}
           Notify.SendNotification args {"member":"Priya","message":"..."}
           Notify.Announce args {"message":"...","date":"YYYY-MM-DD","time":"HH:mm"}
+          Deliveries.Hold args {"delivery":"milk subscription","until":"YYYY-MM-DD"}
+          Deliveries.Resume args {"delivery":"milk subscription"}
         - Do not invent proposal functions such as Appliance.Preheat, Reminders.Add, or Reminder.Create.
+        - Deliveries.Hold REFUSES an essential delivery (medication and the like). Read the
+          `essential` flag from the grounded list and never propose holding one.
         - PLAN SHAPE for this goal's domain ({{dispatch.Domain}}) — {{PlanShapeRule(dispatch.Domain)}}
         - Do not propose ingredients or recipes that violate hard constraints.
         - Propose AT MOST 5 side-effecting actions. NEVER emit duplicate proposals. Consolidate a
           recurring action (e.g. a nightly dishwasher run) into ONE proposal, not one per night. Keep
           the plan tight — fewer, higher-value proposals.
         - Use ISO dates inside the contract time_window. Never use a hardcoded anchor date.
+        - EVERY plan item needs a "why". Write it as cause then effect, naming the real fact
+          that drove it ("spinach expires Tuesday", "780 kcal burned yesterday") — not a
+          restatement of the title. It is shown under the item, so one short line.
+        - "considered" is how many options you weighed, and "rejected" is the ones you did
+          NOT take with the reason for each. Report them honestly: if a hard constraint ruled
+          something out, say which constraint. If you weighed nothing, omit both rather than
+          inventing a number — a fabricated rejection is worse than a missing one.
         - The response must start with { and end with }. Do not output whitespace, Markdown, code fences, or prose outside the JSON object.
 
         Final answer must be only valid JSON with this shape:
@@ -762,6 +928,8 @@ public sealed class GoalAgent
             {"proposal_id":"p2","action":"place grocery order","module":"ShoppingList","function":"PlaceOrder","args":{"estimatedTotal":42.50},"tier":"firm","reason":"...","requires_approval":true}
           ],
           "impact": [{"label":"waste","value":"uses 2 expiring items"}],
+          "considered": 17,
+          "rejected": [{"option":"pork belly stir-fry","reason":"no pork"}],
           "explanation": "one concise paragraph"
         }
         """;
@@ -796,6 +964,9 @@ public sealed class GoalAgent
         // in the abstract.
         using var policy = await _safety.BeginGoalAsync(dispatch.GoalId, dispatch.Constraints.Hard, ct);
         _safety.SetTrace(_trace);
+        // Fresh memory of what this goal has already read. Scoped to the run, so nothing
+        // a previous plan (or a previous simulated day) learned can answer for this one.
+        _repeatReads.Reset(_trace);
 
         _logger.LogInformation("plan_start domain={Domain} model_clock={Today}", dispatch.Domain, _clock.Today);
         // PRE-CHECK GATE 1: can this goal be planned at all? Before a single token
@@ -814,13 +985,22 @@ public sealed class GoalAgent
                 note: precheck.Results.FirstOrDefault(r => r.Blocks)?.Detail ?? "world not ready", verdict: "blocked");
             return BuildPrecheckBlockedPlan(dispatch, precheck);
         }
-        await _trace.HarnessAsync(HarnessModules.Precheck, HarnessStatuses.Pass, note: "The world is ready", verdict: "ready");
+        // v7 COUNTED VERDICTS. Every verdict below reports a real number the engine
+        // measured. "grounded" and "ready" were true and said nothing — a pipeline that
+        // only reports that it ran is an animation, and the reader learns to stop looking
+        // at it. Nothing here is computed for the display: these are counts the run
+        // already had in hand.
+        await _trace.HarnessAsync(HarnessModules.Precheck, HarnessStatuses.Pass,
+            note: "The world is ready", verdict: $"ready · {precheck.Results.Count} probe(s)");
 
         // CAPABILITY MANAGER: the tool surface the planner is allowed to reach for.
-        var toolCount = GroundingFunctions().Count;
+        var groundingFns = GroundingFunctions();
+        var toolCount = groundingFns.Count;
+        var moduleCount = groundingFns.Select(f => f.PluginName).Distinct(StringComparer.Ordinal).Count();
         await _trace.HarnessAsync(HarnessModules.CapabilityManager, HarnessStatuses.Active, note: "Discovering the device's tool surface…");
         await DwellAsync(ct);
-        await _trace.HarnessAsync(HarnessModules.CapabilityManager, HarnessStatuses.Done, note: $"{toolCount} tools available", verdict: $"{toolCount} tools");
+        await _trace.HarnessAsync(HarnessModules.CapabilityManager, HarnessStatuses.Done,
+            note: $"{toolCount} tools available", verdict: $"{toolCount} tools · {moduleCount} modules");
 
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
 
@@ -843,17 +1023,32 @@ public sealed class GoalAgent
         {
             FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(GroundingFunctions(), autoInvoke: true, options: new FunctionChoiceBehaviorOptions
             {
+                // Invocation stays SERIAL: the SafetyFilter arms and records per goal, and
+                // the trace numbers tool_call/tool_result in sequence. Neither wants two
+                // functions running at once, and grounding is not CPU-bound anyway.
                 AllowConcurrentInvocation = false,
-                AllowParallelCalls = false
+                // ...but the model may now ASK for several reads in one assistant turn.
+                // This was false from the first SK milestone, with no recorded reason, and
+                // it meant every single read cost its own full round-trip to a reasoning
+                // model. A meal plan reads inventory, the calendar, the workout routine,
+                // expiring items and the recipe box — five sequential round-trips to learn
+                // five independent facts, none of which depends on another.
+                AllowParallelCalls = true
             }),
             Temperature = 0.2,
-            MaxTokens = 2500
+            MaxTokens = GroundingMaxTokens
         };
 
+        var toolsBefore = _trace.ToolCallCount;
         var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
-        _logger.LogInformation("grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars}",
-            dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length);
-        await _trace.HarnessAsync(HarnessModules.Grounding, HarnessStatuses.Done, note: "Context assembled from the live world", verdict: "grounded");
+        var toolsUsed = _trace.ToolCallCount - toolsBefore;
+        _logger.LogInformation("grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars} tool_calls={Tools}",
+            dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length, toolsUsed);
+        await _trace.HarnessAsync(HarnessModules.Grounding, HarnessStatuses.Done,
+            note: "Context assembled from the live world",
+            // What it actually READ, not merely that it finished. The model chooses how
+            // many tools to call, so this number is genuinely per-run.
+            verdict: toolsUsed > 0 ? $"grounded · {toolsUsed} read(s)" : "grounded");
 
         if (groundingSummary.Length > 0)
         {
@@ -862,13 +1057,42 @@ public sealed class GoalAgent
 
         await _trace.PhaseAsync("planning");
         await _trace.HarnessAsync(HarnessModules.Planner, HarnessStatuses.Active, note: "Composing the plan…");
+
+        // v7 — THE PLANNER STOPS BEING SILENT. The compose call is not streamed and
+        // deliberately keeps its plan JSON off the thinking channel, so through v6 this
+        // engine emitted nothing at all on a healthy run: the drawer was blank for the
+        // longest stretch of the run, and a silent engine looks exactly like a broken one.
+        // It cannot narrate what it is thinking — but it can say what it is thinking
+        // AGAINST, and that is knowable before the call and true every time.
+        var hardCount = CountHardConstraints(dispatch);
+        await _trace.ThinkingStepAsync(
+            "Composing the plan",
+            $"{taskDag.Count} task(s) · {toolCount} tools · {hardCount} household rule(s) to hold");
         await DwellAsync(ct);
         var composeClock = Stopwatch.StartNew();
         var modelPlan = await ComposeModelPlanAsync(chat, history, dispatch, ct);
-        _logger.LogInformation("compose_done goal={GoalId} elapsed_ms={Elapsed} items={Items} proposals={Proposals}",
-            dispatch.GoalId, composeClock.ElapsedMilliseconds, modelPlan.Plan.Count, modelPlan.Proposals.Count);
+        _logger.LogInformation("compose_done goal={GoalId} elapsed_ms={Elapsed} items={Items} proposals={Proposals} considered={Considered} rejected={Rejected}",
+            dispatch.GoalId, composeClock.ElapsedMilliseconds, modelPlan.Plan.Count, modelPlan.Proposals.Count,
+            modelPlan.Considered, modelPlan.Rejected?.Count ?? 0);
         modelPlan = modelPlan with { Plan = AssignPlanDays(modelPlan.Plan, dispatch.Domain, _clock.Today) };
-        await _trace.HarnessAsync(HarnessModules.Planner, HarnessStatuses.Done, note: $"{modelPlan.Plan.Count} steps drafted", verdict: $"{modelPlan.Plan.Count} steps");
+
+        await _trace.ThinkingStepAsync(
+            $"Drafted {modelPlan.Plan.Count} step(s)",
+            modelPlan.Proposals.Count == 0
+                ? "nothing that needs a decision from you"
+                : $"{modelPlan.Proposals.Count} action(s) to put to you");
+        // The discarded branches — the one thing the run knew and could never show, because
+        // they vanished inside a single compose call and the plan arrived looking like the
+        // only plan there was. Model-authored, so displayed and never enforced.
+        if (modelPlan.Rejected is { Count: > 0 } rejected)
+        {
+            await _trace.ThinkingStepAsync(
+                $"Rejected {rejected.Count} option(s)",
+                string.Join(" · ", rejected.Take(4).Select(r => $"{r.Option} ({r.Reason})")));
+        }
+        await _trace.HarnessAsync(HarnessModules.Planner, HarnessStatuses.Done,
+            note: $"{modelPlan.Plan.Count} steps drafted",
+            verdict: PlannerVerdict(modelPlan.Plan.Count, modelPlan.Considered, modelPlan.Rejected?.Count ?? 0));
 
         await _trace.PhaseAsync("checking");
 
@@ -882,13 +1106,19 @@ public sealed class GoalAgent
             await _trace.HarnessAsync(HarnessModules.Safety, HarnessStatuses.Block,
                 note: safetyViolations[0], verdict: $"{safetyViolations.Length} blocked", grade: safetyGate);
         else
+            // "allowed" alone reads as "the engine had nothing to do". It held N rules over
+            // every call the model made, and that is the claim the whole demo rests on.
             await _trace.HarnessAsync(HarnessModules.Safety, HarnessStatuses.Pass,
-                note: "Every action within policy", verdict: "allowed", grade: safetyGate);
+                note: "Every action within policy",
+                verdict: hardCount > 0 ? $"allowed · {hardCount} rule(s) held" : "allowed",
+                grade: safetyGate);
 
         // TASK MANAGER: the goal ledger the whole plan hangs off (the DAG grounded above).
         await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Active, note: "Recording the goal ledger…");
         await DwellAsync(ct);
-        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Done, note: $"{taskDag.Count} task(s) tracked", verdict: $"{taskDag.Count} tasks");
+        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Done,
+            note: $"{taskDag.Count} task(s) tracked",
+            verdict: $"{taskDag.Count} tasks · {modelPlan.Plan.Count} steps");
 
         // Collapse duplicate proposals the model sometimes emits (e.g. the same
         // "run dishwasher" action repeated per night) — dedupe by module+function+args
@@ -934,7 +1164,13 @@ public sealed class GoalAgent
                 Precheck = ToPrecheckVerdict(precheck),
                 Impact = modelPlan.Impact,
                 DemoEvents = demoEvents,
-                Explanation = modelPlan.Explanation
+                Explanation = modelPlan.Explanation,
+                // v7, model-authored and display-only: what it weighed and what it threw
+                // away. Nothing downstream reads these — a wrong rejection reason costs a
+                // wrong sentence, which is the right price for the clearest evidence a
+                // person can be given that something reasoned rather than looked up.
+                Considered = modelPlan.Considered,
+                Rejected = modelPlan.Rejected
             }
         };
 
@@ -1025,10 +1261,10 @@ public sealed class GoalAgent
                 history.AddUserMessage(BuildPlanningRetryInstruction(lastError ?? "Planner did not return a valid JSON object."));
             }
 
-            string raw;
+            ComposeContent composed;
             try
             {
-                raw = await GetComposeContentAsync(chat, history, ct);
+                composed = await GetComposeContentAsync(chat, history, ComposeSiteCompose, ct);
             }
             catch (Exception ex) when (IsTransientProviderError(ex, ct))
             {
@@ -1045,6 +1281,7 @@ public sealed class GoalAgent
                 continue;
             }
 
+            var raw = composed.Raw;
             if (!string.IsNullOrWhiteSpace(raw))
             {
                 // Raw plan JSON must NOT hit the thinking wire channel (ugly if
@@ -1056,6 +1293,14 @@ public sealed class GoalAgent
             if (TryParseModelPlan(raw, out var modelPlan, out var error))
             {
                 return modelPlan;
+            }
+
+            // JSON mode that returns UNPARSEABLE content has failed just as surely as JSON
+            // mode that returns nothing — the measured symptom was a lone `{`. Counting only
+            // the empty case would leave the truncating model paying the toll forever.
+            if (composed.UsedResponseFormat)
+            {
+                await DisableJsonModeAsync(ComposeSiteCompose, "returned content that would not parse as JSON");
             }
 
             lastError = error;
@@ -1070,12 +1315,83 @@ public sealed class GoalAgent
         throw new JsonException(failure);
     }
 
-    private async Task<string> GetComposeContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
+    /// <summary>The two call sites that ask for a JSON object, tracked separately — see _jsonMode.</summary>
+    private const string ComposeSiteDecompose = "decompose";
+    private const string ComposeSiteCompose = "compose";
+
+    /// <summary>What one compose call produced, and whether json_object was used to get it.</summary>
+    private readonly record struct ComposeContent(string Raw, bool UsedResponseFormat);
+
+    /// <summary>
+    /// Does this model/provider pair honour <c>response_format: json_object</c>? Learned,
+    /// not configured — see <see cref="GetComposeContentAsync"/>.
+    /// </summary>
+    private enum JsonModeHealth { Untried = 0, Works = 1, Broken = 2 }
+
+    /// <summary>
+    /// Per-PROCESS, PER-CALL-SITE memory of the answer. Planning is serialized by
+    /// <c>_planLock</c>, so a plain dictionary is enough; it is deliberately not persisted,
+    /// because the operator can change OPENROUTER_MODEL between runs and a stale verdict
+    /// would outlive the model it was about.
+    ///
+    /// <para>
+    /// PER-SITE, and the measurement is why. Decompose and compose issue the same KIND of
+    /// call and get different answers: decompose's history is short and json_object works,
+    /// compose's carries the whole grounding tool loop and it does not. A single verdict
+    /// shared between them would let compose's failure switch off a mode decompose was using
+    /// happily — a fix that quietly degrades the call that was never broken.
+    /// </para>
+    /// </summary>
+    private readonly Dictionary<string, JsonModeHealth> _jsonMode = new(StringComparer.Ordinal);
+
+    private JsonModeHealth JsonModeFor(string site)
+        => _jsonMode.TryGetValue(site, out var health) ? health : JsonModeHealth.Untried;
+
+    /// <summary>
+    /// The compose call, and the one place that decides whether to ask for JSON mode.
+    ///
+    /// <para>
+    /// THE COST THIS REMOVES. `openai/gpt-oss-120b` through OpenRouter answers THIS compose
+    /// request, carrying <c>response_format: json_object</c>, with EMPTY content — a measured
+    /// run spent 188 completion tokens producing nothing at all — or occasionally with a
+    /// truncated object (`{`). Either way the fallback below re-composes with a strict prompt
+    /// and no response_format, and THAT call returns the plan. The old code paid the toll on
+    /// every plan, forever: a wasted round-trip of ~20s and its tokens, plus a
+    /// `planner_notice` in the user's transcript describing a failure that had become routine.
+    /// </para>
+    ///
+    /// <para>
+    /// AND IT IS NOT SIMPLY "THIS MODEL CANNOT DO JSON MODE" — measured, because the obvious
+    /// conclusion was wrong. The same model, same parameters, same task on a SHORT prompt
+    /// honours json_object four times out of four (finish=stop, ~1-2k chars of content). The
+    /// failure needs the compose history: two calls a few seconds apart, 5646 vs 5651 prompt
+    /// tokens, differing ONLY in response_format — 188 tokens and nothing, versus 3677 tokens
+    /// and a plan. What compose carries that the probe does not is the whole grounding
+    /// auto-invoke loop, tool calls and tool results included. Do not "fix" this by observing
+    /// that the model handles json_object fine in isolation. It does. It does not handle it
+    /// here.
+    /// </para>
+    ///
+    /// <para>
+    /// That is exactly why the verdict is learned FROM THE REAL CALL rather than configured:
+    /// the only measurement that predicts this one is this one. The first compose of the
+    /// process still tries JSON mode — it genuinely helps where it works, and hard-coding it
+    /// off would punish models that honour it — but one that fails is not asked again, and
+    /// every later plan goes straight to the strict path.
+    /// </para>
+    /// </summary>
+    private async Task<ComposeContent> GetComposeContentAsync(
+        IChatCompletionService chat, ChatHistory history, string site, CancellationToken ct)
     {
+        if (JsonModeFor(site) == JsonModeHealth.Broken)
+        {
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
+        }
+
         var jsonSettings = new OpenAIPromptExecutionSettings
         {
             Temperature = 0.1,
-            MaxTokens = 6000,
+            MaxTokens = ComposeMaxTokens,
             ResponseFormat = "json_object"
         };
 
@@ -1086,21 +1402,37 @@ public sealed class GoalAgent
             var content = response.Content ?? "";
             if (!string.IsNullOrWhiteSpace(content))
             {
-                return content;
+                _jsonMode[site] = JsonModeHealth.Works;
+                return new ComposeContent(content, true);
             }
 
-            var note = "planner_notice: provider returned empty content with JSON response_format; retrying compose with strict JSON prompt only.";
-            _logger.LogWarning("{Note}", note);
-            await _trace.ThinkingAsync(note);
-            return await GetStrictComposeContentAsync(chat, history, ct);
+            await DisableJsonModeAsync(site, "returned empty content");
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
         }
         catch (Exception ex) when (LooksLikeResponseFormatRejection(ex))
         {
-            var note = $"planner_notice: provider rejected JSON response_format; retrying compose with strict JSON prompt only. Error: {ex.Message}";
-            _logger.LogWarning(ex, "{Note}", note);
-            await _trace.ThinkingAsync(note);
-            return await GetStrictComposeContentAsync(chat, history, ct);
+            await DisableJsonModeAsync(site, $"rejected the parameter ({ex.Message})");
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
         }
+    }
+
+    /// <summary>
+    /// Record that JSON mode does not work here, and say so ONCE.
+    ///
+    /// Once, because the note is only news the first time: after that it describes a
+    /// decision already taken, and a transcript that repeats "retrying compose…" on every
+    /// plan teaches the reader to ignore planner notices — including the ones that matter.
+    /// </summary>
+    private async Task DisableJsonModeAsync(string site, string what)
+    {
+        if (JsonModeFor(site) == JsonModeHealth.Broken)
+        {
+            return;
+        }
+        _jsonMode[site] = JsonModeHealth.Broken;
+        var note = $"planner_notice: this model {what} for JSON response_format on the {site} call — using a strict JSON prompt instead, for this and every later plan.";
+        _logger.LogWarning("json_mode_disabled site={Site} reason={Reason}", site, what);
+        await _trace.ThinkingAsync(note);
     }
 
     private async Task<string> GetStrictComposeContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
@@ -1108,7 +1440,7 @@ public sealed class GoalAgent
         var strictSettings = new OpenAIPromptExecutionSettings
         {
             Temperature = 0.1,
-            MaxTokens = 6000
+            MaxTokens = ComposeMaxTokens
         };
         using var cts = Deadline(ct, _llmCallBudget);
         var response = await chat.GetChatMessageContentAsync(history, strictSettings, _kernel, cts.Token);
@@ -1125,7 +1457,7 @@ public sealed class GoalAgent
         plan — do not rewrite rows the change doesn't touch. Reply with a MINIMAL
         JSON patch and nothing else (no prose, no Markdown, no code fence):
         {
-          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "day": 1, "title": "...", "detail": "...", "why": ["short reason"] } ],
+          "upsert": [ { "id": "<existing id to REPLACE, or a new id to ADD>", "day": 1, "title": "...", "detail": "...", "why": ["short reason"], "status": "planned|skipped", "status_reason": "only when skipped" } ],
           "remove": ["<id to drop>"],
           "impact_delta": [ { "label": "waste", "value": "-2 items" } ],
           "rationale": "one sentence explaining the change"
@@ -1160,12 +1492,116 @@ public sealed class GoalAgent
         return proposal;
     }
 
-    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, GoalRecord active, WorldChange change, CancellationToken ct, string? eventId = null)
+    /// <summary>
+    /// v7 — ANOTHER GOAL CHANGED THIS ONE, and the user already said yes.
+    ///
+    /// <para>
+    /// The account re-resolved this goal's constraints because a DIFFERENT goal was
+    /// approved (the family is away Thursday and Friday, so a meal week has two days it
+    /// should not be planning dinners for). This is the only adaptation path that does not
+    /// open an approval, and the reason is not convenience: every other change in the
+    /// system is something the WORLD did, so a person decides what to do about it — this
+    /// one is something the person already decided, arriving at a goal that had not heard.
+    /// Asking again would be asking the same question twice.
+    /// </para>
+    ///
+    /// <para>
+    /// So the plan changes and the board SAYS so. The status carries the new plan, the
+    /// changed ids and a sentence in the user's terms; the card shows one line and the
+    /// detail page a dismissible notice. Informational, not an approval — there is
+    /// nothing left to decide.
+    /// </para>
+    /// </summary>
+    private async Task<(Status Status, Proposal? Adaptation)> ApplyConstraintChangeAsync(
+        Control control, string? correlationId, CancellationToken ct)
+    {
+        var active = _tasks.GetGoal(control.GoalId);
+        if (active is null)
+        {
+            return (BuildMonitoringStatus(control.GoalId, correlationId, false,
+                "constraints changed, but no active goal is being monitored", null), null);
+        }
+
+        // POLICY PUSHES DOWN, and this is still the account's block — the device re-arms
+        // from what it was sent and authors nothing.
+        if (control.Payload?.Hard is { } hard)
+        {
+            await _safety.ReDispatchAsync(control.GoalId, (JsonObject)hard.DeepClone(), ct);
+            _logger.LogInformation("constraints_redispatched goal={GoalId} keys={Keys}",
+                control.GoalId, string.Join(",", hard.Select(p => p.Key)));
+        }
+
+        var steer = control.Payload?.Steer;
+        if (string.IsNullOrWhiteSpace(steer))
+        {
+            return (BuildMonitoringStatus(control.GoalId, correlationId, false,
+                "constraints changed, but no steer was sent — leaving the plan alone", null), null);
+        }
+
+        var note = control.Payload?.Note ?? "Your household rules changed and this plan was updated.";
+        var change = new WorldChange
+        {
+            // Stable and value-derived, so the same change arriving twice (a re-sent
+            // approval, a reconnect) adapts once.
+            Key = $"constraints:{Hash(steer)}",
+            Kind = "constraints.changed",
+            Description = note,
+            AffectedPlanItems = [],
+            // Deliberately NO TargetItemId: this is not a one-day swap, and leaving it
+            // null is what lets NormalizeAdaptationPatch keep every row the model returns
+            // instead of collapsing the patch to a single upsert.
+            RecommendedAction = "update the plan",
+            Steer = steer,
+            Material = true
+        };
+
+        if (!active.EmittedMaterialChanges.Add(change.Key))
+        {
+            return (BuildMonitoringStatus(control.GoalId, correlationId, false,
+                "this constraint change was already applied", null), null);
+        }
+
+        await _trace.ThinkingStepAsync("Another goal changed this one", note);
+        await _trace.PhaseAsync("adapting");
+        var proposal = await AdaptWithHarnessAsync(control.GoalId, change, () =>
+            ProposeDailyAdaptationAsync(control.GoalId, active, change, ct,
+                instruction: BuildConstraintAdaptInstruction(active.Plan, change),
+                requiresApproval: false), ct);
+
+        if (proposal is null)
+        {
+            return (BuildMonitoringStatus(control.GoalId, correlationId, false,
+                $"{note} Nothing in the plan needed to move.", null), null);
+        }
+
+        // APPLIED HERE, not on an approval that is never coming.
+        var applied = ApplyPendingPatch(proposal.Payload.ProposalId);
+        var status = BuildMonitoringStatus(control.GoalId, correlationId, true, note, null);
+        return (status with
+        {
+            TaskStatus = TaskStatuses.Monitoring,
+            Payload = status.Payload with
+            {
+                UpdatedPlan = applied.Updated,
+                ChangedIds = applied.ChangedIds,
+                ImpactDelta = applied.ImpactDelta,
+                // The board reads this to decide the card's line. Informational: the
+                // plan HAS changed, and there is nothing to approve.
+                PlanChangedNote = note
+            }
+        }, null);
+    }
+
+    /// <summary>A short stable key from a string — dedupe only, never security.</summary>
+    private static string Hash(string text)
+        => Convert.ToHexString(System.Security.Cryptography.MD5.HashData(System.Text.Encoding.UTF8.GetBytes(text)))[..8];
+
+    private async Task<Proposal?> ProposeDailyAdaptationAsync(string goalId, GoalRecord active, WorldChange change, CancellationToken ct, string? eventId = null, string? instruction = null, bool requiresApproval = true)
     {
         var chat = _kernel.Services.GetRequiredService<IChatCompletionService>();
         var history = new ChatHistory();
         history.AddSystemMessage(AdaptSystemPrompt);
-        history.AddUserMessage(BuildAdaptInstruction(active.Plan, change));
+        history.AddUserMessage(instruction ?? BuildAdaptInstruction(active.Plan, change));
 
         PlanPatch? patch = null;
         string? lastError = null;
@@ -1184,6 +1620,20 @@ public sealed class GoalAgent
             if (TryParsePlanPatch(raw, out var parsedPatch, out var error) && (parsedPatch.Upsert.Count > 0 || parsedPatch.Remove.Count > 0))
             {
                 patch = NormalizeAdaptationPatch(active.Plan, change, parsedPatch);
+                // Normalising can empty a patch that arrived non-empty — every row the
+                // model wanted to change turned out to be a day the household already
+                // emptied (DropSkippedRows). Nothing to propose, and raising an approval
+                // for a no-op would be the plan asking permission to stay the same.
+                if (patch.Upsert.Count == 0 && patch.Remove.Count == 0)
+                {
+                    _logger.LogInformation(
+                        "adaptation_patch_empty_after_normalize kind={Kind} — every target row is skipped",
+                        change.Kind);
+                    await _trace.ThinkingStepAsync(
+                        "Nothing to change",
+                        "the day this affects is already empty — you're away");
+                    return null;
+                }
                 break;
             }
 
@@ -1213,7 +1663,7 @@ public sealed class GoalAgent
             Function = PlanPatchFunction,
             Tier = ApprovalTiers.Adapt,
             Reason = patch.Rationale,
-            RequiresApproval = true
+            RequiresApproval = requiresApproval
         });
         _pendingPatches[proposalId] = (goalId, patch);
         _logger.LogInformation("adaptation_proposed {ProposalId} kind={Kind} upsert={Upsert} remove={Remove}", proposalId, change.Kind, patch.Upsert.Count, patch.Remove.Count);
@@ -1230,10 +1680,49 @@ public sealed class GoalAgent
                 Trigger = change.Description,
                 EventId = eventId,
                 Tier = ApprovalTiers.Adapt,
-                RequiresApproval = true,
+                RequiresApproval = requiresApproval,
                 Patch = patch
             }
         };
+    }
+
+    /// <summary>
+    /// The multi-row instruction for a constraint change (v7).
+    ///
+    /// <para>
+    /// Separate from <see cref="BuildAdaptInstruction"/> because that one says "change
+    /// ONLY the Day N dinner" — correct for a world event that lands on one day, and
+    /// exactly wrong here: an away window covers several days and usually moves the ones
+    /// around it too. It also has to teach the model the `status` field, which is the
+    /// point of the whole exercise: a skipped day is KEPT, greyed, with its reason, so
+    /// the change is visible instead of the plan just being shorter.
+    /// </para>
+    /// </summary>
+    private static string BuildConstraintAdaptInstruction(IReadOnlyList<PlanItem> plan, WorldChange change)
+    {
+        var planLines = string.Join("\n", plan.Select(p =>
+            $"- Day {p.Day} | {p.Id} | {p.When ?? "-"} | {p.Title}"));
+        return $"""
+            CURRENT PLAN (day | id | date | title):
+            {planLines}
+
+            WHAT CHANGED: {change.Description}
+            HOW TO ADAPT: {change.Steer}
+
+            Rules for this patch:
+            - Upsert EVERY row that needs to change, reusing each row's exact existing id.
+              This is not a single-day swap.
+            - To mark a day as deliberately empty, upsert it with "status":"skipped" plus the
+              exact "title" and "status_reason" the steer gives you — copy them verbatim
+              rather than paraphrasing. These two strings are read by a person asking why a
+              day is empty, so "Skipped - away" is the wrong answer to that question even
+              though it is a true one.
+              NEVER put it in "remove": a deleted row makes the plan silently shorter and
+              nothing on screen says why.
+            - Keep each row's original date in "when". You are re-planning days, not moving them.
+            - Leave every unaffected row completely alone — do not restate it.
+            - Give each changed row a "why" that names the real cause.
+            """;
     }
 
     private static string BuildAdaptInstruction(IReadOnlyList<PlanItem> plan, WorldChange change)
@@ -1258,8 +1747,51 @@ public sealed class GoalAgent
             """;
     }
 
+    /// <summary>
+    /// The kind of change that is ALLOWED to write a skipped row — because it is the
+    /// change that writes them. Everything else must leave them alone; see
+    /// <see cref="DropSkippedRows"/>.
+    /// </summary>
+    private const string ConstraintChangeKind = "constraints.changed";
+
+    /// <summary>
+    /// A row the household has already emptied is not available to be re-planned.
+    ///
+    /// <para>
+    /// v7 bug: the family approved "we're away Sunday and Monday", the meal week marked
+    /// both days <c>skipped</c> — and then the next day tick fired "the paneer spoiled"
+    /// against Sunday, whose steer says "change tonight's dinner", and the model duly
+    /// cooked dinner on a day nobody is home. The world event was real; the day was not
+    /// available. Materiality is decided per-observer, but the guarantee has to hold for
+    /// every path that can produce a patch, so it is enforced here — the one funnel every
+    /// adaptation passes through — and not only where the change is raised.
+    /// </para>
+    ///
+    /// <para>
+    /// The single exception is the constraint change itself: that is the path that SETS
+    /// skipped rows, and it is also the only path that may legitimately clear them (the
+    /// trip is called off, the window moves). Anything else touching one is a mistake.
+    /// </para>
+    /// </summary>
+    internal static IReadOnlyList<PlanItem> DropSkippedRows(
+        IReadOnlyList<PlanItem> plan, WorldChange change, IReadOnlyList<PlanItem> upsert)
+    {
+        if (string.Equals(change.Kind, ConstraintChangeKind, StringComparison.Ordinal))
+        {
+            return upsert;
+        }
+
+        return upsert.Where(row =>
+        {
+            var existing = plan.FirstOrDefault(item => string.Equals(item.Id, row.Id, StringComparison.Ordinal));
+            return existing?.Status != PlanItemStatuses.Skipped;
+        }).ToArray();
+    }
+
     private static PlanPatch NormalizeAdaptationPatch(IReadOnlyList<PlanItem> plan, WorldChange change, PlanPatch patch)
     {
+        patch = patch with { Upsert = DropSkippedRows(plan, change, patch.Upsert) };
+
         if (change.TargetItemId is null || patch.Upsert.Count == 0)
         {
             return patch with { Upsert = AssignPatchDays(plan, patch.Upsert) };
@@ -1308,7 +1840,7 @@ public sealed class GoalAgent
         var settings = new OpenAIPromptExecutionSettings
         {
             Temperature = 0.2,
-            MaxTokens = 2000,
+            MaxTokens = AdaptMaxTokens,
             ResponseFormat = "json_object"
         };
         for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
@@ -1645,6 +2177,13 @@ public sealed class GoalAgent
         // ceiling before adapting against it.
         await _safety.ReResolveAsync(control.GoalId, ct);
         await _trace.PhaseAsync("monitoring");
+
+        // v7 — THE CROSS-GOAL PATH. Another goal changed the household, the user already
+        // approved that change, and this goal has not heard about it yet.
+        if (control.Command == ControlCommands.ConstraintsChanged)
+        {
+            return await ApplyConstraintChangeAsync(control, correlationId, ct);
+        }
 
         if (control.Command == ControlCommands.TriggerEvent)
         {
@@ -2099,5 +2638,10 @@ public sealed class GoalAgent
         public IReadOnlyList<ProposalItem> Proposals { get; init; } = [];
         public IReadOnlyList<ImpactItem> Impact { get; init; } = [];
         public string? Explanation { get; init; }
+
+        /// <summary>v7: how many options were weighed, and which were discarded and why.</summary>
+        public int? Considered { get; init; }
+
+        public IReadOnlyList<RejectedOption>? Rejected { get; init; }
     }
 }

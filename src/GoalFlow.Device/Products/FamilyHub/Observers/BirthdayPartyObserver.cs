@@ -35,7 +35,7 @@ public sealed class BirthdayPartyObserver : IDomainObserver
 
     public string Domain => "birthday_party";
 
-    public string Hint => "planning a child's birthday party — guest list, invitations, cake and decorations within budget, schedule";
+    public string Hint => "planning a child's birthday party AT HOME — guest list, invitations, cake and decorations, the day's schedule";
 
     public async Task<JsonObject> CaptureAsync(CancellationToken ct = default)
     {

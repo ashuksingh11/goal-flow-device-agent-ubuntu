@@ -68,6 +68,7 @@ services.AddSingleton<IActivePolicy>(sp => sp.GetRequiredService<ArmedPolicies>(
 services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
+services.AddSingleton<RepeatReadFilter>();
 services.AddSingleton<MonitorAdapt>();
 services.AddSingleton<PrecheckEngine>();
 
@@ -121,6 +122,7 @@ var agent = new GoalAgent(
     trace,
     provider.GetRequiredService<Grounding>(),
     provider.GetRequiredService<SafetyFilter>(),
+    provider.GetRequiredService<RepeatReadFilter>(),
     provider.GetRequiredService<ApprovalCoordinator>(),
     provider.GetRequiredService<MonitorAdapt>(),
     provider.GetRequiredService<CapabilityManager>(),
@@ -189,6 +191,44 @@ if (options.VerifyEnvelope)
     return;
 }
 
+// v7-M2 GATE: one Advance day reports two changes and opens one approval. Read-only
+// (it observes; it does not adapt or execute), so it needs no throwaway --data dir.
+if (options.VerifyDayTick)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyDayTickAsync(provider);
+    return;
+}
+
+// v7-M3 GATE: a thinking step is whole, and plain narration is byte-identical to v6.
+// Needs the kernel (it drives a real blocked call through the real filter).
+if (options.VerifyThinkingSteps)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyThinkingStepsAsync(provider);
+    return;
+}
+
+// v7-M4 GATE: the home-away goal can reach what its plan promises. MUTATES the world
+// (it really holds and resumes a delivery, and schedules a clean) — throwaway --data dir.
+if (options.VerifyAwayCapabilities)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyAwayCapabilitiesAsync(provider);
+    return;
+}
+
+// v7-M5 GATE: the one path that changes a plan without asking. Read-only.
+if (options.VerifyCrossGoal)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyCrossGoalAsync(provider);
+    return;
+}
+
+// v7 GATE: ...and the tick that comes after it must not undo it. Read-only.
+if (options.VerifyAwayImmune)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyAwayImmuneAsync(provider);
+    return;
+}
+
 // v6 GATE: the last gate before a real side effect must report a refusal AS a
 // refusal. Needs the agent (it drives the real approval path), so it sits after the
 // kernel is built. MUTATES the world (the allowed proposal really runs) — use a
@@ -216,9 +256,9 @@ if (options.VerifyPrechecks)
     return;
 }
 
-if (options.VerifySuggestions)
+if (options.VerifyRepeatReads)
 {
-    Environment.ExitCode = await ProgramHelpers.VerifySuggestionsAsync(provider);
+    Environment.ExitCode = await ProgramHelpers.VerifyRepeatReadsAsync(provider, loggerFactory);
     return;
 }
 
@@ -245,30 +285,6 @@ if (options.ConnectUrl is { } url)
     var connectLogger = loggerFactory.CreateLogger("Connect");
     await ws.ConnectAsync(capabilities);
 
-    // Proactive suggestions (v3-M8): scan local state and offer goals the family
-    // hasn't asked for. Emitted on connect (so the board shows them immediately) and
-    // after every control tick — advance_day / reset move the world, which can make
-    // new food expire or a restock no longer needed, so the list is recomputed rather
-    // than left stale.
-    var suggesters = provider.GetServices<ISuggester>().ToArray();
-    async Task EmitSuggestionsAsync()
-    {
-        try
-        {
-            var items = new List<SuggestionItem>();
-            foreach (var suggester in suggesters)
-            {
-                items.AddRange(await suggester.ScanAsync());
-            }
-            await ws.SendAsync(new SuggestionsMessage { Items = items });
-            connectLogger.LogInformation("suggestions emitted count={Count}", items.Count);
-        }
-        catch (Exception ex)
-        {
-            connectLogger.LogError(ex, "suggestion scan failed");
-        }
-    }
-    await EmitSuggestionsAsync();
     // Handle each frame on a BACKGROUND task so the receive loop keeps pumping —
     // planning takes 30-60s of LLM calls, and blocking the loop here means the
     // device can't answer WS pings, so the cloud's keepalive closes the socket
@@ -306,9 +322,6 @@ if (options.ConnectUrl is { } url)
                             await ws.SendAsync(status);
                             if (proposal is not null) await ws.SendAsync(proposal);
                         }
-                        // The world moved (advance_day / reset / set_date) — re-scan so a
-                        // suggestion that just came true or went stale is reflected.
-                        await EmitSuggestionsAsync();
                         break;
                 }
             }
@@ -403,6 +416,21 @@ internal sealed record CliOptions
     /// <summary>--verify-envelope — assert one goal's approved order narrows another's ceiling (v6-M3 gate).</summary>
     public bool VerifyEnvelope { get; init; }
 
+    /// <summary>--verify-day-tick — assert one tick reports two changes and opens one approval (v7-M2 gate).</summary>
+    public bool VerifyDayTick { get; init; }
+
+    /// <summary>--verify-thinking-steps — assert a step is whole and narration is v6-identical (v7-M3 gate).</summary>
+    public bool VerifyThinkingSteps { get; init; }
+
+    /// <summary>--verify-away-immune — assert a world event cannot re-plan a day marked away (v7 gate).</summary>
+    public bool VerifyAwayImmune { get; init; }
+
+    /// <summary>--verify-away-capabilities — assert Act 3's steps are reachable and graded (v7-M4 gate).</summary>
+    public bool VerifyAwayCapabilities { get; init; }
+
+    /// <summary>--verify-cross-goal — assert an un-asked re-plan arms from the account and applies once (v7-M5 gate).</summary>
+    public bool VerifyCrossGoal { get; init; }
+
     /// <summary>--verify-approval-block — assert a refused proposal is reported blocked, not executed (v6 gate).</summary>
     public bool VerifyApprovalBlock { get; init; }
 
@@ -412,11 +440,11 @@ internal sealed record CliOptions
     /// <summary>--verify-prechecks — assert the runtime gates pass, block and defer correctly (M3 gate).</summary>
     public bool VerifyPrechecks { get; init; }
 
-    /// <summary>--verify-suggestions — assert the proactive scan is deterministic and well-formed (M8 gate).</summary>
-    public bool VerifySuggestions { get; init; }
-
     /// <summary>--verify-trace-isolation — assert concurrent goals don't collide on goal_id/seq (M5 gate).</summary>
     public bool VerifyTraceIsolation { get; init; }
+
+    /// <summary>--verify-repeat-reads — no read is asked twice, and an unsatisfiable query says so (v7.1 gate 28).</summary>
+    public bool VerifyRepeatReads { get; init; }
 
     /// <summary>--verify-deadline — assert a stalled provider stream aborts rather than wedging a goal (M6 gate).</summary>
     public bool VerifyDeadline { get; init; }
@@ -465,11 +493,16 @@ internal sealed record CliOptions
                 "--verify-grades" => options with { VerifyGrades = true },
                 "--verify-active-policy" => options with { VerifyActivePolicy = true },
                 "--verify-envelope" => options with { VerifyEnvelope = true },
+                "--verify-day-tick" => options with { VerifyDayTick = true },
+                "--verify-thinking-steps" => options with { VerifyThinkingSteps = true },
+                "--verify-away-capabilities" => options with { VerifyAwayCapabilities = true },
+                "--verify-cross-goal" => options with { VerifyCrossGoal = true },
+                "--verify-away-immune" => options with { VerifyAwayImmune = true },
                 "--verify-approval-block" => options with { VerifyApprovalBlock = true },
                 "--verify-task-lifecycle" => options with { VerifyTaskLifecycle = true },
                 "--verify-prechecks" => options with { VerifyPrechecks = true },
-                "--verify-suggestions" => options with { VerifySuggestions = true },
                 "--verify-trace-isolation" => options with { VerifyTraceIsolation = true },
+                "--verify-repeat-reads" => options with { VerifyRepeatReads = true },
                 "--verify-deadline" => options with { VerifyDeadline = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
@@ -590,6 +623,117 @@ public static async Task<int> VerifyTraceIsolationAsync(ILoggerFactory loggerFac
 }
 
 /// <summary>
+/// v7.1 GATE 28: the same read is never asked twice, and a tool that cannot satisfy a
+/// query says so.
+///
+/// <para>
+/// WHAT THIS IS ABOUT. Grounding is one streaming call with auto-invoke, so every tool
+/// call inside it costs a round-trip to the model. A measured meal plan spent four and a
+/// half minutes calling <c>Recipes.FindRecipes</c> ten-plus times with arguments that
+/// differed only in the ORDER of the tag list — because the household prefers white meat,
+/// the box is entirely vegetarian, and the old filter answered a query it could not
+/// satisfy by returning everything in an unchanged order. Silence that looks like success
+/// is the worst thing a tool can hand an agent: its only recourse is to ask again.
+/// </para>
+///
+/// <para>
+/// NO LLM HERE. The filter is exercised through <c>kernel.InvokeAsync</c>, which runs the
+/// real invocation pipeline, so this gate tests the shipped path and not a mock of it.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyRepeatReadsAsync(IServiceProvider provider, ILoggerFactory loggerFactory)
+{
+    var failures = new List<string>();
+    void Check(bool ok, string what) { if (!ok) { failures.Add(what); Console.Error.WriteLine($"  FAIL {what}"); } }
+
+    // --- half one: FindRecipes reports what it could not match ---
+    var recipes = new RecipePlugin(provider.GetRequiredService<IProductApiAdapter>());
+
+    // `high_protein` is the exact word the planner reached for and the box does not use
+    // (its tag is `more_protein`); `soy_free` is simply invented. Both must come back named.
+    var hunted = await recipes.FindRecipes(["high_protein", "soy_free", "quick_prep"]);
+    var hdoc = System.Text.Json.Nodes.JsonNode.Parse(hunted)!.AsObject();
+    var unmatched = hdoc["unmatched_tags"]!.AsArray().Select(n => n!.GetValue<string>()).ToArray();
+    Check(unmatched.Contains("high_protein") && unmatched.Contains("soy_free"),
+        $"tags that exist in NO recipe are named back to the caller — got [{string.Join(",", unmatched)}]");
+    Check(hdoc["note"] is not null,
+        "an unsatisfiable query carries a note telling the caller not to search again — without it the model rephrases and loops");
+    Check(hdoc["available_tags"]!.AsArray().Count > 0,
+        "the reply publishes the box's real tag vocabulary, so the NEXT call can use words that exist");
+    Check(hdoc["recipes"]!.AsArray().Count > 0,
+        "an unmatched query still returns the box — the caller needs the facts, not only the refusal");
+
+    var real = await recipes.FindRecipes(["quick_prep"]);
+    var rdoc = System.Text.Json.Nodes.JsonNode.Parse(real)!.AsObject();
+    Check(rdoc["matched_tags"]!.AsArray().Count == 1 && rdoc["unmatched_tags"]!.AsArray().Count == 0,
+        "a tag that DOES exist is reported as matched, and raises no note");
+    Check(rdoc["note"] is null, "a satisfiable query is not lectured");
+
+    // v7.2 SEED: the household's preference must have something to prefer AND something to
+    // turn down. Through v7 every recipe was vegetarian, so `prefer_white_meat` could not
+    // move a single dinner and the considered/rejected line had nothing true to say.
+    var pref = await recipes.FindRecipes(["white_meat"]);
+    var pdoc = System.Text.Json.Nodes.JsonNode.Parse(pref)!.AsObject();
+    Check(pdoc["unmatched_tags"]!.AsArray().Count == 0,
+        "white_meat is a REAL tag now — the standing household preference can actually bite");
+    var box = pdoc["recipes"]!.AsArray().Select(n => n!.AsObject()).ToArray();
+    string[] TagsOf(System.Text.Json.Nodes.JsonObject r) =>
+        r["tags"]!.AsArray().Select(t => t!.GetValue<string>()).ToArray();
+    Check(box.Count(r => TagsOf(r).Contains("white_meat")) >= 3,
+        "the box carries white-meat dishes, so the preference has something to CHOOSE");
+    Check(box.Count(r => TagsOf(r).Contains("red_meat")) >= 2,
+        "...and red-meat dishes, so it has something to REJECT — a preference that only ever agrees is undemonstrable");
+    Check(TagsOf(box[0]).Contains("white_meat"),
+        "preferring white_meat sorts a white-meat dish to the front");
+    Check(box.All(r => !TagsOf(r).Contains("pork")) && box.All(r => !r["ingredients"]!.AsArray()
+            .Any(i => i!.GetValue<string>().Contains("pork", StringComparison.OrdinalIgnoreCase))),
+        "no pork in the seed — that 'no' belongs to the hard rule, and a hard rule must not need luck");
+
+    // --- half two: the repeat guard, through the real kernel pipeline ---
+    var filter = new RepeatReadFilter(loggerFactory.CreateLogger<RepeatReadFilter>());
+    filter.Reset();
+
+    var runs = 0;
+    var builder = Kernel.CreateBuilder();
+    builder.Services.AddSingleton<IFunctionInvocationFilter>(filter);
+    var kernel = builder.Build();
+    kernel.Plugins.AddFromFunctions("Probe", [
+        KernelFunctionFactory.CreateFromMethod(
+            (string tags) => { runs++; return $"{{\"asked\":\"{tags}\"}}"; },
+            functionName: "Read")
+    ]);
+
+    var args = new KernelArguments { ["tags"] = "[\"a\",\"b\"]" };
+    var first = (await kernel.InvokeAsync("Probe", "Read", args)).GetValue<string>() ?? "";
+    var again = (await kernel.InvokeAsync("Probe", "Read", args)).GetValue<string>() ?? "";
+    Check(runs == 1, $"an identical read runs the tool ONCE — it ran {runs} times");
+    Check(!first.Contains("repeat_of_previous_call"), "the first call is answered by the tool, untouched");
+    Check(again.Contains("repeat_of_previous_call") && again.Contains("\"asked\""),
+        "the repeat is answered from the memo AND still carries the data — a bare scolding would invite another call");
+
+    // The loop this gate exists for permuted the tag list, so order must not create a
+    // "new" question. This is the assertion that would have caught the real bug.
+    await kernel.InvokeAsync("Probe", "Read", new KernelArguments { ["tags"] = "[\"b\",\"a\"]" });
+    Check(runs == 1, $"the SAME tags in a different ORDER is the same question — the tool ran {runs} times");
+
+    // A genuinely different question must still get through, or the guard is a muzzle.
+    await kernel.InvokeAsync("Probe", "Read", new KernelArguments { ["tags"] = "[\"c\"]" });
+    Check(runs == 2, $"a different question still reaches the tool — ran {runs} times, expected 2");
+
+    Check(filter.SuppressedCount == 2, $"the filter counts what it suppressed — got {filter.SuppressedCount}");
+
+    // A new goal starts with no memory, or yesterday's world answers for today's.
+    filter.Reset();
+    await kernel.InvokeAsync("Probe", "Read", args);
+    Check(runs == 3, $"Reset() clears the memo for the next goal — ran {runs} times, expected 3");
+
+    Console.Out.WriteLine(failures.Count == 0
+        ? "gate 28 (no read asked twice; an unsatisfiable query says so): PASS"
+        : $"gate 28 FAIL: {failures.Count}");
+    return failures.Count == 0 ? 0 : 1;
+}
+
+/// <summary>
 /// M3 GATE: the Pre-check Engine — is the world ready?
 ///
 /// <para>
@@ -599,47 +743,6 @@ public static async Task<int> VerifyTraceIsolationAsync(ILoggerFactory loggerFac
 /// that does nothing does.
 /// </para>
 /// </summary>
-/// <summary>
-/// --verify-suggestions (M8 gate 18): the proactive scan is deterministic and
-/// well-formed. Runs the real ISuggester chain against the seed inventory and asserts
-/// the shape a demo depends on — the same suggestions every run, each acceptable into a
-/// goal. A scan is only useful if it's repeatable; an LLM here would make the board
-/// flicker between runs, which is why the suggester is a scan, and why this can gate it.
-/// </summary>
-public static async Task<int> VerifySuggestionsAsync(IServiceProvider provider)
-{
-    var failures = new List<string>();
-    void Check(bool ok, string what) { if (!ok) { failures.Add(what); Console.WriteLine($"  FAIL {what}"); } }
-
-    var suggesters = provider.GetServices<ISuggester>().ToArray();
-    Check(suggesters.Length > 0, "at least one suggester is registered");
-
-    var items = new List<SuggestionItem>();
-    foreach (var s in suggesters) items.AddRange(await s.ScanAsync());
-
-    // Determinism: two scans of unchanged state produce the identical list.
-    var again = new List<SuggestionItem>();
-    foreach (var s in suggesters) again.AddRange(await s.ScanAsync());
-    Check(items.Count == again.Count && items.Zip(again).All(p => p.First.Id == p.Second.Id),
-        "the scan is deterministic — same suggestions on a repeat with unchanged state");
-
-    var byKind = items.ToDictionary(i => i.Kind, i => i);
-    Check(byKind.ContainsKey("expiring"), "an 'expiring' suggestion is produced from the seed inventory");
-    Check(byKind.ContainsKey("restock"), "a 'restock' suggestion is produced from the seed inventory");
-
-    // Well-formed: every suggestion must be acceptable into a goal, so goal_text and id
-    // are non-empty — an empty goal_text would submit a blank user_goal.
-    foreach (var it in items)
-    {
-        Check(!string.IsNullOrWhiteSpace(it.Id), $"suggestion has an id ({it.Kind})");
-        Check(!string.IsNullOrWhiteSpace(it.GoalText), $"suggestion '{it.Id}' carries a goal_text to submit on accept");
-        Check(!string.IsNullOrWhiteSpace(it.Title), $"suggestion '{it.Id}' has a title");
-    }
-
-    Console.WriteLine(failures.Count == 0 ? "gate 18 (proactive suggestions scan): PASS" : $"gate 18 (proactive suggestions scan): FAIL: {failures.Count}");
-    return failures.Count == 0 ? 0 : 1;
-}
-
 public static async Task<int> VerifyPrechecksAsync(IServiceProvider provider, string dataDir)
 {
     var failures = new List<string>();
@@ -1136,6 +1239,598 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
 /// and the real observer against a throwaway copy of the world, with no LLM anywhere.
 /// </para>
 /// </summary>
+/// <summary>
+/// v7-M5 GATE: a constraint change re-arms from the ACCOUNT's block, and applies once.
+///
+/// <para>
+/// This is the only path in the system that changes a plan without asking, which makes it
+/// the one worth pinning hardest. Two things make it defensible and neither is visible in
+/// the demo: the device re-arms from a block it was SENT (it does not author policy just
+/// because it was told the household moved), and a change already applied is never applied
+/// again however many times the frame arrives — a re-sent approval, a reconnect replaying
+/// one, or a cloud that fans out twice.
+/// </para>
+///
+/// <para>
+/// Deterministic and offline. The RE-PLAN itself needs an LLM, so what is asserted here is
+/// everything around it: the arming, the dedupe, and that the always-enforced rules survive
+/// a re-dispatch rather than being reset by it.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyCrossGoalAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    var armed = provider.GetRequiredService<ArmedPolicies>();
+    var safety = provider.GetRequiredService<SafetyFilter>();
+
+    var dispatched = new JsonObject { ["allergens"] = new JsonArray("peanuts") };
+    using (armed.Arm("goal-week", dispatched, (JsonObject)dispatched.DeepClone()))
+    {
+        // 1. THE ACCOUNT OWNS THE POLICY. A new block replaces the DISPATCHED one, so a
+        //    later re-resolve starts from what the account last said — not from whatever
+        //    the device had narrowed it to, which would let its own arithmetic compound.
+        var updated = new JsonObject
+        {
+            ["allergens"] = new JsonArray("peanuts"),
+            ["away_window"] = new JsonObject { ["start"] = "2026-07-30", ["end"] = "2026-07-31" },
+        };
+        await safety.ReDispatchAsync("goal-week", (JsonObject)updated.DeepClone());
+
+        var nowDispatched = armed.DispatchedFor("goal-week");
+        if (nowDispatched?["away_window"] is null)
+        {
+            failures.Add($"the new block must become the DISPATCHED one, got {nowDispatched?.ToJsonString()}");
+        }
+        if (armed.ActiveHard()?["away_window"] is null)
+        {
+            failures.Add("…and must be what is enforced from here on");
+        }
+        if (nowDispatched?["allergens"] is null)
+        {
+            failures.Add("the always-enforced rules must survive a re-dispatch — this is not a reset");
+        }
+
+        // 2. IT DOES NOT ARM A GOAL THAT WAS NEVER ARMED. A constraint change for a goal
+        //    this device is not running must be a no-op, not a policy conjured from a frame.
+        await safety.ReDispatchAsync("goal-never-seen", (JsonObject)updated.DeepClone());
+        if (armed.DispatchedFor("goal-never-seen") is not null)
+        {
+            failures.Add("a constraint change for an unknown goal must not arm one");
+        }
+    }
+
+    // 3. APPLIED ONCE. The dedupe is a set on the goal record keyed by the change's stable
+    //    key; the same steer arriving twice must be recognised as the same change.
+    var record = new GoalRecord
+    {
+        Dispatch = new Dispatch
+        {
+            GoalId = "goal-week",
+            CorrelationId = "c",
+            Domain = "meal_plan",
+            Objective = "plan my weekly meal",
+            Constraints = new TaskConstraints { Hard = new JsonObject() },
+            TimeWindow = new TimeWindow { Start = "2026-07-28", End = "2026-08-03" },
+        },
+        Tasks = [],
+    };
+    const string key = "constraints:abcd1234";
+    if (!record.EmittedMaterialChanges.Add(key) || record.EmittedMaterialChanges.Add(key))
+    {
+        failures.Add("the same constraint change must be surfaced exactly once");
+    }
+
+    foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
+    Console.WriteLine("gate 25 (cross-goal: the account arms it, and it applies once): "
+                      + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
+    return failures.Count == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// v7-M4 GATE: the home-away goal can actually reach what its plan promises.
+///
+/// <para>
+/// A plan step is only real if a function exists behind it. Act 3 narrates pausing
+/// deliveries, handing the house to SmartThings, arming security and coming back to a
+/// clean house — so this pins that each of those is a callable thing with the right
+/// grade, not a sentence the planner was told to write.
+/// </para>
+///
+/// <para>
+/// The row that matters most is the REFUSAL. Holding a repeat prescription to tidy up
+/// the porch is the obvious failure of a goal told to "pause non-essential deliveries",
+/// and it is not caught by reading: it is caught by the function saying no. Deterministic
+/// code, same shape as the Safety engine, for the same reason.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyAwayCapabilitiesAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    var deliveries = provider.GetRequiredService<DeliveriesPlugin>();
+    var appliances = provider.GetRequiredService<ApplianceControlPlugin>();
+    var clock = provider.GetRequiredService<IClock>();
+    var until = clock.Today.AddDays(3).ToString("yyyy-MM-dd");
+
+    // 1. THE REFUSAL. An essential delivery cannot be held, however it is asked for.
+    try
+    {
+        await deliveries.Hold("repeat prescription", until);
+        failures.Add("holding an essential delivery (medication) must be refused, and was not");
+    }
+    catch (InvalidOperationException ex)
+    {
+        if (!ex.Message.Contains("essential", StringComparison.OrdinalIgnoreCase))
+        {
+            failures.Add($"the refusal must say WHY, got: {ex.Message}");
+        }
+    }
+
+    // 2. A non-essential one holds, and records what it was held until — the away window
+    //    is the whole point, so a hold with no end date is a subscription quietly killed.
+    var held = JsonNode.Parse(await deliveries.Hold("milk subscription", until))?.AsObject();
+    if (held?["status"]?.GetValue<string>() != "held" || held["until"]?.GetValue<string>() != until)
+    {
+        failures.Add($"a non-essential delivery must hold until a date, got {held?.ToJsonString()}");
+    }
+
+    // 3. …and comes back. Return readiness is not decoration: an unresumable hold means
+    //    the family is still without milk a week after they got home.
+    var resumed = JsonNode.Parse(await deliveries.Resume("milk subscription"))?.AsObject();
+    if (resumed?["status"]?.GetValue<string>() != "resumed")
+    {
+        failures.Add($"a held delivery must resume, got {resumed?.ToJsonString()}");
+    }
+    var after = JsonNode.Parse(await deliveries.ListDeliveries())?.AsArray()
+        .Select(n => n?.AsObject()).OfType<JsonObject>()
+        .FirstOrDefault(d => d["id"]?.GetValue<string>() == "del-milk");
+    if (after?["held"]?.GetValue<bool>() != false || after.ContainsKey("held_until"))
+    {
+        failures.Add($"resuming must clear both the flag and the date, got {after?.ToJsonString()}");
+    }
+
+    // 4. THE GRADES. Hold is A2 — an outward-facing commitment to a third party, not the
+    //    same kind of act as adding milk to a list — so it must land as its own approval
+    //    rather than riding the batch.
+    var registry = provider.GetRequiredService<CapabilityManager>();
+    var gradeKernel = Kernel.CreateBuilder().Build();
+    gradeKernel.Plugins.AddFromObject(deliveries, "Deliveries");
+    gradeKernel.Plugins.AddFromObject(provider.GetRequiredService<SecurityPlugin>(), "Security");
+    var catalog = gradeKernel.Plugins
+        .ToDictionary(p => p.Name, p => registry.DescribePlugin(p).Functions ?? []);
+
+    foreach (var (module, function, wantTier) in new[]
+    {
+        ("Deliveries", "Hold", ApprovalTiers.Firm),
+        ("Deliveries", "Resume", ApprovalTiers.Light),
+        ("Security", "ArmSecurity", ApprovalTiers.Light),
+    })
+    {
+        var fn = catalog.TryGetValue(module, out var fns)
+            ? fns.FirstOrDefault(f => f.Name == function)
+            : null;
+        if (fn is null) failures.Add($"{module}.{function} must exist — Act 3 plans a step onto it");
+        else if (fn.Tier != wantTier) failures.Add($"{module}.{function} must be tier {wantTier}, got {fn.Tier}");
+    }
+
+    // 5. THE ROBOT VACUUM EXISTS. ApplianceControlPlugin's own [Description] has
+    //    advertised a vacuum since v2 while the world held none — and the planner reads
+    //    that description, so an over-claim invites a step the device then cannot run.
+    var list = JsonNode.Parse(await appliances.ListAppliances())?.AsArray();
+    var rvc = list?.Select(n => n?.AsObject()).OfType<JsonObject>()
+        .FirstOrDefault(a => a["id"]?.GetValue<string>() == "rvc");
+    if (rvc is null)
+    {
+        failures.Add("the robot vacuum must exist — return readiness schedules a clean through Appliance.RunProgram");
+    }
+    else if (rvc["programs"]?.AsArray().Count is null or 0)
+    {
+        failures.Add("the vacuum needs programs, or Appliance.RunProgram refuses every clean it is asked for");
+    }
+    else
+    {
+        var program = rvc["programs"]!.AsArray()[0]!.GetValue<string>();
+        var run = JsonNode.Parse(await appliances.RunProgram("rvc", program, $"{until}T11:00"))?.AsObject();
+        if (run?["status"]?.GetValue<string>() != "scheduled")
+        {
+            failures.Add($"the vacuum must be schedulable through the EXISTING RunProgram, got {run?.ToJsonString()}");
+        }
+    }
+
+    foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
+    Console.WriteLine("gate 24 (away capabilities: reachable, graded, refusing): " + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
+    return failures.Count == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// v7-M3 GATE: the run says what it DID, and a v6 client cannot tell the difference.
+///
+/// <para>
+/// Two things are being pinned, and the second is the one that would break quietly.
+/// First: a step is WHOLE — it carries its own headline and sub-line, and a client never
+/// has to accumulate fragments or guess where one thought ends. Second: plain narration
+/// is BYTE-IDENTICAL to what v6 emitted. The whole design rests on `text` staying the
+/// only required field, so a surface that ignores `kind`/`step`/`detail` renders exactly
+/// what it always did — and the cheapest way to break that is to start stamping `kind`
+/// on everything for tidiness.
+/// </para>
+///
+/// <para>
+/// Deterministic and offline: a real Trace with a capturing sink, and the real
+/// SafetyFilter blocking a real call.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyThinkingStepsAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    var captured = new List<AgentEvent>();
+    var trace = new Trace(
+        provider.GetRequiredService<ILoggerFactory>().CreateLogger<Trace>(),
+        ev => { captured.Add(ev); return Task.CompletedTask; });
+
+    using (trace.BeginGoalScope("goal-steps", "c"))
+    {
+        await trace.ThinkingStepAsync("Composing the plan", "7 tasks · 20 tools");
+        await trace.ThinkingStepAsync("Drafted 7 steps");
+        await trace.ThinkingStepAsync("   ", "a step with no headline is not a step");
+        await trace.ThinkingAsync("the model's own words");
+    }
+
+    JsonObject? Payload(int i) => i < captured.Count ? captured[i].Payload : null;
+
+    // 1. A STEP IS WHOLE. Headline, sub-line, and a `text` that reads as a sentence for
+    //    anything that only knows about `text`.
+    var step = Payload(0);
+    if (step?["kind"]?.GetValue<string>() != ThinkingKinds.Step
+        || step["step"]?.GetValue<string>() != "Composing the plan"
+        || step["detail"]?.GetValue<string>() != "7 tasks · 20 tools"
+        || step["text"]?.GetValue<string>() != "Composing the plan — 7 tasks · 20 tools")
+    {
+        failures.Add($"a step must carry kind/step/detail and a joined text, got {step?.ToJsonString()}");
+    }
+
+    // 2. No detail means NO detail key — not an empty string a client has to test for.
+    var bare = Payload(1);
+    if (bare is null || bare.ContainsKey("detail") || bare["text"]?.GetValue<string>() != "Drafted 7 steps")
+    {
+        failures.Add($"a step with no sub-line must omit `detail` entirely, got {bare?.ToJsonString()}");
+    }
+
+    // 3. A step with no headline is dropped rather than emitted blank.
+    if (captured.Count != 3)
+    {
+        failures.Add($"a whitespace-only step must not be emitted, got {captured.Count} events");
+    }
+
+    // 4. BACK-COMPAT, and this is the one worth having. Narration carries `text` and
+    //    NOTHING else, so a v6 client sees the exact bytes it saw before v7.
+    var narration = captured.Count >= 3 ? captured[2].Payload : null;
+    if (narration is null || narration.Count != 1 || narration["text"]?.GetValue<string>() != "the model's own words")
+    {
+        failures.Add($"narration must stay exactly {{text}} — a v6 client must not see new keys, got {narration?.ToJsonString()}");
+    }
+
+    // 5. A SAFETY BLOCK SAYS SO, in the run's own transcript. Until v7 the most
+    //    interesting thing this engine ever does reached the user as a chip summary and
+    //    a number on the plan card, and never as a sentence at the moment it happened.
+    var filter = provider.GetRequiredService<SafetyFilter>();
+    var armed = provider.GetRequiredService<ArmedPolicies>();
+    captured.Clear();
+    filter.SetTrace(trace);
+    var hard = new JsonObject { ["allergens"] = new JsonArray("peanuts") };
+    // A kernel with one plugin and the real filter — the Kernel itself is built by
+    // GoalAgent rather than registered, and this gate needs a real invocation to travel
+    // the real filter rather than a hand-called method.
+    var builder = Kernel.CreateBuilder();
+    builder.Plugins.AddFromObject(provider.GetRequiredService<ShoppingListPlugin>(), "ShoppingList");
+    var kernel = builder.Build();
+    kernel.FunctionInvocationFilters.Add(filter);
+
+    using (trace.BeginGoalScope("goal-block", "c"))
+    using (armed.Arm("goal-block", hard, (JsonObject)hard.DeepClone()))
+    {
+        var fn = kernel.Plugins.GetFunction("ShoppingList", "Add");
+        await kernel.InvokeAsync(fn, new KernelArguments { ["items"] = new[] { "peanut butter" }, ["reason"] = "test" });
+    }
+
+    var notice = captured.FirstOrDefault(e =>
+        e.Event == AgentEventKinds.Thinking
+        && e.Payload["kind"]?.GetValue<string>() == ThinkingKinds.Notice);
+    if (notice is null)
+    {
+        failures.Add("a safety block must be said out loud as a notice step, not only counted");
+    }
+    else if (!(notice.Payload["detail"]?.GetValue<string>() ?? "").Contains("peanut", StringComparison.OrdinalIgnoreCase))
+    {
+        failures.Add($"the notice must carry the reason it blocked, got {notice.Payload["detail"]}");
+    }
+
+    // 6. COUNTED VERDICTS. "7 steps" alone says the engine ran; the rest says what it
+    //    weighed, which is the difference between an animation and a report.
+    foreach (var (steps, considered, rejected, want) in new (int, int?, int, string)[]
+    {
+        (7, 17, 5, "7 steps · 17 considered, 5 rejected"),
+        (7, 17, 0, "7 steps · 17 considered"),
+        (7, null, 5, "7 steps · 5 rejected"),
+        (7, null, 0, "7 steps"),
+    })
+    {
+        var got = GoalAgent.PlannerVerdict(steps, considered, rejected);
+        if (got != want) failures.Add($"planner verdict: expected \"{want}\", got \"{got}\"");
+    }
+
+    foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
+    Console.WriteLine("gate 23 (thinking steps: whole, and v6-compatible): " + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
+    return failures.Count == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// v7-M2 GATE: the day tick TELLS the family everything and ASKS about one thing.
+///
+/// <para>
+/// Act 2 shows two changes overnight — a hard training day and a fish delivery — and
+/// exactly one approval. That is a real distinction in the harness, not staging: a
+/// non-material change is listed in the day summary and never opens an approval, and
+/// before v7 it went nowhere at all (only the single material change reached
+/// <c>DayAdvanced.Events</c>, so an observed non-material change was indistinguishable
+/// from a quiet day).
+/// </para>
+///
+/// <para>
+/// Deterministic and offline: the real observer, the real feed, the real clock. No LLM,
+/// so the ADAPTATION itself is out of scope here — what is in scope is that exactly one
+/// change is eligible to cause one, and that its steer carries both facts, which is the
+/// only reason a single adaptation can explain both.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyDayTickAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    var observer = provider.GetServices<IDomainObserver>().First(o => o.Domain == "meal_plan");
+    var workout = provider.GetRequiredService<WorkoutPlugin>();
+    var clock = provider.GetRequiredService<IClock>();
+
+    // 1. THE WORLD FILE SEEDS AND READS. A missing data file fails silently — the
+    //    observer catches FileNotFoundException, returns no changes, and the goal just
+    //    never adapts — so a gate that only checked behaviour would pass on an empty world.
+    var routine = JsonNode.Parse(await workout.GetWeeklyRoutine())?.AsObject();
+    if (routine?["target_steps_per_day"]?.GetValue<int>() is not 8000)
+    {
+        failures.Add($"Workout.GetWeeklyRoutine must return the household's step target, got {routine?.ToJsonString()}");
+    }
+    if ((routine?["week"]?.AsArray()?.Count ?? 0) != 7)
+    {
+        failures.Add("the routine must cover a full week, or 'workout-friendly' has nothing to shape a week against");
+    }
+
+    // 2. THE GENERIC-CLOCK RULE holds for activity too: -1 is yesterday on any day the
+    //    demo runs, resolved at READ time. An absolute date here would go stale between
+    //    demos in a way nobody notices until the numbers read as a week old.
+    var recent = JsonNode.Parse(await workout.GetRecentActivity())?.AsArray();
+    var yesterday = recent?
+        .Select(n => n?.AsObject())
+        .OfType<JsonObject>()
+        .FirstOrDefault(d => d["day_offset"]?.GetValue<int>() == -1);
+    var wantYesterday = clock.Today.AddDays(-1).ToString("yyyy-MM-dd");
+    if (yesterday?["date"]?.GetValue<string>() != wantYesterday)
+    {
+        failures.Add($"recent activity must resolve day_offset -1 to {wantYesterday}, got {yesterday?["date"]}");
+    }
+
+    // 3. THE SPIKE IS NOT IN THE STEADY STATE. If 12,400 steps were seeded here it
+    //    would already be true on day 1, the plan would have been built knowing it, and
+    //    Act 2's adaptation would be reacting to nothing new. It belongs in the feed.
+    if ((recent?.ToJsonString() ?? "").Contains("12400", StringComparison.Ordinal))
+    {
+        failures.Add("the Act 2 activity spike must live in daily_events.json, not in workout.json's steady state");
+    }
+
+    // 4. DAY 1 OF THE FEED: two changes, one of them material.
+    var goal = new GoalRecord
+    {
+        Dispatch = new Dispatch
+        {
+            GoalId = "goal-week",
+            CorrelationId = "c",
+            Domain = "meal_plan",
+            Objective = "plan my weekly meal",
+            Constraints = new TaskConstraints { Hard = new JsonObject() },
+            TimeWindow = new TimeWindow
+            {
+                Start = clock.Today.ToString("yyyy-MM-dd"),
+                End = clock.Today.AddDays(6).ToString("yyyy-MM-dd")
+            }
+        },
+        Tasks = [],
+        Plan = Enumerable.Range(1, 7)
+            .Select(day => new PlanItem { Id = $"d{day}", Day = day, Title = $"Dinner {day}" })
+            .ToArray(),
+        WorldSnapshot = await observer.CaptureAsync()
+    };
+
+    // The snapshot froze the feed's fire dates; now advance INTO day 2, which is what
+    // pressing Advance day does once.
+    if (clock is SimulatedClock sim) sim.AdvanceDay();
+
+    var changes = await observer.ObserveAsync(goal);
+    if (changes.Count != 2)
+    {
+        failures.Add($"day 1 must surface exactly two changes (a training day and a delivery), got {changes.Count}: "
+                     + string.Join(", ", changes.Select(c => c.Key)));
+    }
+
+    var material = changes.Where(c => c.Material).ToArray();
+    if (material.Length != 1 || material[0].Kind != "inventory.restocked")
+    {
+        failures.Add("exactly one day-1 change may be material, and it is the delivery — got "
+                     + string.Join(", ", material.Select(c => c.Kind)));
+    }
+
+    var note = changes.FirstOrDefault(c => c.Kind == "workout.activity_logged");
+    if (note is null)
+    {
+        failures.Add("the training day must be observed at all — it is half of what Advance day reports");
+    }
+    else
+    {
+        if (note.Material)
+        {
+            failures.Add("a workout is worth TELLING the family about and not worth asking them to approve a plan change for");
+        }
+        if (!string.IsNullOrWhiteSpace(note.Steer))
+        {
+            failures.Add("an informational change must carry no steer, or it becomes a re-plan by accident");
+        }
+        if (string.IsNullOrWhiteSpace(note.Description))
+        {
+            failures.Add("an informational change still needs a description — it is what the day summary shows");
+        }
+    }
+
+    // 5. ONE ADAPTATION, BOTH REASONS. This is why two events are allowed to produce
+    //    one approval: the material change's steer quotes the other one's numbers, so
+    //    the single re-plan the user approves can explain itself in full.
+    var steer = material.FirstOrDefault()?.Steer ?? "";
+    foreach (var mustSay in new[] { "fish", "12,400" })
+    {
+        if (!steer.Contains(mustSay, StringComparison.OrdinalIgnoreCase))
+        {
+            failures.Add($"the delivery's steer must name '{mustSay}' — one adaptation has to account for both changes");
+        }
+    }
+
+    // 6. EXACTLY ONCE, both kinds. The tick dedups through one "already surfaced" set;
+    //    a listed change that re-fires every tick is a day summary that repeats itself
+    //    forever, which reads as a broken agent rather than a quiet week.
+    foreach (var change in changes) goal.EmittedMaterialChanges.Add(change.Key);
+    var again = (await observer.ObserveAsync(goal))
+        .Where(c => !goal.EmittedMaterialChanges.Contains(c.Key))
+        .ToArray();
+    if (again.Length != 0)
+    {
+        failures.Add($"a surfaced change must not surface again, got {string.Join(", ", again.Select(c => c.Key))}");
+    }
+
+    foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
+    Console.WriteLine("gate 22 (day tick: two changes, one approval): " + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
+    return failures.Count == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// --verify-away-immune (v7 gate 26) — A DAY THE HOUSEHOLD EMPTIED STAYS EMPTY.
+///
+/// <para>
+/// The bug this exists for: the family approved "we're away Sunday and Monday", the meal
+/// week marked both days skipped, and the next Advance day fired "the paneer spoiled"
+/// against Sunday — whose steer says "change tonight's dinner" — so the model cooked
+/// dinner on a day nobody is home. The cross-goal moment is the demo's headline, and the
+/// very next tick quietly undid half of it.
+/// </para>
+///
+/// <para>
+/// Two independent layers, because one is a judgement and the other is a guarantee: the
+/// observer stops RAISING the change as material (so no LLM call, no approval), and
+/// <c>DropSkippedRows</c> stops any patch from LANDING on a skipped row whatever raised
+/// it. The gate asserts both, plus the thing that makes it humane — the change is still
+/// TOLD. A family that is away still wants to know their fridge lost something.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyAwayImmuneAsync(IServiceProvider provider)
+{
+    var failures = new List<string>();
+    var observer = provider.GetServices<IDomainObserver>().First(o => o.Domain == "meal_plan");
+    var clock = provider.GetRequiredService<IClock>();
+
+    // A week whose Day 3 is away — exactly the shape the cross-goal moment leaves behind.
+    // day2-shortage in the feed targets Day 3, so this is the collision, not a contrivance.
+    PlanItem[] Week() => Enumerable.Range(1, 7)
+        .Select(day => new PlanItem
+        {
+            Id = $"d{day}",
+            Day = day,
+            Title = day == 3 ? "Away — no meal planned" : $"Dinner {day}",
+            Status = day == 3 ? PlanItemStatuses.Skipped : PlanItemStatuses.Planned,
+            StatusReason = day == 3 ? "you're away · from Vacation Home Prep" : null
+        })
+        .ToArray();
+
+    var goal = new GoalRecord
+    {
+        Dispatch = new Dispatch
+        {
+            GoalId = "goal-week",
+            CorrelationId = "c",
+            Domain = "meal_plan",
+            Objective = "plan my weekly meal",
+            Constraints = new TaskConstraints { Hard = new JsonObject() },
+            TimeWindow = new TimeWindow
+            {
+                Start = clock.Today.ToString("yyyy-MM-dd"),
+                End = clock.Today.AddDays(6).ToString("yyyy-MM-dd")
+            }
+        },
+        Tasks = [],
+        Plan = Week(),
+        WorldSnapshot = await observer.CaptureAsync()
+    };
+
+    // Advance INTO day 3 — two presses of Advance day, which is where the demo is when
+    // the trip starts.
+    if (clock is SimulatedClock sim) { sim.AdvanceDay(); sim.AdvanceDay(); }
+
+    var changes = await observer.ObserveAsync(goal);
+    var shortage = changes.FirstOrDefault(c => c.Kind == "inventory.shortage");
+    if (shortage is null)
+    {
+        failures.Add("the day-3 shortage must still be OBSERVED — the fix is to stop it re-planning, not to hide it");
+    }
+    else
+    {
+        if (shortage.Material)
+        {
+            failures.Add("a change aimed at an away day must not be material — there is no dinner that day to change");
+        }
+        if (!shortage.Description.Contains("away", StringComparison.OrdinalIgnoreCase))
+        {
+            failures.Add($"the day summary has to say WHY nothing changed, got: {shortage.Description}");
+        }
+    }
+
+    // The other half: whatever raises a change, a patch may not land on a skipped row.
+    // Asserted directly rather than through an LLM, because a guarantee that only holds
+    // when the model cooperates is not a guarantee.
+    var worldChange = new WorldChange
+    {
+        Key = "k", Kind = "inventory.shortage", Description = "d",
+        AffectedPlanItems = ["d3"], Material = true
+    };
+    var attempted = new PlanItem[]
+    {
+        new() { Id = "d3", Day = 3, Title = "Paneer-free Rajma" },
+        new() { Id = "d5", Day = 5, Title = "Something else" }
+    };
+    var kept = GoalAgent.DropSkippedRows(Week(), worldChange, attempted);
+    if (kept.Any(r => r.Id == "d3"))
+    {
+        failures.Add("a patch upsert aimed at a skipped row must be dropped, whatever produced it");
+    }
+    if (!kept.Any(r => r.Id == "d5"))
+    {
+        failures.Add("dropping the away row must not drop the rest of the patch with it");
+    }
+
+    // ...EXCEPT the change that writes them. If a constraint change could not touch a
+    // skipped row, a cancelled trip could never give the family their week back.
+    var constraintChange = worldChange with { Kind = "constraints.changed" };
+    if (GoalAgent.DropSkippedRows(Week(), constraintChange, attempted).Count != 2)
+    {
+        failures.Add("a constraints.changed patch MAY write skipped rows — it is the path that sets and clears them");
+    }
+
+    foreach (var f in failures) Console.WriteLine($"  FAIL {f}");
+    Console.WriteLine("gate 26 (an away day stays away): " + (failures.Count == 0 ? "PASS" : $"FAIL: {failures.Count}"));
+    return failures.Count == 0 ? 0 : 1;
+}
+
 public static async Task<int> VerifyEnvelopeAsync(IServiceProvider provider, string dataDir)
 {
     var failures = new List<string>();
@@ -1462,20 +2157,34 @@ public static void EnsureDataDir(string dataDir)
         {
             return; // this IS the seed
         }
-        if (Directory.Exists(dataDir) && Directory.EnumerateFiles(dataDir, "*.json").Any())
-        {
-            return; // already has a world
-        }
         if (!Directory.Exists(seed))
         {
             return; // nothing to seed from — let the store fail loudly
         }
         Directory.CreateDirectory(dataDir);
+
+        // v7 — FILL IN WHAT IS MISSING, rather than skipping a dir that has any json at
+        // all. The old rule ("already has a world → leave it alone") had a failure mode
+        // with no symptom: add a world file and every pre-existing --data dir silently
+        // lacks it, so the observer that reads it throws FileNotFoundException, returns
+        // no changes, and the goal simply never adapts. Nothing errors. It cost real time
+        // twice — once for workout.json, once for deliveries.json — and on a Hub that has
+        // already run an older build there is no `rm -rf` to reach for.
+        //
+        // Copying per-file is safe because overwrite stays FALSE: a file the run has
+        // mutated is never clobbered, so this only ever adds what was never there.
+        var added = 0;
         foreach (var file in Directory.EnumerateFiles(seed, "*.json"))
         {
-            File.Copy(file, Path.Combine(dataDir, Path.GetFileName(file)), overwrite: false);
+            var target = Path.Combine(dataDir, Path.GetFileName(file));
+            if (File.Exists(target)) continue;
+            File.Copy(file, target, overwrite: false);
+            added++;
         }
-        Console.Error.WriteLine($"seeded mock world: {dataDir} <- {seed}");
+        if (added > 0)
+        {
+            Console.Error.WriteLine($"seeded mock world: {dataDir} <- {seed} ({added} file(s))");
+        }
     }
     catch (Exception ex)
     {

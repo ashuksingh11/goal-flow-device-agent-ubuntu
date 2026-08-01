@@ -48,6 +48,19 @@ public sealed record StatusPayload
     public IReadOnlyList<ImpactItem> ImpactDelta { get; init; } = [];
 
     public string? Note { get; init; }
+
+    /// <summary>
+    /// v7: this plan was changed WITHOUT an approval, because another goal the user
+    /// already approved changed the household. One sentence in their terms.
+    ///
+    /// <para>
+    /// Distinct from <see cref="Note"/>, which is monitoring narration the board does not
+    /// surface, and distinct from an alert, which means "you still have to decide". This
+    /// means "it is already done, and you should know" — the board renders it as a line
+    /// on the card and a dismissible notice on the detail page, never as an approval.
+    /// </para>
+    /// </summary>
+    public string? PlanChangedNote { get; init; }
 }
 
 /// <summary>One executed side-effect, reported in <see cref="StatusPayload.Executed"/>.
