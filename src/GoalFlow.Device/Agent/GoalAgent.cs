@@ -81,6 +81,7 @@ public sealed class GoalAgent
     private readonly Grounding _grounding;
     private readonly SafetyFilter _safety;
     private readonly RepeatReadFilter _repeatReads;
+    private readonly ToolRoundFilter _toolRounds;
     private readonly ApprovalCoordinator _approvals;
     private readonly MonitorAdapt _monitor;
     private readonly CapabilityManager _capabilities;
@@ -126,6 +127,7 @@ public sealed class GoalAgent
         Grounding grounding,
         SafetyFilter safety,
         RepeatReadFilter repeatReads,
+        ToolRoundFilter toolRounds,
         ApprovalCoordinator approvals,
         MonitorAdapt monitor,
         CapabilityManager capabilities,
@@ -140,6 +142,7 @@ public sealed class GoalAgent
         _grounding = grounding;
         _safety = safety;
         _repeatReads = repeatReads;
+        _toolRounds = toolRounds;
         _approvals = approvals;
         _monitor = monitor;
         _capabilities = capabilities;
@@ -182,6 +185,10 @@ public sealed class GoalAgent
         // AFTER the safety filter, deliberately: the gate has already run on anything this
         // sees, so a memoized answer is never an unchecked one.
         builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<RepeatReadFilter>());
+        // A different KIND of filter: the two above run per function call, this one runs per
+        // model round-trip. It bounds the tool loop SK would otherwise let run to 128 turns,
+        // and records how many rounds a run actually took — see ToolRoundFilter.
+        builder.Services.AddSingleton<IAutoFunctionInvocationFilter>(services.GetRequiredService<ToolRoundFilter>());
         builder.Services.AddSingleton(services.GetRequiredService<IProductApiAdapter>());
 
         foreach (var capability in services.GetRequiredService<CapabilityManager>().Descriptors)
@@ -438,6 +445,26 @@ public sealed class GoalAgent
     /// </para>
     /// </summary>
     private const int ComposeMaxTokens = 16000;
+
+    /// <summary>
+    /// Decompose's OWN ceiling, because it was silently inheriting compose's.
+    ///
+    /// <para>
+    /// Decompose shares <see cref="GetComposeContentAsync"/> with compose, so a call that
+    /// returns one to eight task titles was asking for the same 16000 tokens as a seven-day
+    /// plan. Nothing in the reasoning above argues for that — it is inherited from code
+    /// sharing, not from a measurement.
+    /// </para>
+    ///
+    /// <para>
+    /// It matters more than a spare ceiling normally would, because this model expands its
+    /// reasoning to fill whatever budget it is given — the same effect documented at
+    /// <see cref="GroundingMaxTokens"/>, where raising a cap took a phase from 77s to 253s.
+    /// A ceiling here is a brake, and 1200 is roughly what the equivalent cloud-side
+    /// classification calls use.
+    /// </para>
+    /// </summary>
+    private const int DecomposeMaxTokens = 1200;
 
     /// <summary>
     /// Grounding keeps its ORIGINAL, much smaller ceiling — measured, after raising it was
@@ -984,6 +1011,7 @@ public sealed class GoalAgent
         // Fresh memory of what this goal has already read. Scoped to the run, so nothing
         // a previous plan (or a previous simulated day) learned can answer for this one.
         _repeatReads.Reset(_trace);
+        _toolRounds.BeginGoal();
 
         _logger.LogInformation("plan_start domain={Domain} model_clock={Today}", dispatch.Domain, _clock.Today);
         // PRE-CHECK GATE 1: can this goal be planned at all? Before a single token
@@ -1059,8 +1087,14 @@ public sealed class GoalAgent
         var toolsBefore = _trace.ToolCallCount;
         var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
         var toolsUsed = _trace.ToolCallCount - toolsBefore;
-        _logger.LogInformation("grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars} tool_calls={Tools}",
-            dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length, toolsUsed);
+        // Rounds, not just tools: grounding's cost is round-TRIPS, and the two differ whenever
+        // the model batches reads. This is the number that used to vary 80s-240s unrecorded.
+        // suppressed = reads RepeatReadFilter answered from memory instead of calling again;
+        // it was computed and thrown away before v8.
+        _logger.LogInformation(
+            "grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars} tool_calls={Tools} rounds={Rounds} suppressed={Suppressed}",
+            dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length, toolsUsed,
+            _toolRounds.Rounds, _repeatReads.SuppressedCount);
         await _trace.HarnessAsync(HarnessModules.Grounding, HarnessStatuses.Done,
             note: "Context assembled from the live world",
             // What it actually READ, not merely that it finished. The model chooses how
@@ -1270,9 +1304,27 @@ public sealed class GoalAgent
     {
         history.AddUserMessage(BuildPlanningInstruction(dispatch));
         string? lastError = null;
+        // ONE budget for the whole loop, not one per attempt (v8).
+        //
+        // The per-call deadline bounds a single request; nothing bounded the three of them
+        // together. A compose that legitimately runs to the 180s ceiling is classified
+        // transient — correctly, because a hung stream must be retried — and then tried twice
+        // more, each time with a LONGER history than the attempt that just timed out. Three
+        // ceilings plus backoff is ~9 minutes for one goal, and the later attempts are the
+        // least likely to succeed. Past this line, "slow" has already been answered; trying
+        // again only makes the person wait for a worse version of the same call.
+        var composeClock = Stopwatch.StartNew();
 
         for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
         {
+            if (attempt > 1 && composeClock.Elapsed > _llmCallBudget)
+            {
+                var giveUp = $"compose gave up after {composeClock.Elapsed.TotalSeconds:F0}s across {attempt - 1} attempt(s) — the budget is for the whole plan, not for each try.";
+                _logger.LogWarning("compose_budget_exhausted goal={GoalId} elapsed_ms={Elapsed} attempts={Attempts}",
+                    dispatch.GoalId, composeClock.ElapsedMilliseconds, attempt - 1);
+                throw new JsonException(lastError is null ? giveUp : $"{giveUp} Last error: {lastError}");
+            }
+
             if (attempt > 1)
             {
                 history.AddUserMessage(BuildPlanningRetryInstruction(lastError ?? "Planner did not return a valid JSON object."));
@@ -1357,6 +1409,13 @@ public sealed class GoalAgent
     /// </summary>
     private readonly Dictionary<string, JsonModeHealth> _jsonMode = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// The token ceiling for a site. Decompose and compose share one method but are not the
+    /// same size of question — see <see cref="DecomposeMaxTokens"/>.
+    /// </summary>
+    private static int MaxTokensFor(LlmCallSite site)
+        => site == LlmCallSite.Decompose ? DecomposeMaxTokens : ComposeMaxTokens;
+
     private JsonModeHealth JsonModeFor(LlmCallSite site)
         => _jsonMode.TryGetValue(site.Name, out var health) ? health : JsonModeHealth.Untried;
 
@@ -1396,6 +1455,7 @@ public sealed class GoalAgent
     private async Task<ComposeContent> GetComposeContentAsync(
         IChatCompletionService chat, ChatHistory history, LlmCallSite site, CancellationToken ct)
     {
+        var maxTokens = MaxTokensFor(site);
         if (JsonModeFor(site) == JsonModeHealth.Broken)
         {
             return new ComposeContent(await GetStrictComposeContentAsync(chat, history, site, ct), false);
@@ -1404,7 +1464,7 @@ public sealed class GoalAgent
         var jsonSettings = _routing.Apply(new OpenAIPromptExecutionSettings
         {
             Temperature = 0.1,
-            MaxTokens = ComposeMaxTokens,
+            MaxTokens = maxTokens,
             ResponseFormat = "json_object"
         }, site);
 
@@ -1459,7 +1519,7 @@ public sealed class GoalAgent
         var strictSettings = _routing.Apply(new OpenAIPromptExecutionSettings
         {
             Temperature = 0.1,
-            MaxTokens = ComposeMaxTokens
+            MaxTokens = MaxTokensFor(site)
         }, site);
         using var cts = Deadline(ct, _llmCallBudget);
         var response = await chat.GetChatMessageContentAsync(history, strictSettings, _kernel, cts.Token);

@@ -69,6 +69,7 @@ services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
 services.AddSingleton<RepeatReadFilter>();
+services.AddSingleton<ToolRoundFilter>();
 services.AddSingleton<MonitorAdapt>();
 services.AddSingleton<PrecheckEngine>();
 
@@ -131,6 +132,7 @@ var agent = new GoalAgent(
     provider.GetRequiredService<Grounding>(),
     provider.GetRequiredService<SafetyFilter>(),
     provider.GetRequiredService<RepeatReadFilter>(),
+    provider.GetRequiredService<ToolRoundFilter>(),
     provider.GetRequiredService<ApprovalCoordinator>(),
     provider.GetRequiredService<MonitorAdapt>(),
     provider.GetRequiredService<CapabilityManager>(),
