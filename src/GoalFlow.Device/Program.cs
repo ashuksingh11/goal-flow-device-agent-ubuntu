@@ -1178,6 +1178,14 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
         Constraints = new TaskConstraints { Hard = hard },
     };
     tasks.CreateGoal(dispatch, [new TaskRecord { TaskId = "t1", GoalId = dispatch.GoalId, Title = "prep" }], new JsonObject());
+    // Walk t1 to AwaitingApproval, which is where a real goal sits when an approval
+    // arrives. Without this the task stays Created, ApplyApproval's transitions match
+    // nothing, and the ledger assertion below passes while testing nothing — which is
+    // exactly what it did on its first run.
+    // Placed directly rather than walked through TransitionAsync: a transition emits a
+    // task_update, and Trace refuses to emit outside a goal scope this harness has not
+    // opened yet. The state is what matters here, not the path to it.
+    tasks.GetGoal(dispatch.GoalId)!.Tasks[0].State = TaskState.AwaitingApproval;
 
     // p1 runs the dishwasher mid-trip (forbidden); p2 adds to the shopping list (fine).
     approvals.Register(new ProposalItem
@@ -1301,6 +1309,21 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
         if (!approvals.ExecutedIds().Contains("p2"))
         {
             failures.Add("the allowed proposal must be marked executed");
+        }
+
+        // ...AND THE LEDGER MUST NOT BE LEFT MID-FLIGHT. Tasks reach Monitoring on the
+        // last line of ApplyApprovalCoreAsync, so anything that stops it getting there
+        // strands them in Executing — and CompleteIfWindowPassedAsync could then never
+        // complete the goal. Not "completes late": never. Its card sat on the board for
+        // the rest of the session, past its dates, while every other goal retired around
+        // it. That is how a single actuator throw outlived itself by a whole demo, and it
+        // is the reason this assertion is here rather than in a lifecycle gate: the throw
+        // and the stranding are one failure, and only this gate has both.
+        var stranded = tasks.GetGoal(dispatch.GoalId)?.Tasks
+            .Where(t => t.State == TaskState.Executing).ToArray() ?? [];
+        if (stranded.Length > 0)
+        {
+            failures.Add($"a failed actuator must not strand the ledger — {stranded.Length} task(s) left Executing, and a goal with nothing Monitoring can never complete");
         }
     }
 

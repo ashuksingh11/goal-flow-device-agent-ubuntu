@@ -662,13 +662,29 @@ public sealed class GoalAgent
             return false;
         }
 
-        var monitoring = goal.Tasks.Where(t => t.State == TaskState.Monitoring).ToArray();
-        if (monitoring.Length == 0)
+        // EXECUTING COUNTS, NOT JUST MONITORING (v8.1).
+        //
+        // Tasks reach Monitoring at the END of ApplyApprovalCoreAsync. Anything that stops
+        // that method reaching its last line leaves them in Executing — and this used to
+        // return false on an empty Monitoring set, so the goal could NEVER complete. Not
+        // "completes late": never. Its card sat on the board for the rest of the session,
+        // past its dates, with no way to clear it, while every other goal retired around
+        // it. That is what an unguarded actuator throw left behind, and it is why the
+        // symptom outlived the crash that caused it by a whole demo.
+        //
+        // A goal whose last day has passed is over, whether or not its executor finished
+        // tidily. What is deliberately still NOT swept is a goal that never got that far —
+        // Created / Ready / Planning / AwaitingApproval. A goal still waiting on a person
+        // is not complete, and quietly retiring it would answer for them.
+        var outstanding = goal.Tasks
+            .Where(t => t.State is TaskState.Monitoring or TaskState.Executing)
+            .ToArray();
+        if (outstanding.Length == 0)
         {
             return false;
         }
 
-        foreach (var task in monitoring)
+        foreach (var task in outstanding)
         {
             await _tasks.TransitionAsync(goal.Dispatch.GoalId, task.TaskId, TaskState.Completed);
         }
