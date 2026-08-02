@@ -766,13 +766,75 @@ public sealed class GoalAgent
 
             _logger.LogInformation("decomposed {GoalId} into {Count} task(s){Repaired}",
                 dispatch.GoalId, tasks.Count, repairs.Count > 0 ? $" ({repairs.Count} repaired)" : "");
-            await _trace.ThinkingAsync($"broke the goal into {tasks.Count} steps: {string.Join(" → ", tasks.Select(t => t.Title))}");
+            await ReportDecompositionAsync(tasks, repairs.Count);
             return tasks;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             _logger.LogWarning(ex, "decompose_failed — falling back to a single task");
             return SynthesizeTasks(dispatch);
+        }
+    }
+
+    /// <summary>
+    /// Reports the decomposition as a LIST OF STEPS, not a sentence (v8.1).
+    ///
+    /// <para>
+    /// It used to go out as one <see cref="Trace.ThinkingAsync"/> blob —
+    /// <c>"broke the goal into 8 steps: A → B → C → …"</c> — which the chat surface renders
+    /// as flowing prose, because that is what the thinking channel is: a stream of
+    /// fragments to be accumulated. So the one genuinely STRUCTURED thing this pass
+    /// produces, the shape of the whole goal, arrived as the least structured thing on
+    /// screen: an arrow-separated paragraph that wrapped across four lines and had to be
+    /// read left to right to be counted.
+    /// </para>
+    ///
+    /// <para>
+    /// Every other receipt in the drawer is already a step — <c>Composing the plan</c>,
+    /// <c>Drafted 7 step(s)</c>, the safety notices — and a step arrives WHOLE, so the
+    /// client lists it instead of guessing where one thought ends. The decomposition is
+    /// the most list-shaped thing in the run; it just was not being sent that way.
+    /// </para>
+    ///
+    /// <para>
+    /// Dependencies are printed as POSITIONS, not ids: <c>depends_on</c> carries "t3",
+    /// which is the model's own bookkeeping and means nothing to the person reading it.
+    /// </para>
+    /// </summary>
+    private async Task ReportDecompositionAsync(IReadOnlyList<TaskRecord> tasks, int repairs)
+    {
+        if (tasks.Count == 0) return;
+
+        await _trace.ThinkingStepAsync(
+            $"Broke the goal into {tasks.Count} step(s)",
+            repairs > 0 ? $"{repairs} repaired into an executable order" : null);
+
+        // id -> 1-based position, so "after t3" can be said as "after step 3".
+        var position = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var i = 0; i < tasks.Count; i++) position[tasks[i].TaskId] = i + 1;
+
+        for (var i = 0; i < tasks.Count; i++)
+        {
+            var task = tasks[i];
+            var parts = new List<string>(2);
+            if (task.Capabilities.Count > 0)
+            {
+                parts.Add(string.Join(" · ", task.Capabilities));
+            }
+            var after = task.DependsOn
+                .Where(position.ContainsKey)
+                .Select(id => position[id])
+                .OrderBy(n => n)
+                .ToArray();
+            if (after.Length > 0)
+            {
+                parts.Add(after.Length == 1
+                    ? $"after step {after[0]}"
+                    : $"after steps {string.Join(", ", after)}");
+            }
+            await _trace.ThinkingStepAsync(
+                $"{i + 1}. {task.Title}",
+                parts.Count > 0 ? string.Join(" — ", parts) : null);
         }
     }
 
@@ -2190,8 +2252,47 @@ public sealed class GoalAgent
             var function = _kernel.Plugins.GetFunction(proposal.Module, proposal.Function);
             var args = ToKernelArguments(proposal.Args);
             _logger.LogInformation("execute_proposal {ProposalId} {Module}.{Function}", proposal.ProposalId, proposal.Module, proposal.Function);
-            var invokeResult = await _kernel.InvokeAsync(function, args, ct);
-            var resultText = invokeResult.ToString();
+
+            // ONE PROPOSAL MAY FAIL WITHOUT TAKING THE GOAL WITH IT (v8.1).
+            //
+            // This invoke was unguarded, and plugins throw ON PURPOSE — Deliveries.Hold
+            // throws for an essential delivery, and Find throws when the named delivery
+            // does not exist at all. The commonest trigger is not a plugin bug: it is the
+            // model naming something the household has never had ("magazine
+            // subscription"), which is precisely the class of mistake this executor exists
+            // to catch. Instead it propagated out of the loop and out of the handler, so
+            // every later proposal was skipped, nothing was marked executed, and the
+            // status frame — the only thing that tells the cloud and the board what
+            // happened — was never sent. The goal went quiet, and the sole evidence was
+            // one stack trace in the device log.
+            //
+            // Reported per proposal and the loop carries on. Cancellation is NOT caught:
+            // a cancelled goal is not a failed actuator, and swallowing it here would turn
+            // shutdown into a page of spurious failures.
+            string resultText;
+            try
+            {
+                resultText = (await _kernel.InvokeAsync(function, args, ct)).ToString();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Unwrap: the kernel wraps a plugin throw, and the inner message is the
+                // one written for a person ("'repeat prescription' is an essential
+                // delivery and cannot be held").
+                var reason = (ex.InnerException ?? ex).Message;
+                _logger.LogWarning(ex, "proposal_failed {ProposalId} {Module}.{Function}: {Reason}",
+                    proposal.ProposalId, proposal.Module, proposal.Function, reason);
+                await _trace.ThinkingStepAsync(
+                    $"Couldn't {proposal.Module}.{proposal.Function}", reason, ThinkingKinds.Notice);
+                executed.Add(new ExecutedEffect
+                {
+                    ProposalId = proposal.ProposalId,
+                    Action = $"{proposal.Module}.{proposal.Function}",
+                    Result = ExecutionResults.FailedActuator,
+                    Detail = reason
+                });
+                continue;
+            }
 
             // THE FILTER REFUSED IT. The plugin never ran — the gate did its job — but
             // saying "executed" here would tell the user the action happened, with the

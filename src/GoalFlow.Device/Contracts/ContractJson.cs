@@ -110,6 +110,30 @@ public static class ExecutionResults
     /// </para>
     /// </summary>
     public const string BlockedSafety = "blocked_safety";
+
+    /// <summary>
+    /// It RAN and threw: the actuator refused the arguments it was given (v8.1).
+    ///
+    /// <para>
+    /// The fourth outcome, and the one that was missing. Plugins throw DELIBERATELY —
+    /// <c>DeliveriesPlugin.Hold</c> throws for an essential delivery precisely because
+    /// "a refusal the planner can read as done is a refusal that lands on the card as a
+    /// completed step" — but nothing caught them, so a single throw took down the whole
+    /// approval handler: every later proposal in the plan went unexecuted, nothing was
+    /// marked executed, and NO status frame was ever sent. The goal simply stopped, with
+    /// one line in the device log and silence everywhere else.
+    /// </para>
+    ///
+    /// <para>
+    /// The commonest cause is not a bug in the plugin: it is the model naming something
+    /// that does not exist (a "magazine subscription" the household has never had). That
+    /// is exactly what the executor is for — LLM plans, code checks — so it is reported
+    /// per proposal and the rest of the plan carries on. Like <see cref="BlockedSafety"/>
+    /// the approval does NOT stand: the arguments were frozen at planning time, so
+    /// re-applying it fails the same way.
+    /// </para>
+    /// </summary>
+    public const string FailedActuator = "failed_actuator";
 }
 
 /// <summary>

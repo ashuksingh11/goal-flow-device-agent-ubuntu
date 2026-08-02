@@ -1205,6 +1205,27 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
         Tier = ApprovalTiers.Light,
         Reason = "restock",
     });
+    // p3 THROWS: the household has never had a magazine subscription, so the plugin's
+    // Find raises. This is the commonest actuator failure there is — the model naming
+    // something that does not exist — and it used to be fatal. The invoke was unguarded,
+    // so the exception left the loop AND the handler: every later proposal was skipped,
+    // nothing was marked executed, and the status frame that tells the cloud and the
+    // board what happened was never sent. The goal went silent with one stack trace in
+    // the device log, which is exactly how it was found.
+    approvals.Register(new ProposalItem
+    {
+        ProposalId = "p3",
+        Action = "hold the magazine subscription",
+        Module = "Deliveries",
+        Function = "Hold",
+        Args = new JsonObject
+        {
+            ["delivery"] = "magazine subscription",
+            ["until"] = $"{clock.Today.AddDays(9):yyyy-MM-dd}",
+        },
+        Tier = ApprovalTiers.Firm,
+        Reason = "nobody is home to take it in",
+    });
 
     using (safety.BeginGoal(dispatch.GoalId, hard))
     {
@@ -1217,6 +1238,7 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
                 Decisions =
                 [
                     new ApprovalDecision { ProposalId = "p1", Approved = true },
+                    new ApprovalDecision { ProposalId = "p3", Approved = true },
                     new ApprovalDecision { ProposalId = "p2", Approved = true },
                 ],
             },
@@ -1246,10 +1268,34 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
             failures.Add("a blocked proposal must NOT be marked executed — unlike a deferred pre-check, re-applying it can never work");
         }
 
+        // The actuator that THREW. Reported, not fatal.
+        var threw = executed.FirstOrDefault(e => e.ProposalId == "p3");
+        if (threw is null)
+        {
+            failures.Add("an actuator that threw must still be REPORTED — the goal used to go silent instead");
+        }
+        else
+        {
+            if (threw.Result != ExecutionResults.FailedActuator)
+            {
+                failures.Add($"a proposal whose actuator threw must come back failed, got '{threw.Result}'");
+            }
+
+            if (threw.Detail?.Contains("magazine subscription", StringComparison.Ordinal) != true)
+            {
+                failures.Add($"the failure must say WHAT could not be done, got '{threw.Detail}'");
+            }
+        }
+
+        if (approvals.ExecutedIds().Contains("p3"))
+        {
+            failures.Add("a failed actuator must NOT be marked executed — the args were frozen at planning time, so re-applying fails identically");
+        }
+
         var allowed = executed.FirstOrDefault(e => e.ProposalId == "p2");
         if (allowed?.Result != ExecutionResults.Executed)
         {
-            failures.Add($"one blocked proposal must not take the others down with it, got '{allowed?.Result}'");
+            failures.Add($"one blocked or failed proposal must not take the others down with it, got '{allowed?.Result}'");
         }
 
         if (!approvals.ExecutedIds().Contains("p2"))
