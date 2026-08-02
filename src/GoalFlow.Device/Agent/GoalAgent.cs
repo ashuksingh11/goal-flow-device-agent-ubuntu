@@ -662,20 +662,13 @@ public sealed class GoalAgent
             return false;
         }
 
-        // EXECUTING COUNTS, NOT JUST MONITORING (v8.1).
+        // EXECUTING COUNTS, NOT JUST MONITORING. Tasks reach Monitoring on the LAST line of
+        // ApplyApprovalCoreAsync, so anything that stops it getting there strands them in
+        // Executing — and sweeping only Monitoring meant the goal could then never complete,
+        // leaving its card on the board past its dates for the rest of the session.
         //
-        // Tasks reach Monitoring at the END of ApplyApprovalCoreAsync. Anything that stops
-        // that method reaching its last line leaves them in Executing — and this used to
-        // return false on an empty Monitoring set, so the goal could NEVER complete. Not
-        // "completes late": never. Its card sat on the board for the rest of the session,
-        // past its dates, with no way to clear it, while every other goal retired around
-        // it. That is what an unguarded actuator throw left behind, and it is why the
-        // symptom outlived the crash that caused it by a whole demo.
-        //
-        // A goal whose last day has passed is over, whether or not its executor finished
-        // tidily. What is deliberately still NOT swept is a goal that never got that far —
-        // Created / Ready / Planning / AwaitingApproval. A goal still waiting on a person
-        // is not complete, and quietly retiring it would answer for them.
+        // Still NOT swept: Created / Ready / Planning / AwaitingApproval. A goal waiting on
+        // a person is not complete, and retiring it would answer for them.
         var outstanding = goal.Tasks
             .Where(t => t.State is TaskState.Monitoring or TaskState.Executing)
             .ToArray();
@@ -793,28 +786,12 @@ public sealed class GoalAgent
     }
 
     /// <summary>
-    /// Reports the decomposition as a LIST OF STEPS, not a sentence (v8.1).
+    /// Reports the decomposition as a list of STEPS, not one prose blob.
     ///
     /// <para>
-    /// It used to go out as one <see cref="Trace.ThinkingAsync"/> blob —
-    /// <c>"broke the goal into 8 steps: A → B → C → …"</c> — which the chat surface renders
-    /// as flowing prose, because that is what the thinking channel is: a stream of
-    /// fragments to be accumulated. So the one genuinely STRUCTURED thing this pass
-    /// produces, the shape of the whole goal, arrived as the least structured thing on
-    /// screen: an arrow-separated paragraph that wrapped across four lines and had to be
-    /// read left to right to be counted.
-    /// </para>
-    ///
-    /// <para>
-    /// Every other receipt in the drawer is already a step — <c>Composing the plan</c>,
-    /// <c>Drafted 7 step(s)</c>, the safety notices — and a step arrives WHOLE, so the
-    /// client lists it instead of guessing where one thought ends. The decomposition is
-    /// the most list-shaped thing in the run; it just was not being sent that way.
-    /// </para>
-    ///
-    /// <para>
-    /// Dependencies are printed as POSITIONS, not ids: <c>depends_on</c> carries "t3",
-    /// which is the model's own bookkeeping and means nothing to the person reading it.
+    /// Steps arrive whole, so a client lists them; <see cref="Trace.ThinkingAsync"/> is a
+    /// stream of fragments and renders as flowing prose. Dependencies print as POSITIONS —
+    /// <c>depends_on</c> carries "t3", which means nothing to the person reading it.
     /// </para>
     /// </summary>
     private async Task ReportDecompositionAsync(IReadOnlyList<TaskRecord> tasks, int repairs)
@@ -2269,22 +2246,13 @@ public sealed class GoalAgent
             var args = ToKernelArguments(proposal.Args);
             _logger.LogInformation("execute_proposal {ProposalId} {Module}.{Function}", proposal.ProposalId, proposal.Module, proposal.Function);
 
-            // ONE PROPOSAL MAY FAIL WITHOUT TAKING THE GOAL WITH IT (v8.1).
+            // ONE PROPOSAL MAY FAIL WITHOUT TAKING THE GOAL WITH IT. Plugins throw ON
+            // PURPOSE (Deliveries.Hold refuses an essential delivery; Find throws for one
+            // the household does not have), and unguarded, a single throw left the loop AND
+            // the handler — later proposals skipped, no status frame sent at all.
             //
-            // This invoke was unguarded, and plugins throw ON PURPOSE — Deliveries.Hold
-            // throws for an essential delivery, and Find throws when the named delivery
-            // does not exist at all. The commonest trigger is not a plugin bug: it is the
-            // model naming something the household has never had ("magazine
-            // subscription"), which is precisely the class of mistake this executor exists
-            // to catch. Instead it propagated out of the loop and out of the handler, so
-            // every later proposal was skipped, nothing was marked executed, and the
-            // status frame — the only thing that tells the cloud and the board what
-            // happened — was never sent. The goal went quiet, and the sole evidence was
-            // one stack trace in the device log.
-            //
-            // Reported per proposal and the loop carries on. Cancellation is NOT caught:
-            // a cancelled goal is not a failed actuator, and swallowing it here would turn
-            // shutdown into a page of spurious failures.
+            // Cancellation is NOT caught: a cancelled goal is not a failed actuator, and
+            // swallowing it would turn shutdown into a page of spurious failures.
             string resultText;
             try
             {
