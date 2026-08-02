@@ -189,7 +189,26 @@ the global Advance-day world tick, guest prep-timeline + appliance gating, and c
 enforcement resolved per goal, including the household envelope across goals and the
 date-window block for an empty house.
 
-Verify with `./verify/v7-m7/check.sh` — it chains gates 1–28 and needs no API key.
+Verify with `./verify/v8-m1/check.sh` — it chains gates 1–29 and needs no API key.
+
+**Before anything else, check `OPENROUTER_PROVIDER_ORDER` is set (v8).** Unset, OpenRouter
+load-balances `gpt-oss-120b` across nineteen endpoints spanning 39x in throughput and lands
+on the slow ones: four identical runs measured 59s / 175s / 145s / 189s unpinned, and
+8.4s / 8.4s / 8.7s / 10.1s pinned. The agent logs `llm_routing ...` at startup — if it says
+`off`, that is why a run is slow.
+
+The shipped config is `OPENROUTER_PROVIDER_ORDER=cerebras` **plus
+`OPENROUTER_PROVIDER_ALLOW_FALLBACKS=false`**, and the second line is not caution, it is the
+measurement: the next-best provider takes 203-234s on the real pipeline, *slower than sending
+no preference at all*. Falling back here is a silent four-minute stall, not a graceful degrade.
+
+`Agent/LlmRouting.cs` holds the config and `reasoning_effort`; `Agent/OpenRouterBodyHandler.cs`
+is how `provider` actually reaches the wire — **both device repos are pinned to SK 1.43, which
+has no `ExtraBody`**, so it rides on the HttpClient instead. `LLM_REASONING_EFFORT` is built and
+ships OFF; its doc comment explains why `low` must not be turned on without re-measuring.
+
+`grounding_done` now carries `rounds=` and `suppressed=` alongside `elapsed_ms` — the round
+count is what used to vary invisibly between an 80s and a 240s grounding pass.
 (Gate 18 is retired: proactive suggestions were removed in v7.1, so `verify/m8`
 is an empty link kept because v6-m2 chains it.)
 

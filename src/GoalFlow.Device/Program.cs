@@ -69,6 +69,7 @@ services.AddSingleton<SafetyFilter>();
 services.AddSingleton<ApprovalCoordinator>();
 services.AddSingleton<Grounding>();
 services.AddSingleton<RepeatReadFilter>();
+services.AddSingleton<ToolRoundFilter>();
 services.AddSingleton<MonitorAdapt>();
 services.AddSingleton<PrecheckEngine>();
 
@@ -92,6 +93,14 @@ if (ProgramHelpers.TryParsePositiveInt(Environment.GetEnvironmentVariable("LLM_S
 // audience can watch the pipeline light up. 0/unset = OFF (real timing). Allow 0 explicitly.
 if (int.TryParse(Environment.GetEnvironmentVariable("HARNESS_DWELL_MS"), out var harnessDwell) && harnessDwell >= 0)
     settings = settings with { HarnessDwellMs = harnessDwell };
+// v8: OpenRouter provider routing + per-call-site reasoning_effort. Resolved ONCE here, so the
+// mechanism never reads the environment itself — Tizen has no environment variables and fills the
+// same record from goalflow.conf. Unset = LlmRouting.None = a request body identical to v7.
+settings = settings with
+{
+    Routing = LlmRouting.FromEnvironment(
+        Environment.GetEnvironmentVariable, loggerFactory.CreateLogger("llm-routing"))
+};
 var kernel = GoalAgent.BuildKernel(settings, provider);
 
 WsClient? liveWs = null;
@@ -123,6 +132,7 @@ var agent = new GoalAgent(
     provider.GetRequiredService<Grounding>(),
     provider.GetRequiredService<SafetyFilter>(),
     provider.GetRequiredService<RepeatReadFilter>(),
+    provider.GetRequiredService<ToolRoundFilter>(),
     provider.GetRequiredService<ApprovalCoordinator>(),
     provider.GetRequiredService<MonitorAdapt>(),
     provider.GetRequiredService<CapabilityManager>(),
@@ -259,6 +269,12 @@ if (options.VerifyPrechecks)
 if (options.VerifyRepeatReads)
 {
     Environment.ExitCode = await ProgramHelpers.VerifyRepeatReadsAsync(provider, loggerFactory);
+    return;
+}
+
+if (options.VerifyRequestShape)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyRequestShapeAsync(loggerFactory);
     return;
 }
 
@@ -448,6 +464,7 @@ internal sealed record CliOptions
 
     /// <summary>--verify-deadline — assert a stalled provider stream aborts rather than wedging a goal (M6 gate).</summary>
     public bool VerifyDeadline { get; init; }
+    public bool VerifyRequestShape { get; init; }
 
     public static CliOptions Parse(string[] args)
     {
@@ -504,6 +521,7 @@ internal sealed record CliOptions
                 "--verify-trace-isolation" => options with { VerifyTraceIsolation = true },
                 "--verify-repeat-reads" => options with { VerifyRepeatReads = true },
                 "--verify-deadline" => options with { VerifyDeadline = true },
+                "--verify-request-shape" => options with { VerifyRequestShape = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -512,7 +530,25 @@ internal sealed record CliOptions
     }
 }
 
-/// <summary>Minimal KEY=VALUE .env loader (BCL only; missing file is fine).</summary>
+/// <summary>
+/// Minimal KEY=VALUE .env loader (BCL only; missing file is fine).
+///
+/// <para>
+/// THE FILE DOES NOT OVERRIDE THE ENVIRONMENT. It used to, unconditionally, which made
+/// <c>FOO=bar dotnet run …</c> silently do nothing for any key that also appeared in
+/// <c>.env</c> — the command looked like it worked, the value was replaced before anything
+/// read it, and there was no message. It cost a bad measurement: a run exported with a
+/// <c>:nitro</c> model id was quietly executed with the plain one from the file and came back
+/// at 186s, looking like evidence about Semantic Kernel rather than about this loader.
+/// </para>
+///
+/// <para>
+/// It is also the precedence Tizen already uses — <c>DeviceConfig.Get</c> reads the
+/// environment first and falls back to <c>goalflow.conf</c>. Having the two devices disagree
+/// about which source wins is exactly the kind of difference that makes a port behave
+/// differently from the box it was tested on.
+/// </para>
+/// </summary>
 internal static class DotEnv
 {
     public static void Load(string path)
@@ -530,6 +566,12 @@ internal static class DotEnv
             if (idx <= 0) continue;
             var key = trimmed[..idx].Trim();
             var value = trimmed[(idx + 1)..].Trim().Trim('"');
+            // Already set for real? Leave it. A value on the command line is the more
+            // deliberate of the two.
+            if (Environment.GetEnvironmentVariable(key) is { Length: > 0 })
+            {
+                continue;
+            }
             Environment.SetEnvironmentVariable(key, value);
         }
     }
@@ -1136,6 +1178,14 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
         Constraints = new TaskConstraints { Hard = hard },
     };
     tasks.CreateGoal(dispatch, [new TaskRecord { TaskId = "t1", GoalId = dispatch.GoalId, Title = "prep" }], new JsonObject());
+    // Walk t1 to AwaitingApproval, which is where a real goal sits when an approval
+    // arrives. Without this the task stays Created, ApplyApproval's transitions match
+    // nothing, and the ledger assertion below passes while testing nothing — which is
+    // exactly what it did on its first run.
+    // Placed directly rather than walked through TransitionAsync: a transition emits a
+    // task_update, and Trace refuses to emit outside a goal scope this harness has not
+    // opened yet. The state is what matters here, not the path to it.
+    tasks.GetGoal(dispatch.GoalId)!.Tasks[0].State = TaskState.AwaitingApproval;
 
     // p1 runs the dishwasher mid-trip (forbidden); p2 adds to the shopping list (fine).
     approvals.Register(new ProposalItem
@@ -1163,6 +1213,27 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
         Tier = ApprovalTiers.Light,
         Reason = "restock",
     });
+    // p3 THROWS: the household has never had a magazine subscription, so the plugin's
+    // Find raises. This is the commonest actuator failure there is — the model naming
+    // something that does not exist — and it used to be fatal. The invoke was unguarded,
+    // so the exception left the loop AND the handler: every later proposal was skipped,
+    // nothing was marked executed, and the status frame that tells the cloud and the
+    // board what happened was never sent. The goal went silent with one stack trace in
+    // the device log, which is exactly how it was found.
+    approvals.Register(new ProposalItem
+    {
+        ProposalId = "p3",
+        Action = "hold the magazine subscription",
+        Module = "Deliveries",
+        Function = "Hold",
+        Args = new JsonObject
+        {
+            ["delivery"] = "magazine subscription",
+            ["until"] = $"{clock.Today.AddDays(9):yyyy-MM-dd}",
+        },
+        Tier = ApprovalTiers.Firm,
+        Reason = "nobody is home to take it in",
+    });
 
     using (safety.BeginGoal(dispatch.GoalId, hard))
     {
@@ -1175,6 +1246,7 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
                 Decisions =
                 [
                     new ApprovalDecision { ProposalId = "p1", Approved = true },
+                    new ApprovalDecision { ProposalId = "p3", Approved = true },
                     new ApprovalDecision { ProposalId = "p2", Approved = true },
                 ],
             },
@@ -1204,15 +1276,54 @@ public static async Task<int> VerifyApprovalBlockAsync(IServiceProvider provider
             failures.Add("a blocked proposal must NOT be marked executed — unlike a deferred pre-check, re-applying it can never work");
         }
 
+        // The actuator that THREW. Reported, not fatal.
+        var threw = executed.FirstOrDefault(e => e.ProposalId == "p3");
+        if (threw is null)
+        {
+            failures.Add("an actuator that threw must still be REPORTED — the goal used to go silent instead");
+        }
+        else
+        {
+            if (threw.Result != ExecutionResults.FailedActuator)
+            {
+                failures.Add($"a proposal whose actuator threw must come back failed, got '{threw.Result}'");
+            }
+
+            if (threw.Detail?.Contains("magazine subscription", StringComparison.Ordinal) != true)
+            {
+                failures.Add($"the failure must say WHAT could not be done, got '{threw.Detail}'");
+            }
+        }
+
+        if (approvals.ExecutedIds().Contains("p3"))
+        {
+            failures.Add("a failed actuator must NOT be marked executed — the args were frozen at planning time, so re-applying fails identically");
+        }
+
         var allowed = executed.FirstOrDefault(e => e.ProposalId == "p2");
         if (allowed?.Result != ExecutionResults.Executed)
         {
-            failures.Add($"one blocked proposal must not take the others down with it, got '{allowed?.Result}'");
+            failures.Add($"one blocked or failed proposal must not take the others down with it, got '{allowed?.Result}'");
         }
 
         if (!approvals.ExecutedIds().Contains("p2"))
         {
             failures.Add("the allowed proposal must be marked executed");
+        }
+
+        // ...AND THE LEDGER MUST NOT BE LEFT MID-FLIGHT. Tasks reach Monitoring on the
+        // last line of ApplyApprovalCoreAsync, so anything that stops it getting there
+        // strands them in Executing — and CompleteIfWindowPassedAsync could then never
+        // complete the goal. Not "completes late": never. Its card sat on the board for
+        // the rest of the session, past its dates, while every other goal retired around
+        // it. That is how a single actuator throw outlived itself by a whole demo, and it
+        // is the reason this assertion is here rather than in a lifecycle gate: the throw
+        // and the stranding are one failure, and only this gate has both.
+        var stranded = tasks.GetGoal(dispatch.GoalId)?.Tasks
+            .Where(t => t.State == TaskState.Executing).ToArray() ?? [];
+        if (stranded.Length > 0)
+        {
+            failures.Add($"a failed actuator must not strand the ledger — {stranded.Length} task(s) left Executing, and a goal with nothing Monitoring can never complete");
         }
     }
 
@@ -2619,6 +2730,227 @@ public static async Task<int> VerifyDeadlineAsync(ILoggerFactory loggerFactory)
         "the same exception under genuine cancellation is NOT transient");
 
     Console.WriteLine(failures == 0 ? "gate 15 (provider deadline): PASS" : $"gate 15 (provider deadline): FAIL: {failures}");
+    return failures == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// Gate 29 (v8-M1) — the two OpenRouter body fields SK does not model, and the promise that
+/// they are INVISIBLE until someone asks for them.
+///
+/// <para>
+/// HALF THIS GATE IS ABOUT THE FIELDS BEING ABSENT, and that half matters more. Every other
+/// gate in <c>verify/</c> was written against a request body with no <c>provider</c> and no
+/// <c>reasoning_effort</c> in it, and not one of them would notice if we started sending them —
+/// they never reach the network. This one does, so "unset changes nothing" is a measured claim
+/// rather than a hope.
+/// </para>
+///
+/// <para>
+/// It asserts on the WIRE, not on the settings object, because the claim under test is a claim
+/// about SK's serializer: that <c>ExtraBody</c> lands as a top-level <c>provider</c> key and not
+/// nested under <c>extra_body</c>, and that it does so on the streaming path too. Asserting on
+/// <c>OpenAIPromptExecutionSettings</c> would prove only that we set a property.
+/// </para>
+/// </summary>
+public static async Task<int> VerifyRequestShapeAsync(ILoggerFactory loggerFactory)
+{
+    var failures = 0;
+    void Check(bool ok, string what)
+    {
+        if (!ok) { failures++; Console.WriteLine($"  FAIL {what}"); }
+        else { Console.WriteLine($"  ok   {what}"); }
+    }
+
+    using var listener = new System.Net.HttpListener();
+    var port = 8600 + (Environment.ProcessId % 400);
+    listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+    listener.Start();
+
+    var bodies = new System.Collections.Concurrent.ConcurrentQueue<System.Text.Json.JsonElement>();
+    using var stop = new CancellationTokenSource();
+    var serve = Task.Run(async () =>
+    {
+        while (!stop.IsCancellationRequested)
+        {
+            System.Net.HttpListenerContext context;
+            try { context = await listener.GetContextAsync(); }
+            catch { return; }
+
+            string raw;
+            using (var reader = new StreamReader(context.Request.InputStream))
+            {
+                raw = await reader.ReadToEndAsync();
+            }
+
+            var streaming = false;
+            try
+            {
+                var parsed = System.Text.Json.JsonDocument.Parse(raw);
+                bodies.Enqueue(parsed.RootElement.Clone());
+                streaming = parsed.RootElement.TryGetProperty("stream", out var s)
+                    && s.ValueKind == System.Text.Json.JsonValueKind.True;
+            }
+            catch { /* an unparseable body fails the assertions below, which is the point */ }
+
+            context.Response.StatusCode = 200;
+            if (streaming)
+            {
+                // Mirror the real thing closely enough that the SDK commits to the stream:
+                // the deadline gate learned the hard way that a fixture the client REJECTS
+                // tests the rejection, not the behaviour under test.
+                context.Response.ContentType = "text/event-stream";
+                context.Response.SendChunked = true;
+                var body = context.Response.OutputStream;
+                var chunk = System.Text.Encoding.UTF8.GetBytes(
+                    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"shape-test\","
+                    + "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+                    + "data: [DONE]\n\n");
+                await body.WriteAsync(chunk);
+                await body.FlushAsync();
+            }
+            else
+            {
+                context.Response.ContentType = "application/json";
+                var body = System.Text.Encoding.UTF8.GetBytes(
+                    "{\"id\":\"c\",\"object\":\"chat.completion\",\"created\":1,\"model\":\"shape-test\","
+                    + "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"{}\"},\"finish_reason\":\"stop\"}]}");
+                await context.Response.OutputStream.WriteAsync(body);
+            }
+            context.Response.Close();
+        }
+    });
+
+    // Built PER ROUTING, not once: `provider` rides on the HttpClient now, so a kernel that was
+    // built from a different routing would not be testing the thing under test.
+    Microsoft.SemanticKernel.ChatCompletion.IChatCompletionService ChatFor(LlmRouting routing)
+        => Kernel.CreateBuilder()
+            .AddOpenAIChatCompletion(modelId: "shape-test", endpoint: new Uri($"http://127.0.0.1:{port}"),
+                apiKey: "test", orgId: null, serviceId: null,
+                httpClient: OpenRouterBodyHandler.CreateClient(routing))
+            .Build()
+            .GetRequiredService<Microsoft.SemanticKernel.ChatCompletion.IChatCompletionService>();
+
+    async Task<System.Text.Json.JsonElement> SendAsync(LlmRouting routing, LlmCallSite site, bool streaming)
+    {
+        while (bodies.TryDequeue(out _)) { }
+        var chat = ChatFor(routing);
+        var kernel = new Kernel();
+        var settings = routing.Apply(new Microsoft.SemanticKernel.Connectors.OpenAI.OpenAIPromptExecutionSettings { Temperature = 0.1, MaxTokens = 64 }, site);
+        var history = new Microsoft.SemanticKernel.ChatCompletion.ChatHistory();
+        history.AddUserMessage("shape");
+        try
+        {
+            if (streaming)
+            {
+                await foreach (var _ in chat.GetStreamingChatMessageContentsAsync(history, settings, kernel)) { }
+            }
+            else
+            {
+                await Microsoft.SemanticKernel.ChatCompletion.ChatCompletionServiceExtensions.GetChatMessageContentAsync(chat, history, settings, kernel);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  (send failed: {ex.GetType().Name}: {ex.Message})");
+        }
+        return bodies.TryDequeue(out var body) ? body : default;
+    }
+
+    static bool Has(System.Text.Json.JsonElement body, string key)
+        => body.ValueKind == System.Text.Json.JsonValueKind.Object && body.TryGetProperty(key, out _);
+
+    static string? Str(System.Text.Json.JsonElement body, string key)
+        => body.ValueKind == System.Text.Json.JsonValueKind.Object && body.TryGetProperty(key, out var v)
+           && v.ValueKind == System.Text.Json.JsonValueKind.String ? v.GetString() : null;
+
+    // --- the no-op: this is the gate that protects every OTHER gate ---
+    var none = LlmRouting.FromEnvironment(_ => null);
+    Check(none.IsNoOp, "nothing set at all resolves to LlmRouting.None");
+
+    var plain = await SendAsync(none, LlmCallSite.Compose, streaming: false);
+    Check(plain.ValueKind == System.Text.Json.JsonValueKind.Object, "the fixture captured a request body");
+    Check(!Has(plain, "provider"), "unset: a non-streaming body carries NO provider key");
+    Check(!Has(plain, "reasoning_effort"), "unset: a non-streaming body carries NO reasoning_effort key");
+    Check(!Has(plain, "extra_body"), "unset: nothing leaks through as a literal extra_body key");
+
+    var plainStream = await SendAsync(none, LlmCallSite.Grounding, streaming: true);
+    Check(!Has(plainStream, "provider") && !Has(plainStream, "reasoning_effort"),
+        "unset: a STREAMING body carries neither");
+
+    // --- routed ---
+    var env = new Dictionary<string, string?>(StringComparer.Ordinal)
+    {
+        ["OPENROUTER_PROVIDER_ORDER"] = "cerebras,groq",
+        ["LLM_REASONING_EFFORT"] = "medium",
+        ["LLM_REASONING_EFFORT_COMPOSE"] = "off",
+    };
+    var routed = LlmRouting.FromEnvironment(k => env.TryGetValue(k, out var v) ? v : null);
+    Check(!routed.IsNoOp, "with the vars set it is no longer a no-op");
+
+    var ground = await SendAsync(routed, LlmCallSite.Grounding, streaming: true);
+    Check(Has(ground, "provider"), "provider is a TOP-LEVEL body field on the STREAMING path");
+    if (Has(ground, "provider"))
+    {
+        var provider = ground.GetProperty("provider");
+        var order = provider.TryGetProperty("order", out var o) && o.ValueKind == System.Text.Json.JsonValueKind.Array
+            ? o.EnumerateArray().Select(x => x.GetString()).ToArray()
+            : Array.Empty<string?>();
+        Check(order.Length == 2 && order[0] == "cerebras" && order[1] == "groq",
+            $"provider.order is [cerebras, groq] in that order (got [{string.Join(", ", order)}])");
+        Check(provider.TryGetProperty("allow_fallbacks", out var af)
+            && af.ValueKind == System.Text.Json.JsonValueKind.True,
+            "allow_fallbacks defaults to true when it is not configured");
+    }
+    Check(Str(ground, "reasoning_effort") == "medium", "grounding STREAMS and still carries reasoning_effort");
+    Check(ground.TryGetProperty("stream", out var streamFlag)
+        && streamFlag.ValueKind == System.Text.Json.JsonValueKind.True,
+        "the handler ADDED provider without disturbing what SK wrote (\"stream\": true survives)");
+
+    var compose = await SendAsync(routed, LlmCallSite.Compose, streaming: false);
+    Check(Has(compose, "provider"), "compose carries provider too — routing is process-wide");
+    Check(!Has(compose, "reasoning_effort"),
+        "LLM_REASONING_EFFORT_COMPOSE=off suppresses the global default at that ONE site");
+
+    // --- "cerebras or nothing", which is what the demo ships ---
+    //
+    // The mechanism's DEFAULT is allow_fallbacks:true, but the demo turns it off, and the
+    // measurement is why: Cerebras plans a goal in 8-10s and the next-best provider takes
+    // 203-234s — slower than sending no preference at all. Falling back is not graceful
+    // degradation here, so a run that cannot have Cerebras should fail visibly instead.
+    var strictEnv = new Dictionary<string, string?>(StringComparer.Ordinal)
+    {
+        ["OPENROUTER_PROVIDER_ORDER"] = "cerebras",
+        ["OPENROUTER_PROVIDER_ALLOW_FALLBACKS"] = "false",
+    };
+    var strict = LlmRouting.FromEnvironment(k => strictEnv.TryGetValue(k, out var v) ? v : null);
+    var strictBody = await SendAsync(strict, LlmCallSite.Compose, streaming: false);
+    if (Has(strictBody, "provider"))
+    {
+        var sp = strictBody.GetProperty("provider");
+        var order = sp.TryGetProperty("order", out var so) && so.ValueKind == System.Text.Json.JsonValueKind.Array
+            ? so.EnumerateArray().Select(x => x.GetString()).ToArray()
+            : Array.Empty<string?>();
+        Check(order.Length == 1 && order[0] == "cerebras", "strict: exactly one provider is named");
+        Check(sp.TryGetProperty("allow_fallbacks", out var saf)
+            && saf.ValueKind == System.Text.Json.JsonValueKind.False,
+            "strict: ALLOW_FALLBACKS=false reaches the wire as false, so a busy Cerebras fails loudly");
+    }
+    else
+    {
+        Check(false, "strict: provider block reached the wire");
+    }
+
+    // --- fail-soft: a bad value degrades to unset, it never throws ---
+    var garbage = LlmRouting.FromEnvironment(k => k == "OPENROUTER_PROVIDER_JSON" ? "{not json" : null);
+    Check(garbage.IsNoOp, "malformed OPENROUTER_PROVIDER_JSON is ignored, not thrown");
+    var badEffort = LlmRouting.FromEnvironment(k => k == "LLM_REASONING_EFFORT" ? "lo" : null);
+    Check(badEffort.IsNoOp, "an unknown reasoning_effort value is ignored, not thrown");
+
+    stop.Cancel();
+    listener.Stop();
+    try { await serve.WaitAsync(TimeSpan.FromSeconds(2)); } catch { /* shutting down */ }
+
+    Console.WriteLine(failures == 0 ? "gate 29 (request shape): PASS" : $"gate 29 (request shape): FAIL: {failures}");
     return failures == 0 ? 0 : 1;
 }
 

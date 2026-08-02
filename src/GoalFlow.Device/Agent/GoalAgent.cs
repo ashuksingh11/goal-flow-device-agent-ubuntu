@@ -51,6 +51,16 @@ public sealed record AgentSettings
     /// on Tizen. Suggested demo value ~1200–1500.
     /// </summary>
     public int HarnessDwellMs { get; init; } = 0;
+
+    /// <summary>
+    /// v8 — the two OpenRouter body fields SK does not model: provider routing and per-call-site
+    /// <c>reasoning_effort</c>. <see cref="LlmRouting.None"/> unless the environment says
+    /// otherwise, and None sends nothing, so the request body is byte-identical to v7 — which is
+    /// what keeps every verify gate honest. Resolved ONCE, here, rather than read from the
+    /// environment at the call sites: Tizen has no environment variables and populates this same
+    /// record from <c>goalflow.conf</c>.
+    /// </summary>
+    public LlmRouting Routing { get; init; } = LlmRouting.None;
 }
 
 /// <summary>
@@ -71,6 +81,7 @@ public sealed class GoalAgent
     private readonly Grounding _grounding;
     private readonly SafetyFilter _safety;
     private readonly RepeatReadFilter _repeatReads;
+    private readonly ToolRoundFilter _toolRounds;
     private readonly ApprovalCoordinator _approvals;
     private readonly MonitorAdapt _monitor;
     private readonly CapabilityManager _capabilities;
@@ -116,6 +127,7 @@ public sealed class GoalAgent
         Grounding grounding,
         SafetyFilter safety,
         RepeatReadFilter repeatReads,
+        ToolRoundFilter toolRounds,
         ApprovalCoordinator approvals,
         MonitorAdapt monitor,
         CapabilityManager capabilities,
@@ -130,6 +142,7 @@ public sealed class GoalAgent
         _grounding = grounding;
         _safety = safety;
         _repeatReads = repeatReads;
+        _toolRounds = toolRounds;
         _approvals = approvals;
         _monitor = monitor;
         _capabilities = capabilities;
@@ -140,8 +153,12 @@ public sealed class GoalAgent
         _llmCallBudget = TimeSpan.FromSeconds(Math.Max(MinTimeoutSeconds, settings.LlmCallTimeoutSeconds));
         _streamingCallBudget = TimeSpan.FromSeconds(Math.Max(MinTimeoutSeconds, settings.LlmStreamTimeoutSeconds));
         _harnessDwell = TimeSpan.FromMilliseconds(Math.Max(0, settings.HarnessDwellMs));
+        _routing = settings.Routing;
         _logger.LogInformation("llm_budgets model={Model} call_timeout_s={Call} stream_timeout_s={Stream} harness_dwell_ms={Dwell}",
             settings.ModelId, (int)_llmCallBudget.TotalSeconds, (int)_streamingCallBudget.TotalSeconds, (int)_harnessDwell.TotalMilliseconds);
+        // Its own line, and always logged: which provider served a run is the difference between
+        // a 1.5s compose and a 50s one, and "why was that run slow" is unanswerable without it.
+        _logger.LogInformation("llm_routing {Routing}", _routing.Describe());
     }
 
     /// <summary>
@@ -158,16 +175,28 @@ public sealed class GoalAgent
     {
         var builder = Kernel.CreateBuilder();
 
+        // The HttpClient is how `provider` reaches OpenRouter (SK 1.43 has no ExtraBody). It is
+        // NULL unless a provider preference is configured, and then SK builds its own exactly as
+        // before — which is what keeps every gate's request body unchanged. See
+        // OpenRouterBodyHandler for why its Timeout must be infinite.
+        var http = OpenRouterBodyHandler.CreateClient(settings.Routing);
         builder.AddOpenAIChatCompletion(
             modelId: settings.ModelId,
             endpoint: new Uri(settings.BaseUrl),
-            apiKey: settings.ApiKey);
+            apiKey: settings.ApiKey,
+            orgId: null,
+            serviceId: null,
+            httpClient: http);
 
         builder.Services.AddSingleton(services.GetRequiredService<ILoggerFactory>());
         builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<SafetyFilter>());
         // AFTER the safety filter, deliberately: the gate has already run on anything this
         // sees, so a memoized answer is never an unchecked one.
         builder.Services.AddSingleton<IFunctionInvocationFilter>(services.GetRequiredService<RepeatReadFilter>());
+        // A different KIND of filter: the two above run per function call, this one runs per
+        // model round-trip. It bounds the tool loop SK would otherwise let run to 128 turns,
+        // and records how many rounds a run actually took — see ToolRoundFilter.
+        builder.Services.AddSingleton<IAutoFunctionInvocationFilter>(services.GetRequiredService<ToolRoundFilter>());
         builder.Services.AddSingleton(services.GetRequiredService<IProductApiAdapter>());
 
         foreach (var capability in services.GetRequiredService<CapabilityManager>().Descriptors)
@@ -426,6 +455,26 @@ public sealed class GoalAgent
     private const int ComposeMaxTokens = 16000;
 
     /// <summary>
+    /// Decompose's OWN ceiling, because it was silently inheriting compose's.
+    ///
+    /// <para>
+    /// Decompose shares <see cref="GetComposeContentAsync"/> with compose, so a call that
+    /// returns one to eight task titles was asking for the same 16000 tokens as a seven-day
+    /// plan. Nothing in the reasoning above argues for that — it is inherited from code
+    /// sharing, not from a measurement.
+    /// </para>
+    ///
+    /// <para>
+    /// It matters more than a spare ceiling normally would, because this model expands its
+    /// reasoning to fill whatever budget it is given — the same effect documented at
+    /// <see cref="GroundingMaxTokens"/>, where raising a cap took a phase from 77s to 253s.
+    /// A ceiling here is a brake, and 1200 is roughly what the equivalent cloud-side
+    /// classification calls use.
+    /// </para>
+    /// </summary>
+    private const int DecomposeMaxTokens = 1200;
+
+    /// <summary>
     /// Grounding keeps its ORIGINAL, much smaller ceiling — measured, after raising it was
     /// tried and was worse.
     ///
@@ -471,6 +520,9 @@ public sealed class GoalAgent
     /// </summary>
     private readonly TimeSpan _llmCallBudget;
     private readonly TimeSpan _streamingCallBudget;
+
+    /// <summary>v8: provider routing + per-call-site reasoning effort. See <see cref="LlmRouting"/>.</summary>
+    private readonly LlmRouting _routing;
 
     /// <summary>v5 presenter-mode demo pacing; <see cref="TimeSpan.Zero"/> = OFF (real timing).</summary>
     private readonly TimeSpan _harnessDwell;
@@ -610,13 +662,22 @@ public sealed class GoalAgent
             return false;
         }
 
-        var monitoring = goal.Tasks.Where(t => t.State == TaskState.Monitoring).ToArray();
-        if (monitoring.Length == 0)
+        // EXECUTING COUNTS, NOT JUST MONITORING. Tasks reach Monitoring on the LAST line of
+        // ApplyApprovalCoreAsync, so anything that stops it getting there strands them in
+        // Executing — and sweeping only Monitoring meant the goal could then never complete,
+        // leaving its card on the board past its dates for the rest of the session.
+        //
+        // Still NOT swept: Created / Ready / Planning / AwaitingApproval. A goal waiting on
+        // a person is not complete, and retiring it would answer for them.
+        var outstanding = goal.Tasks
+            .Where(t => t.State is TaskState.Monitoring or TaskState.Executing)
+            .ToArray();
+        if (outstanding.Length == 0)
         {
             return false;
         }
 
-        foreach (var task in monitoring)
+        foreach (var task in outstanding)
         {
             await _tasks.TransitionAsync(goal.Dispatch.GoalId, task.TaskId, TaskState.Completed);
         }
@@ -672,7 +733,7 @@ public sealed class GoalAgent
             {
                 try
                 {
-                    content = (await GetComposeContentAsync(chat, history, ComposeSiteDecompose, ct)).Raw;
+                    content = (await GetComposeContentAsync(chat, history, LlmCallSite.Decompose, ct)).Raw;
                     break;
                 }
                 catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
@@ -714,13 +775,59 @@ public sealed class GoalAgent
 
             _logger.LogInformation("decomposed {GoalId} into {Count} task(s){Repaired}",
                 dispatch.GoalId, tasks.Count, repairs.Count > 0 ? $" ({repairs.Count} repaired)" : "");
-            await _trace.ThinkingAsync($"broke the goal into {tasks.Count} steps: {string.Join(" → ", tasks.Select(t => t.Title))}");
+            await ReportDecompositionAsync(tasks, repairs.Count);
             return tasks;
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             _logger.LogWarning(ex, "decompose_failed — falling back to a single task");
             return SynthesizeTasks(dispatch);
+        }
+    }
+
+    /// <summary>
+    /// Reports the decomposition as a list of STEPS, not one prose blob.
+    ///
+    /// <para>
+    /// Steps arrive whole, so a client lists them; <see cref="Trace.ThinkingAsync"/> is a
+    /// stream of fragments and renders as flowing prose. Dependencies print as POSITIONS —
+    /// <c>depends_on</c> carries "t3", which means nothing to the person reading it.
+    /// </para>
+    /// </summary>
+    private async Task ReportDecompositionAsync(IReadOnlyList<TaskRecord> tasks, int repairs)
+    {
+        if (tasks.Count == 0) return;
+
+        await _trace.ThinkingStepAsync(
+            $"Broke the goal into {tasks.Count} step(s)",
+            repairs > 0 ? $"{repairs} repaired into an executable order" : null);
+
+        // id -> 1-based position, so "after t3" can be said as "after step 3".
+        var position = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var i = 0; i < tasks.Count; i++) position[tasks[i].TaskId] = i + 1;
+
+        for (var i = 0; i < tasks.Count; i++)
+        {
+            var task = tasks[i];
+            var parts = new List<string>(2);
+            if (task.Capabilities.Count > 0)
+            {
+                parts.Add(string.Join(" · ", task.Capabilities));
+            }
+            var after = task.DependsOn
+                .Where(position.ContainsKey)
+                .Select(id => position[id])
+                .OrderBy(n => n)
+                .ToArray();
+            if (after.Length > 0)
+            {
+                parts.Add(after.Length == 1
+                    ? $"after step {after[0]}"
+                    : $"after steps {string.Join(", ", after)}");
+            }
+            await _trace.ThinkingStepAsync(
+                $"{i + 1}. {task.Title}",
+                parts.Count > 0 ? string.Join(" — ", parts) : null);
         }
     }
 
@@ -967,6 +1074,7 @@ public sealed class GoalAgent
         // Fresh memory of what this goal has already read. Scoped to the run, so nothing
         // a previous plan (or a previous simulated day) learned can answer for this one.
         _repeatReads.Reset(_trace);
+        _toolRounds.BeginGoal();
 
         _logger.LogInformation("plan_start domain={Domain} model_clock={Today}", dispatch.Domain, _clock.Today);
         // PRE-CHECK GATE 1: can this goal be planned at all? Before a single token
@@ -1019,7 +1127,7 @@ public sealed class GoalAgent
         history.AddSystemMessage(_grounding.RenderPrompt(ground));
         history.AddUserMessage(BuildGroundingInstruction(dispatch));
 
-        var groundingSettings = new OpenAIPromptExecutionSettings
+        var groundingSettings = _routing.Apply(new OpenAIPromptExecutionSettings
         {
             FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(GroundingFunctions(), autoInvoke: true, options: new FunctionChoiceBehaviorOptions
             {
@@ -1037,13 +1145,19 @@ public sealed class GoalAgent
             }),
             Temperature = 0.2,
             MaxTokens = GroundingMaxTokens
-        };
+        }, LlmCallSite.Grounding);
 
         var toolsBefore = _trace.ToolCallCount;
         var groundingSummary = await RunGroundingPassAsync(chat, history, groundingSettings, ct);
         var toolsUsed = _trace.ToolCallCount - toolsBefore;
-        _logger.LogInformation("grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars} tool_calls={Tools}",
-            dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length, toolsUsed);
+        // Rounds, not just tools: grounding's cost is round-TRIPS, and the two differ whenever
+        // the model batches reads. This is the number that used to vary 80s-240s unrecorded.
+        // suppressed = reads RepeatReadFilter answered from memory instead of calling again;
+        // it was computed and thrown away before v8.
+        _logger.LogInformation(
+            "grounding_done goal={GoalId} elapsed_ms={Elapsed} chars={Chars} tool_calls={Tools} rounds={Rounds} suppressed={Suppressed}",
+            dispatch.GoalId, groundingClock.ElapsedMilliseconds, groundingSummary.Length, toolsUsed,
+            _toolRounds.Rounds, _repeatReads.SuppressedCount);
         await _trace.HarnessAsync(HarnessModules.Grounding, HarnessStatuses.Done,
             note: "Context assembled from the live world",
             // What it actually READ, not merely that it finished. The model chooses how
@@ -1253,9 +1367,27 @@ public sealed class GoalAgent
     {
         history.AddUserMessage(BuildPlanningInstruction(dispatch));
         string? lastError = null;
+        // ONE budget for the whole loop, not one per attempt (v8).
+        //
+        // The per-call deadline bounds a single request; nothing bounded the three of them
+        // together. A compose that legitimately runs to the 180s ceiling is classified
+        // transient — correctly, because a hung stream must be retried — and then tried twice
+        // more, each time with a LONGER history than the attempt that just timed out. Three
+        // ceilings plus backoff is ~9 minutes for one goal, and the later attempts are the
+        // least likely to succeed. Past this line, "slow" has already been answered; trying
+        // again only makes the person wait for a worse version of the same call.
+        var composeClock = Stopwatch.StartNew();
 
         for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
         {
+            if (attempt > 1 && composeClock.Elapsed > _llmCallBudget)
+            {
+                var giveUp = $"compose gave up after {composeClock.Elapsed.TotalSeconds:F0}s across {attempt - 1} attempt(s) — the budget is for the whole plan, not for each try.";
+                _logger.LogWarning("compose_budget_exhausted goal={GoalId} elapsed_ms={Elapsed} attempts={Attempts}",
+                    dispatch.GoalId, composeClock.ElapsedMilliseconds, attempt - 1);
+                throw new JsonException(lastError is null ? giveUp : $"{giveUp} Last error: {lastError}");
+            }
+
             if (attempt > 1)
             {
                 history.AddUserMessage(BuildPlanningRetryInstruction(lastError ?? "Planner did not return a valid JSON object."));
@@ -1264,7 +1396,7 @@ public sealed class GoalAgent
             ComposeContent composed;
             try
             {
-                composed = await GetComposeContentAsync(chat, history, ComposeSiteCompose, ct);
+                composed = await GetComposeContentAsync(chat, history, LlmCallSite.Compose, ct);
             }
             catch (Exception ex) when (IsTransientProviderError(ex, ct))
             {
@@ -1300,7 +1432,7 @@ public sealed class GoalAgent
             // the empty case would leave the truncating model paying the toll forever.
             if (composed.UsedResponseFormat)
             {
-                await DisableJsonModeAsync(ComposeSiteCompose, "returned content that would not parse as JSON");
+                await DisableJsonModeAsync(LlmCallSite.Compose, "returned content that would not parse as JSON");
             }
 
             lastError = error;
@@ -1314,10 +1446,6 @@ public sealed class GoalAgent
         await _trace.ThinkingAsync($"planner_error: {failure}");
         throw new JsonException(failure);
     }
-
-    /// <summary>The two call sites that ask for a JSON object, tracked separately — see _jsonMode.</summary>
-    private const string ComposeSiteDecompose = "decompose";
-    private const string ComposeSiteCompose = "compose";
 
     /// <summary>What one compose call produced, and whether json_object was used to get it.</summary>
     private readonly record struct ComposeContent(string Raw, bool UsedResponseFormat);
@@ -1344,8 +1472,15 @@ public sealed class GoalAgent
     /// </summary>
     private readonly Dictionary<string, JsonModeHealth> _jsonMode = new(StringComparer.Ordinal);
 
-    private JsonModeHealth JsonModeFor(string site)
-        => _jsonMode.TryGetValue(site, out var health) ? health : JsonModeHealth.Untried;
+    /// <summary>
+    /// The token ceiling for a site. Decompose and compose share one method but are not the
+    /// same size of question — see <see cref="DecomposeMaxTokens"/>.
+    /// </summary>
+    private static int MaxTokensFor(LlmCallSite site)
+        => site == LlmCallSite.Decompose ? DecomposeMaxTokens : ComposeMaxTokens;
+
+    private JsonModeHealth JsonModeFor(LlmCallSite site)
+        => _jsonMode.TryGetValue(site.Name, out var health) ? health : JsonModeHealth.Untried;
 
     /// <summary>
     /// The compose call, and the one place that decides whether to ask for JSON mode.
@@ -1381,19 +1516,20 @@ public sealed class GoalAgent
     /// </para>
     /// </summary>
     private async Task<ComposeContent> GetComposeContentAsync(
-        IChatCompletionService chat, ChatHistory history, string site, CancellationToken ct)
+        IChatCompletionService chat, ChatHistory history, LlmCallSite site, CancellationToken ct)
     {
+        var maxTokens = MaxTokensFor(site);
         if (JsonModeFor(site) == JsonModeHealth.Broken)
         {
-            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, site, ct), false);
         }
 
-        var jsonSettings = new OpenAIPromptExecutionSettings
+        var jsonSettings = _routing.Apply(new OpenAIPromptExecutionSettings
         {
             Temperature = 0.1,
-            MaxTokens = ComposeMaxTokens,
+            MaxTokens = maxTokens,
             ResponseFormat = "json_object"
-        };
+        }, site);
 
         try
         {
@@ -1402,17 +1538,17 @@ public sealed class GoalAgent
             var content = response.Content ?? "";
             if (!string.IsNullOrWhiteSpace(content))
             {
-                _jsonMode[site] = JsonModeHealth.Works;
+                _jsonMode[site.Name] = JsonModeHealth.Works;
                 return new ComposeContent(content, true);
             }
 
             await DisableJsonModeAsync(site, "returned empty content");
-            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, site, ct), false);
         }
         catch (Exception ex) when (LooksLikeResponseFormatRejection(ex))
         {
             await DisableJsonModeAsync(site, $"rejected the parameter ({ex.Message})");
-            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, ct), false);
+            return new ComposeContent(await GetStrictComposeContentAsync(chat, history, site, ct), false);
         }
     }
 
@@ -1423,25 +1559,31 @@ public sealed class GoalAgent
     /// decision already taken, and a transcript that repeats "retrying compose…" on every
     /// plan teaches the reader to ignore planner notices — including the ones that matter.
     /// </summary>
-    private async Task DisableJsonModeAsync(string site, string what)
+    private async Task DisableJsonModeAsync(LlmCallSite site, string what)
     {
         if (JsonModeFor(site) == JsonModeHealth.Broken)
         {
             return;
         }
-        _jsonMode[site] = JsonModeHealth.Broken;
+        _jsonMode[site.Name] = JsonModeHealth.Broken;
         var note = $"planner_notice: this model {what} for JSON response_format on the {site} call — using a strict JSON prompt instead, for this and every later plan.";
-        _logger.LogWarning("json_mode_disabled site={Site} reason={Reason}", site, what);
+        _logger.LogWarning("json_mode_disabled site={Site} reason={Reason}", site.Name, what);
         await _trace.ThinkingAsync(note);
     }
 
-    private async Task<string> GetStrictComposeContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
+    /// <summary>
+    /// The strict-prompt fallback. Takes the SITE because it is a fallback SHAPE, not a fifth call
+    /// site: reached from decompose it is still decompose, reached from compose it is still
+    /// compose, and each must keep its own routing.
+    /// </summary>
+    private async Task<string> GetStrictComposeContentAsync(
+        IChatCompletionService chat, ChatHistory history, LlmCallSite site, CancellationToken ct)
     {
-        var strictSettings = new OpenAIPromptExecutionSettings
+        var strictSettings = _routing.Apply(new OpenAIPromptExecutionSettings
         {
             Temperature = 0.1,
-            MaxTokens = ComposeMaxTokens
-        };
+            MaxTokens = MaxTokensFor(site)
+        }, site);
         using var cts = Deadline(ct, _llmCallBudget);
         var response = await chat.GetChatMessageContentAsync(history, strictSettings, _kernel, cts.Token);
         return response.Content ?? "";
@@ -1837,12 +1979,12 @@ public sealed class GoalAgent
 
     private async Task<string> GetAdaptContentAsync(IChatCompletionService chat, ChatHistory history, CancellationToken ct)
     {
-        var settings = new OpenAIPromptExecutionSettings
+        var settings = _routing.Apply(new OpenAIPromptExecutionSettings
         {
             Temperature = 0.2,
             MaxTokens = AdaptMaxTokens,
             ResponseFormat = "json_object"
-        };
+        }, LlmCallSite.Adapt);
         for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
         {
             try
@@ -2103,8 +2245,38 @@ public sealed class GoalAgent
             var function = _kernel.Plugins.GetFunction(proposal.Module, proposal.Function);
             var args = ToKernelArguments(proposal.Args);
             _logger.LogInformation("execute_proposal {ProposalId} {Module}.{Function}", proposal.ProposalId, proposal.Module, proposal.Function);
-            var invokeResult = await _kernel.InvokeAsync(function, args, ct);
-            var resultText = invokeResult.ToString();
+
+            // ONE PROPOSAL MAY FAIL WITHOUT TAKING THE GOAL WITH IT. Plugins throw ON
+            // PURPOSE (Deliveries.Hold refuses an essential delivery; Find throws for one
+            // the household does not have), and unguarded, a single throw left the loop AND
+            // the handler — later proposals skipped, no status frame sent at all.
+            //
+            // Cancellation is NOT caught: a cancelled goal is not a failed actuator, and
+            // swallowing it would turn shutdown into a page of spurious failures.
+            string resultText;
+            try
+            {
+                resultText = (await _kernel.InvokeAsync(function, args, ct)).ToString();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Unwrap: the kernel wraps a plugin throw, and the inner message is the
+                // one written for a person ("'repeat prescription' is an essential
+                // delivery and cannot be held").
+                var reason = (ex.InnerException ?? ex).Message;
+                _logger.LogWarning(ex, "proposal_failed {ProposalId} {Module}.{Function}: {Reason}",
+                    proposal.ProposalId, proposal.Module, proposal.Function, reason);
+                await _trace.ThinkingStepAsync(
+                    $"Couldn't {proposal.Module}.{proposal.Function}", reason, ThinkingKinds.Notice);
+                executed.Add(new ExecutedEffect
+                {
+                    ProposalId = proposal.ProposalId,
+                    Action = $"{proposal.Module}.{proposal.Function}",
+                    Result = ExecutionResults.FailedActuator,
+                    Detail = reason
+                });
+                continue;
+            }
 
             // THE FILTER REFUSED IT. The plugin never ran — the gate did its job — but
             // saying "executed" here would tell the user the action happened, with the

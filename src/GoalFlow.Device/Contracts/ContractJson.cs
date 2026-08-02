@@ -110,6 +110,17 @@ public static class ExecutionResults
     /// </para>
     /// </summary>
     public const string BlockedSafety = "blocked_safety";
+
+    /// <summary>
+    /// It RAN and threw: the actuator refused the arguments it was given — usually because
+    /// the model named something the household does not have.
+    ///
+    /// <para>
+    /// Like <see cref="BlockedSafety"/> the approval does NOT stand: the arguments were
+    /// frozen at planning time, so re-applying fails identically. See DESIGN.md §4.
+    /// </para>
+    /// </summary>
+    public const string FailedActuator = "failed_actuator";
 }
 
 /// <summary>
