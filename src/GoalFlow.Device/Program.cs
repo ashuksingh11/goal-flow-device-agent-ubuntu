@@ -278,6 +278,12 @@ if (options.VerifyRequestShape)
     return;
 }
 
+if (options.VerifyBackoff)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyBackoffAsync(loggerFactory);
+    return;
+}
+
 if (options.VerifyDeadline)
 {
     Environment.ExitCode = await ProgramHelpers.VerifyDeadlineAsync(loggerFactory);
@@ -466,6 +472,9 @@ internal sealed record CliOptions
     public bool VerifyDeadline { get; init; }
     public bool VerifyRequestShape { get; init; }
 
+    /// <summary>--verify-backoff — assert a 429 waits seconds, not milliseconds (v9 gate 30).</summary>
+    public bool VerifyBackoff { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -522,6 +531,7 @@ internal sealed record CliOptions
                 "--verify-repeat-reads" => options with { VerifyRepeatReads = true },
                 "--verify-deadline" => options with { VerifyDeadline = true },
                 "--verify-request-shape" => options with { VerifyRequestShape = true },
+                "--verify-backoff" => options with { VerifyBackoff = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -2952,6 +2962,92 @@ public static async Task<int> VerifyRequestShapeAsync(ILoggerFactory loggerFacto
 
     Console.WriteLine(failures == 0 ? "gate 29 (request shape): PASS" : $"gate 29 (request shape): FAIL: {failures}");
     return failures == 0 ? 0 : 1;
+}
+
+/// <summary>
+/// Gate 30 (v9) — A RATE LIMIT IS NOT A DROPPED SOCKET, and the wait has to know it.
+///
+/// <para>
+/// The field report this exists for is two <c>planner_notice</c> lines in a row, both
+/// carrying the raw text <c>"Status: 429 (Too Many Requests)"</c>, both inside about a
+/// second of each other. Every retry site waited <c>400ms × attempt</c> — a sensible pause
+/// for a stream that hiccupped, and two orders of magnitude short for a quota window
+/// measured in seconds. All three attempts were spent before the window could possibly
+/// have reopened.
+/// </para>
+///
+/// <para>
+/// So the gate asserts on the DELAY, using the exact exception text the user saw, and on
+/// both halves of the fix: the seconds-scale exponential wait for a 429, and the fact that
+/// nothing else got slower — a stalled stream still retries in 400ms, because making every
+/// transient error wait two seconds would have been a latency regression wearing the mask
+/// of a fix.
+/// </para>
+///
+/// <para>
+/// It also pins the cool-off's ONE non-obvious property: it is a floor, so a later, shorter
+/// 429 cannot pull the wait back in and let the next call fire into a window the previous
+/// one already knew was closed.
+/// </para>
+/// </summary>
+public static Task<int> VerifyBackoffAsync(ILoggerFactory loggerFactory)
+{
+    var log = loggerFactory.CreateLogger("verify-backoff");
+    var failures = 0;
+    void Check(bool ok, string what)
+    {
+        if (!ok) { failures++; Console.WriteLine($"  FAIL {what}"); }
+        else Console.WriteLine($"  ok   {what}");
+    }
+
+    // VERBATIM from the report. Matching on a prettier string would test the string.
+    var rateLimited = new Exception(
+        "ClientResultException: Service request failed.\nStatus: 429 (Too Many Requests)\n");
+    var dropped = new TaskCanceledException("The operation was canceled.");
+
+    Check(GoalAgent.IsRateLimitedForTests(rateLimited), "the reported 429 text is recognised as a rate limit");
+    Check(!GoalAgent.IsRateLimitedForTests(dropped), "a cancelled/stalled call is NOT a rate limit");
+    using var live = new CancellationTokenSource();
+    Check(GoalAgent.IsTransientProviderErrorForTests(rateLimited, live.Token),
+        "...and it is still TRANSIENT, so the existing retry loops handle it");
+
+    var first = GoalAgent.RetryDelayForTests(1, rateLimited);
+    var second = GoalAgent.RetryDelayForTests(2, rateLimited);
+    log.LogInformation("429 backoff: attempt1={First}ms attempt2={Second}ms", first.TotalMilliseconds, second.TotalMilliseconds);
+    // The lower bound is the whole point: 0.4s was the bug.
+    Check(first >= TimeSpan.FromSeconds(2), $"a 429 waits SECONDS, not milliseconds ({first.TotalMilliseconds:0}ms)");
+    Check(second >= first * 1.5, $"and it backs off exponentially ({second.TotalMilliseconds:0}ms after {first.TotalMilliseconds:0}ms)");
+    Check(GoalAgent.RetryDelayForTests(9, rateLimited) <= TimeSpan.FromSeconds(21),
+        "capped — nobody watches a fridge spinner for a provider's benefit");
+    // Jitter, asserted as the absence of a constant: correlated retries rebuild the burst.
+    var draws = Enumerable.Range(0, 8).Select(_ => GoalAgent.RetryDelayForTests(1, rateLimited)).Distinct().Count();
+    Check(draws > 1, $"the wait is jittered rather than identical across callers ({draws} distinct of 8)");
+
+    // The half that is about NOT changing: every other transient error keeps its old wait.
+    Check(GoalAgent.RetryDelayForTests(1, dropped) == TimeSpan.FromMilliseconds(400),
+        "a non-429 transient error still retries in 400ms — no latency regression");
+    Check(GoalAgent.RetryDelayForTests(2, dropped) == TimeSpan.FromMilliseconds(800),
+        "...and still scales linearly, as before");
+
+    // Retry-After beats the guess. A server that says when to come back is not guessing.
+    var stated = new Exception("Service request failed. Status: 429 (Too Many Requests). Retry-After: 7");
+    Check(GoalAgent.RetryDelayForTests(1, stated) == TimeSpan.FromSeconds(7),
+        "the provider's own Retry-After wins over our backoff");
+
+    // The cool-off: armed by a 429, and a FLOOR.
+    GoalAgent.ClearCoolOffForTests();
+    Check(GoalAgent.CoolOffRemainingForTests() == TimeSpan.Zero, "no 429 seen → nothing waits");
+    GoalAgent.ArmCoolOffForTests(TimeSpan.FromSeconds(5));
+    var armed = GoalAgent.CoolOffRemainingForTests();
+    Check(armed > TimeSpan.FromSeconds(4) && armed <= TimeSpan.FromSeconds(5),
+        $"a 429 makes the NEXT call wait too ({armed.TotalMilliseconds:0}ms)");
+    GoalAgent.ArmCoolOffForTests(TimeSpan.FromSeconds(1));
+    Check(GoalAgent.CoolOffRemainingForTests() > TimeSpan.FromSeconds(4),
+        "a shorter later cool-off does NOT pull the wait back in");
+    GoalAgent.ClearCoolOffForTests();
+
+    Console.WriteLine(failures == 0 ? "gate 30 (rate-limit backoff): PASS" : $"gate 30 (rate-limit backoff): FAIL: {failures}");
+    return Task.FromResult(failures == 0 ? 0 : 1);
 }
 
 }
