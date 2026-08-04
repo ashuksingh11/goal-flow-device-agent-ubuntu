@@ -2928,17 +2928,30 @@ public sealed class GoalAgent
     }
 
     /// <summary>
-    /// The transcript line for a transient retry. A rate limit gets ENGLISH and a number of
-    /// seconds; everything else keeps the raw exception, which is what a genuinely
-    /// unexpected failure is worth reading. The old line pasted
-    /// <c>"ClientResultException: Service request failed. Status: 429 (Too Many Requests)"</c>
-    /// — newlines and all — into the thinking stream three times in a row, which tells the
-    /// reader nothing except that something is broken.
+    /// The transcript line for a transient retry, as a NOTICE STEP rather than prose.
+    ///
+    /// <para>
+    /// A rate limit gets English and a number of seconds; everything else keeps the raw
+    /// exception, which is what a genuinely unexpected failure is worth reading. The old
+    /// line pasted <c>"ClientResultException: Service request failed. Status: 429 (Too Many
+    /// Requests)"</c> — newlines and all — into the thinking stream three times in a row.
+    /// </para>
+    ///
+    /// <para>
+    /// It goes down the STEP channel because a step arrives whole and prose does not:
+    /// consecutive prose fragments from one engine are concatenated by design (that is how
+    /// streaming works), so two retries in a row rendered as
+    /// <c>"…retrying grounding (1/3).planner_notice: the model provider…"</c> — one run-on
+    /// paragraph, seen in a live run that really was throttled. A notice is a discrete
+    /// event, and the wire has had a kind for exactly that since v7.
+    /// </para>
     /// </summary>
-    private static string TransientNote(string what, int attempt, int max, Exception ex, TimeSpan delay)
+    private static (string Step, string Detail) TransientNote(string what, int attempt, int max, Exception ex, TimeSpan delay)
         => IsRateLimited(ex)
-            ? $"planner_notice: the model provider is rate-limiting us (429) — waiting {delay.TotalSeconds:0.#}s, then retrying {what} ({attempt}/{max})."
-            : $"planner_notice: {what} attempt {attempt}/{max} hit a transient provider error ({ex.GetType().Name}: {ex.Message}); retrying.";
+            ? ($"Provider rate-limited us (429) — waiting {delay.TotalSeconds:0.#}s",
+               $"retrying {what}, attempt {attempt} of {max}")
+            : ($"{what} hit a transient provider error — retrying",
+               $"attempt {attempt} of {max} · {ex.GetType().Name}: {ex.Message}");
 
     /// <summary>
     /// One place that turns "this attempt failed transiently" into "wait, then go again":
@@ -2955,7 +2968,8 @@ public sealed class GoalAgent
         }
         _logger.LogWarning(ex, "transient_retry site={Site} attempt={Attempt}/{Max} delay_ms={Delay}",
             what, attempt, max, (long)delay.TotalMilliseconds);
-        await _trace.ThinkingAsync(TransientNote(what, attempt, max, ex, delay));
+        var (step, detail) = TransientNote(what, attempt, max, ex, delay);
+        await _trace.ThinkingStepAsync(step, detail, ThinkingKinds.Notice);
         await Task.Delay(delay, ct);
     }
 
