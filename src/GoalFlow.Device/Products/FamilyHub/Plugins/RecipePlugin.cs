@@ -41,13 +41,19 @@ public sealed class RecipePlugin
     /// detect is to ask again.
     /// </para>
     /// </summary>
+    // TERSE, not short of facts, and the FIRST CLAUSE now leads. Three instructions here
+    // are load-bearing and were each paid for once: call once (the v7.1 retry loop), never
+    // follow with GetRecipe (the v7.2 seven-round-trip loop), preferTags only re-orders
+    // (why a "no match" reply is not a reason to rephrase). Trim those and the loops come
+    // back — gate 28. But they are addressed to a MODEL, and SafetyFilter.Describe prints
+    // the opening clause of this string into the user's transcript as the step headline,
+    // so the sentence a person reads has to come first: "Returns the whole recipe box".
     [KernelFunction]
-    [Description("Returns the ENTIRE recipe box, each recipe COMPLETE — ingredients, tags, allergen 'contains' " +
-                 "and prep_minutes. One call is enough: do not call it again, and do NOT follow it with GetRecipe, " +
-                 "which can only repeat what you already have. preferTags only re-orders the result, and the reply " +
-                 "reports which of your tags actually exist.")]
+    [Description("Returns the whole recipe box — every recipe complete, with ingredients, tags, " +
+                 "allergen 'contains' and prep_minutes. Call once; do not repeat it and do not follow " +
+                 "it with GetRecipe. preferTags only re-orders; the reply says which tags exist.")]
     public async Task<string> FindRecipes(
-        [Description("Tags to prefer. The reply lists the box's real tag vocabulary under 'available_tags'; anything else is reported back as unmatched.")] string[]? preferTags = null,
+        [Description("Tags to prefer. The reply lists the real vocabulary under 'available_tags' and names any that matched nothing.")] string[]? preferTags = null,
         [Description("Ingredients or allergen groups that must NOT appear, e.g. [\"peanut\",\"mushrooms\"].")] string[]? excludeIngredients = null,
         [Description("Maximum prep minutes, e.g. 20 for a busy evening. 0 = no limit.")] int maxPrepMinutes = 0,
         CancellationToken ct = default)
