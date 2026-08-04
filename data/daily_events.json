@@ -51,6 +51,7 @@
         ],
         "also_happened": "Rohan logged 12,400 steps and burned 780 kcal yesterday, against an 8,000-step baseline"
       },
+      "action": "Swap tonight's dinner to use the fish",
       "steer": "Change tonight's dinner to use the 500 g of fish before it expires, and raise the protein because yesterday was a hard training day — 12,400 steps and 780 kcal burned. Say both reasons in the why. Drop items now in stock from the shopping list."
     },
     {
@@ -68,6 +69,7 @@
           "rice"
         ]
       },
+      "action": "Re-plan tonight's dinner without the paneer",
       "steer": "Change tonight's dinner if it relied on paneer or rice, using in-stock ingredients, and add a sensible replacement to the shopping list."
     },
     {
@@ -84,6 +86,7 @@
         "start": "18:00",
         "end": "19:30"
       },
+      "action": "Move tonight's dinner to a quicker dish",
       "steer": "Change tonight's dinner plan so prep happens earlier, or swap it to a quicker dish that fits the compressed window."
     },
     {
@@ -99,6 +102,7 @@
         "extra_guests": 1,
         "constraint": "low-sodium"
       },
+      "action": "Cook tonight's dinner for one more",
       "steer": "Scale tonight's dinner for one more person and keep it low-sodium."
     },
     {
@@ -114,6 +118,7 @@
         "appliance": "oven",
         "reason": "self-clean cycle"
       },
+      "action": "Swap tonight's dinner off the oven",
       "steer": "Swap tonight's dinner if it is oven-baked, using a stovetop or no-cook option."
     },
     {
@@ -129,6 +134,7 @@
         "request": "lighter end-of-week dinner",
         "preference": "light, under 30 min"
       },
+      "action": "Swap tonight's dinner for something lighter",
       "steer": "Swap tonight's dinner to a lighter dish that cooks in under 30 minutes using in-stock ingredients."
     }
   ]

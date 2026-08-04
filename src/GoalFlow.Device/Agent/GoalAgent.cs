@@ -1023,10 +1023,14 @@ public sealed class GoalAgent
         - "considered" is how many options you weighed, and "rejected" is the ones you did
           NOT take with the reason for each. Report them honestly: if a hard constraint ruled
           something out, say which constraint. If you weighed nothing, omit both rather than
-          inventing a number — a fabricated rejection is worse than a missing one.
+          inventing a number — a fabricated rejection is worse than a missing one. Every
+          rejected option must be something you could have put in THIS plan: a home-prep goal
+          rejecting a dinner is not a rejection, it is noise from another goal's vocabulary.
         - The response must start with { and end with }. Do not output whitespace, Markdown, code fences, or prose outside the JSON object.
 
-        Final answer must be only valid JSON with this shape:
+        Final answer must be only valid JSON with this shape. EVERY VALUE BELOW IS A
+        PLACEHOLDER showing the field's type and length — none of it is content. Never copy
+        a value out of it into your answer; write what is true of THIS goal.
         {
           "plan": [
             {"id":"s1","title":"...","detail":"...","when":"YYYY-MM-DD or YYYY-MM-DDTHH:mm","why":["..."],"tags":["..."]}
@@ -1035,9 +1039,9 @@ public sealed class GoalAgent
             {"proposal_id":"p1","action":"add missing groceries","module":"ShoppingList","function":"Add","args":{"items":["..."],"reason":"..."},"tier":"light","reason":"...","requires_approval":true},
             {"proposal_id":"p2","action":"place grocery order","module":"ShoppingList","function":"PlaceOrder","args":{"estimatedTotal":42.50},"tier":"firm","reason":"...","requires_approval":true}
           ],
-          "impact": [{"label":"waste","value":"uses 2 expiring items"}],
+          "impact": [{"label":"<short noun>","value":"<what this plan changes>"}],
           "considered": 17,
-          "rejected": [{"option":"pork belly stir-fry","reason":"no pork"}],
+          "rejected": [{"option":"<an option you weighed and did not take>","reason":"<what ruled it out>"}],
           "explanation": "one concise paragraph"
         }
         """;
@@ -1873,6 +1877,12 @@ public sealed class GoalAgent
             - Keep each row's original date in "when". You are re-planning days, not moving them.
             - Leave every unaffected row completely alone — do not restate it.
             - Give each changed row a "why" that names the real cause.
+            - A row you change is still the SAME KIND OF THING it was: a dinner stays the name
+              of a dinner, a chore stays the name of a chore. "Use up leftovers before away" and
+              "Light meal after away" are descriptions of the instruction you were given, not
+              rows of a plan — a person reading the plan wants to know what is happening, and
+              the reason it changed belongs in "why". The only exception is a skipped row,
+              whose title the steer dictates verbatim.
             """;
     }
 
