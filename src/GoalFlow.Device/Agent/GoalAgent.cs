@@ -1116,7 +1116,20 @@ public sealed class GoalAgent
         // ALTITUDE ONE: what are the pieces of this goal? Structure only, no tools,
         // no world facts — that is what grounding below is for. Fails soft to one
         // task, so the goal always plans.
+        //
+        // TASK MANAGER BEATS HERE, and this is where it always belonged. The engine used
+        // to light up after Safety, sixth in the rail, captioned "Recording the goal
+        // ledger…" — but the goal is broken into tasks HERE, before a single world fact
+        // has been read, and the beat sixty lines later was narrating bookkeeping for a
+        // decision already taken. It also cost the steps their author: `ReportDecomposition`
+        // emits "Broke the goal into 8 step(s)" with no engine active, so the chat filed
+        // the whole task breakdown under GROUNDING — the engine that had not started yet.
+        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Active, note: "Breaking the goal into tasks…");
+        await DwellAsync(ct);
         var taskDag = await DecomposeAsync(chat, dispatch, ct);
+        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Done,
+            note: $"{taskDag.Count} task(s) tracked",
+            verdict: taskDag.Count == 1 ? "1 task" : $"{taskDag.Count} tasks");
 
         await _trace.PhaseAsync("grounding");
         await _trace.HarnessAsync(HarnessModules.Grounding, HarnessStatuses.Active, note: "Assembling real-world context…");
@@ -1228,12 +1241,10 @@ public sealed class GoalAgent
                 verdict: hardCount > 0 ? $"allowed · {hardCount} rule(s) held" : "allowed",
                 grade: safetyGate);
 
-        // TASK MANAGER: the goal ledger the whole plan hangs off (the DAG grounded above).
-        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Active, note: "Recording the goal ledger…");
-        await DwellAsync(ct);
-        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Done,
-            note: $"{taskDag.Count} task(s) tracked",
-            verdict: $"{taskDag.Count} tasks · {modelPlan.Plan.Count} steps");
+        // The ledger itself is written below (CreateGoal + the state-machine transitions).
+        // It gets NO second Task Manager beat: the engine already resolved above, and an
+        // engine that lights up twice in one run turns a rail whose rows resolve in place
+        // into one that flickers — for a step that decides nothing the earlier one had not.
 
         // Collapse duplicate proposals the model sometimes emits (e.g. the same
         // "run dishwasher" action repeated per night) — dedupe by module+function+args
