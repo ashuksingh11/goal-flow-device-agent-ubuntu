@@ -237,11 +237,91 @@ public sealed class GoalAgent
         {
             return await RunCoreAsync(dispatch, ct);
         }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A DISPATCH IS ALWAYS ANSWERED. This is the single most important line in
+            // the file for a demo, and it was missing.
+            //
+            // Until v11.2 an exception here propagated to Program.cs's frame handler,
+            // which caught it, wrote `frame handling failed for dispatch` to a log
+            // nobody is watching, and told NO ONE. The cloud's graph sits in
+            // collect_plan waiting for a plan_ready that will never come; the webview
+            // sits on "grounding" forever; the create-phase bracket never closes. There
+            // is no timeout anywhere in that chain, so the goal hangs until someone
+            // reloads — and on a fridge in front of an audience, that is the demo over.
+            //
+            // Reported through the PRECHECK path rather than as a new failure kind,
+            // because the semantics already match exactly: a precheck block means "not
+            // yet — the world isn't ready, this should run when it recovers", which is
+            // precisely what a provider rate limit is. The cloud routes it to
+            // `precheck_wait`, the board shows Waiting with a reason, and nothing
+            // pretends the goal completed. See nodes.py:precheck_wait.
+            using var failScope = _trace.BeginGoalScope(dispatch.GoalId, dispatch.CorrelationId);
+            var rateLimited = IsRateLimited(ex);
+            _logger.LogError(ex, "plan_failed goal={GoalId} rate_limited={RateLimited} — answering with a precheck hold rather than going silent",
+                dispatch.GoalId, rateLimited);
+            try { await _trace.ThinkingAsync(PlanFailureReason(rateLimited)); }
+            catch (Exception traceEx) { _logger.LogDebug(traceEx, "plan_failed_trace_suppressed"); }
+            return BuildFailureHold(dispatch, rateLimited);
+        }
         finally
         {
             _planningSlot.Release();
         }
     }
+
+    /// <summary>What the person at the fridge is told when planning could not finish.</summary>
+    private static string PlanFailureReason(bool rateLimited)
+        => rateLimited
+            ? "The AI service is busy right now, so I couldn't finish this plan. Ask me again in a moment."
+            : "Something went wrong while planning, so I've stopped rather than guess. Ask me again in a moment.";
+
+    /// <summary>
+    /// A plan_ready that reports FAILURE honestly, using the precheck hold the cloud
+    /// already understands.
+    ///
+    /// <para>
+    /// `Ok = false` is what routes it: the cloud's `route_on_safety` sends a
+    /// precheck-blocked plan to `precheck_wait`, which deliberately does NOT complete
+    /// the goal — an empty plan flowing on to relay_decisions would make the board read
+    /// "Completed" for a goal that never ran. Safety is reported as PASSED because
+    /// nothing was checked and nothing was violated; claiming a safety block would
+    /// accuse the household's rules of stopping a plan the provider stopped.
+    /// </para>
+    /// </summary>
+    private static PlanReady BuildFailureHold(Dispatch dispatch, bool rateLimited)
+        => new()
+        {
+            GoalId = dispatch.GoalId,
+            CorrelationId = dispatch.CorrelationId,
+            // Monitoring, not "done": the goal is waiting, not finished.
+            TaskStatus = TaskStatuses.Monitoring,
+            Payload = new PlanReadyPayload
+            {
+                Plan = [],
+                Proposals = [],
+                Safety = new SafetyVerdict { Gate = SafetyGates.Passed, Violations = [] },
+                Precheck = new PrecheckVerdict
+                {
+                    Ok = false,
+                    // The REASON lives on a result row, because that is where the cloud
+                    // reads it from (board.py takes `precheck.results[].detail` for the
+                    // card's waiting line). A verdict with no rows would route correctly
+                    // and then show a hold with no explanation attached.
+                    Results =
+                    [
+                        new PrecheckResultDto
+                        {
+                            Id = rateLimited ? "provider_available" : "planner_completed",
+                            Status = "fail",
+                            Detail = PlanFailureReason(rateLimited),
+                        },
+                    ],
+                },
+                Impact = [],
+                Explanation = PlanFailureReason(rateLimited),
+            },
+        };
 
     /// <summary>
     /// Applies an approval frame: ApprovalCoordinator flips decisions, then the
@@ -1351,6 +1431,12 @@ public sealed class GoalAgent
         CancellationToken ct)
     {
         var baseline = history.Count;
+        // v11.2: a 429 is waited out, not counted as an attempt — see RateLimitRetries.
+        // Grounding is where this bites hardest: it is the LONGEST phase (~6 tool rounds
+        // with a large context each) and therefore the most likely to cross the
+        // provider's tokens-per-window limit, which is exactly where the demo was
+        // observed to stall.
+        var rateLimitRetries = 0;
 
         for (var attempt = 1; ; attempt++)
         {
@@ -1384,6 +1470,14 @@ public sealed class GoalAgent
             }
             // The final attempt's exception propagates (guard excludes it), so a real
             // failure still surfaces instead of looping.
+            catch (Exception ex) when (IsRateLimited(ex) && rateLimitRetries < RateLimitRetries)
+            {
+                rateLimitRetries++;
+                await BackOffAsync("grounding", rateLimitRetries, RateLimitRetries, ex, ct);
+                attempt--;   // the provider was busy; this was not an attempt at anything
+            }
+            // The final attempt's exception propagates (guard excludes it), so a real
+            // failure still surfaces instead of looping.
             catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
             {
                 await BackOffAsync("grounding", attempt, MaxComposeAttempts, ex, ct);
@@ -1405,6 +1499,24 @@ public sealed class GoalAgent
         // least likely to succeed. Past this line, "slow" has already been answered; trying
         // again only makes the person wait for a worse version of the same call.
         var composeClock = Stopwatch.StartNew();
+
+        // v11.2 — RATE LIMITS GET THEIR OWN COUNTER, and are not modelling attempts.
+        //
+        // A 429 used to consume one of the three compose attempts AND, on the next pass,
+        // append a "the previous response could not be parsed" instruction to the
+        // history. Both are wrong, and the second is actively harmful:
+        //
+        //   * the model did nothing wrong — it never saw the request — so telling it to
+        //     try harder at JSON is a correction for a fault it did not commit;
+        //   * that instruction GROWS the prompt, and the limit being hit is a
+        //     TOKENS-per-window one (measured: ~6 requests of ~3.5k tokens saturates
+        //     Cerebras). Retrying a token-rate limit with a bigger payload is the one
+        //     thing guaranteed to make it worse.
+        //
+        // So three modelling attempts still mean three malformed answers, and a 429 now
+        // costs a wait instead. Measured recovery is ~3s, so RateLimitRetries × the
+        // 2/4/8s backoff covers it many times over.
+        var rateLimitRetries = 0;
 
         for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
         {
@@ -1434,6 +1546,15 @@ public sealed class GoalAgent
                 // failure — retry the LLM (still LLM-only; no scripted plan). Genuine
                 // cancellation is excluded by IsTransientProviderError and propagates.
                 lastError = $"provider/transport error: {ex.Message}";
+                if (IsRateLimited(ex) && rateLimitRetries < RateLimitRetries)
+                {
+                    // Not a modelling failure: wait, and re-enter on the SAME attempt so
+                    // the history is untouched and the prompt does not grow.
+                    rateLimitRetries++;
+                    await BackOffAsync("compose", rateLimitRetries, RateLimitRetries, ex, ct);
+                    attempt--;
+                    continue;
+                }
                 await BackOffAsync("compose", attempt, MaxComposeAttempts, ex, ct);
                 continue;
             }
@@ -2860,6 +2981,20 @@ public sealed class GoalAgent
         if (backoff > RateLimitMaxDelay) backoff = RateLimitMaxDelay;
         return backoff + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 500));
     }
+
+    /// <summary>
+    /// How many times a 429 may be waited out before it becomes a real failure.
+    ///
+    /// <para>
+    /// Separate from <c>MaxComposeAttempts</c> on purpose (v11.2): those three are for a
+    /// model that returned unusable JSON, and a rate limit is not that. MEASURED against
+    /// the live provider: ~6 requests of ~3.5k tokens saturate Cerebras, and it recovers
+    /// in about **3 seconds**. With the 2/4/8s backoff below, six retries span ~40s —
+    /// more than ten recovery windows, so a demo has to be extraordinarily unlucky to
+    /// exhaust it, while a genuinely dead provider still fails inside a minute.
+    /// </para>
+    /// </summary>
+    private const int RateLimitRetries = 6;
 
     private static readonly TimeSpan RateLimitBaseDelay = TimeSpan.FromSeconds(2);
 
