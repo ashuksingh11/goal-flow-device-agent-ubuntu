@@ -1106,6 +1106,9 @@ public sealed class GoalAgent
           inventing a number — a fabricated rejection is worse than a missing one. Every
           rejected option must be something you could have put in THIS plan: a home-prep goal
           rejecting a dinner is not a rejection, it is noise from another goal's vocabulary.
+        - "narration" is REQUIRED on every plan, and it is placed FIRST in the shape below
+          on purpose — write it before you run long on the optional fields. A plan that
+          arrives without it is spoken about by nobody.
         - "narration" is NOT "explanation". Explanation is READ, on screen, and may be a
           paragraph. Narration is HEARD, once, by someone who may not be looking.
         - "narration" is this plan SPOKEN ALOUD to the family, in TWO SHORT SENTENCES, at
@@ -1129,11 +1132,11 @@ public sealed class GoalAgent
             {"proposal_id":"p1","action":"add missing groceries","module":"ShoppingList","function":"Add","args":{"items":["..."],"reason":"..."},"tier":"light","reason":"...","requires_approval":true},
             {"proposal_id":"p2","action":"place grocery order","module":"ShoppingList","function":"PlaceOrder","args":{"estimatedTotal":42.50},"tier":"firm","reason":"...","requires_approval":true}
           ],
+          "narration": "<two short sentences, spoken aloud>",
           "impact": [{"label":"<short noun>","value":"<what this plan changes>"}],
           "considered": 17,
           "rejected": [{"option":"<an option you weighed and did not take>","reason":"<what ruled it out>"}],
-          "explanation": "one concise paragraph",
-          "narration": "<two short sentences, spoken aloud>"
+          "explanation": "one concise paragraph"
         }
         """;
 
@@ -1150,9 +1153,9 @@ public sealed class GoalAgent
           "proposals": [
             {"proposal_id":"p1","action":"...","module":"ShoppingList","function":"Add","args":{"items":["..."],"reason":"..."},"tier":"light","reason":"...","requires_approval":true}
           ],
+          "narration": "<two short sentences, spoken aloud>",
           "impact": [{"label":"...","value":"..."}],
-          "explanation": "one concise paragraph",
-          "narration": "<two short sentences, spoken aloud>"
+          "explanation": "one concise paragraph"
         }
         """;
 
