@@ -137,7 +137,20 @@ public sealed class MealPlanObserver : IDomainObserver
             TargetDay = targetDay,
             TargetItemId = targetItem?.Id,
             TargetTitle = targetItem?.Title,
-            RecommendedAction = ev["steer"]?.GetValue<string>(),
+            // TWO STRINGS, TWO AUDIENCES — and they were the same string until v9.
+            //
+            // `Steer` is written TO THE MODEL: "…Say both reasons in the why. Drop items now
+            // in stock from the shopping list." `RecommendedAction` is written to a PERSON —
+            // it is the headline on the adaptation card and the line on their board. Setting
+            // both from `steer` put our prompt on the fridge door, directives and all, which
+            // is how the demo ended up asking a family to "say both reasons in the why".
+            //
+            // Every other observer in this folder already authors a real sentence here; this
+            // one is the only one reading it out of the feed, so the feed grew an `action`
+            // beside each `steer`. The fallback is the SUMMARY, never the steer: a feed entry
+            // that forgets its action should read as the event that happened, not as an
+            // instruction to a language model.
+            RecommendedAction = ev["action"]?.GetValue<string>() ?? summary,
             Steer = ev["steer"]?.GetValue<string>(),
             Context = context,
             Material = IsMaterial(kind) && !awayDay

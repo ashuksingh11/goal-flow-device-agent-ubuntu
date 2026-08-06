@@ -37,6 +37,12 @@ OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-dump-mode}" \
 # filtered…" to "returns the ENTIRE box (one call is enough)". That wording is
 # behaviour: the old phrasing advertised filtering as the way to use the tool, and the
 # model duly filtered ten-plus times per plan. See verify/v7-m7 and gate 28.
+#
+# v9 REGENERATED IT AGAIN, same line, and this time only for LENGTH — the v7.1 sentence
+# had grown to 60 words of shouting. Every load-bearing clause survives verbatim in
+# meaning: call once, never follow with GetRecipe, preferTags only re-orders. Nothing
+# else in the frame moved (the diff was that one string). If a future edit drops one of
+# those three clauses, gate 28 is the one that will notice, not this one.
 # NB: every gate uses `if ! diff` and NOT `diff && echo PASS` — under `set -e`, a
 # command in a && list does NOT trigger errexit unless it is the LAST one, so
 # `diff && echo PASS` silently swallows the failure and the gate can never fail.

@@ -73,7 +73,10 @@ wired separately in each host.
   one evening is one day, not seven. Day is not cosmetic: the device completes at
   `Plan.Max(p => p.Day)` and the cloud sizes progress from the same span. The compose
   prompt's plan shape is per-domain too (`PlanShapeRule`, v3.5.1 injects only the active
-  one). Transient-provider-error retry loop wraps LLM calls.
+  one). Transient-provider-error retry loop wraps LLM calls — and **a 429 is not a dropped
+  socket** (v9): rate limits back off in SECONDS (2s, 4s… capped, jittered, `Retry-After`
+  wins) and arm a process-wide cool-off every call site waits out, so a throttled run slows
+  down once instead of at every site. Everything else still retries in 400ms. Gate 30.
 - `Products/FamilyHub/**` — THE PRODUCT PACK: everything fridge-specific.
   - `FamilyHubProduct.cs` — the manifest. **The single place the plugin catalog is
     declared** (`services.AddFamilyHub(dataDir)`); it used to be hand-listed in four
@@ -189,7 +192,7 @@ the global Advance-day world tick, guest prep-timeline + appliance gating, and c
 enforcement resolved per goal, including the household envelope across goals and the
 date-window block for an empty house.
 
-Verify with `./verify/v8-m1/check.sh` — it chains gates 1–29 and needs no API key.
+Verify with `./verify/v9/check.sh` — it chains gates 1–30 and needs no API key.
 
 **Before anything else, check `OPENROUTER_PROVIDER_ORDER` is set (v8).** Unset, OpenRouter
 load-balances `gpt-oss-120b` across nineteen endpoints spanning 39x in throughput and lands

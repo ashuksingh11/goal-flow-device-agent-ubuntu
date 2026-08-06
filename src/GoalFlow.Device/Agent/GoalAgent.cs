@@ -7,9 +7,11 @@ using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Stopwatch = System.Diagnostics.Stopwatch;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Collections.Concurrent;
 
 namespace GoalFlow.Device.Agent;
@@ -738,8 +740,7 @@ public sealed class GoalAgent
                 }
                 catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
                 {
-                    _logger.LogWarning("decompose_transient attempt {Attempt}/{Max}: {Message}; retrying", attempt, MaxComposeAttempts, ex.Message);
-                    await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+                    await BackOffAsync("decompose", attempt, MaxComposeAttempts, ex, ct);
                 }
             }
 
@@ -1022,10 +1023,14 @@ public sealed class GoalAgent
         - "considered" is how many options you weighed, and "rejected" is the ones you did
           NOT take with the reason for each. Report them honestly: if a hard constraint ruled
           something out, say which constraint. If you weighed nothing, omit both rather than
-          inventing a number — a fabricated rejection is worse than a missing one.
+          inventing a number — a fabricated rejection is worse than a missing one. Every
+          rejected option must be something you could have put in THIS plan: a home-prep goal
+          rejecting a dinner is not a rejection, it is noise from another goal's vocabulary.
         - The response must start with { and end with }. Do not output whitespace, Markdown, code fences, or prose outside the JSON object.
 
-        Final answer must be only valid JSON with this shape:
+        Final answer must be only valid JSON with this shape. EVERY VALUE BELOW IS A
+        PLACEHOLDER showing the field's type and length — none of it is content. Never copy
+        a value out of it into your answer; write what is true of THIS goal.
         {
           "plan": [
             {"id":"s1","title":"...","detail":"...","when":"YYYY-MM-DD or YYYY-MM-DDTHH:mm","why":["..."],"tags":["..."]}
@@ -1034,9 +1039,9 @@ public sealed class GoalAgent
             {"proposal_id":"p1","action":"add missing groceries","module":"ShoppingList","function":"Add","args":{"items":["..."],"reason":"..."},"tier":"light","reason":"...","requires_approval":true},
             {"proposal_id":"p2","action":"place grocery order","module":"ShoppingList","function":"PlaceOrder","args":{"estimatedTotal":42.50},"tier":"firm","reason":"...","requires_approval":true}
           ],
-          "impact": [{"label":"waste","value":"uses 2 expiring items"}],
+          "impact": [{"label":"<short noun>","value":"<what this plan changes>"}],
           "considered": 17,
-          "rejected": [{"option":"pork belly stir-fry","reason":"no pork"}],
+          "rejected": [{"option":"<an option you weighed and did not take>","reason":"<what ruled it out>"}],
           "explanation": "one concise paragraph"
         }
         """;
@@ -1115,7 +1120,20 @@ public sealed class GoalAgent
         // ALTITUDE ONE: what are the pieces of this goal? Structure only, no tools,
         // no world facts — that is what grounding below is for. Fails soft to one
         // task, so the goal always plans.
+        //
+        // TASK MANAGER BEATS HERE, and this is where it always belonged. The engine used
+        // to light up after Safety, sixth in the rail, captioned "Recording the goal
+        // ledger…" — but the goal is broken into tasks HERE, before a single world fact
+        // has been read, and the beat sixty lines later was narrating bookkeeping for a
+        // decision already taken. It also cost the steps their author: `ReportDecomposition`
+        // emits "Broke the goal into 8 step(s)" with no engine active, so the chat filed
+        // the whole task breakdown under GROUNDING — the engine that had not started yet.
+        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Active, note: "Breaking the goal into tasks…");
+        await DwellAsync(ct);
         var taskDag = await DecomposeAsync(chat, dispatch, ct);
+        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Done,
+            note: $"{taskDag.Count} task(s) tracked",
+            verdict: taskDag.Count == 1 ? "1 task" : $"{taskDag.Count} tasks");
 
         await _trace.PhaseAsync("grounding");
         await _trace.HarnessAsync(HarnessModules.Grounding, HarnessStatuses.Active, note: "Assembling real-world context…");
@@ -1227,12 +1245,10 @@ public sealed class GoalAgent
                 verdict: hardCount > 0 ? $"allowed · {hardCount} rule(s) held" : "allowed",
                 grade: safetyGate);
 
-        // TASK MANAGER: the goal ledger the whole plan hangs off (the DAG grounded above).
-        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Active, note: "Recording the goal ledger…");
-        await DwellAsync(ct);
-        await _trace.HarnessAsync(HarnessModules.TaskManager, HarnessStatuses.Done,
-            note: $"{taskDag.Count} task(s) tracked",
-            verdict: $"{taskDag.Count} tasks · {modelPlan.Plan.Count} steps");
+        // The ledger itself is written below (CreateGoal + the state-machine transitions).
+        // It gets NO second Task Manager beat: the engine already resolved above, and an
+        // engine that lights up twice in one run turns a rail whose rows resolve in place
+        // into one that flickers — for a step that decides nothing the earlier one had not.
 
         // Collapse duplicate proposals the model sometimes emits (e.g. the same
         // "run dishwasher" action repeated per night) — dedupe by module+function+args
@@ -1338,6 +1354,7 @@ public sealed class GoalAgent
             var summary = new StringBuilder();
             try
             {
+                await AwaitProviderCoolAsync(ct);
                 // The grounding pass calls tools and streams its reasoning, so it gets
                 // the widest budget of any call here — but a budget nonetheless.
                 using var cts = Deadline(ct, _streamingCallBudget);
@@ -1355,10 +1372,7 @@ public sealed class GoalAgent
             // failure still surfaces instead of looping.
             catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
             {
-                var note = $"planner_notice: grounding attempt {attempt}/{MaxComposeAttempts} hit a transient provider error ({ex.GetType().Name}: {ex.Message}); retrying.";
-                _logger.LogWarning(ex, "{Note}", note);
-                await _trace.ThinkingAsync(note);
-                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+                await BackOffAsync("grounding", attempt, MaxComposeAttempts, ex, ct);
             }
         }
     }
@@ -1406,10 +1420,7 @@ public sealed class GoalAgent
                 // failure — retry the LLM (still LLM-only; no scripted plan). Genuine
                 // cancellation is excluded by IsTransientProviderError and propagates.
                 lastError = $"provider/transport error: {ex.Message}";
-                var tnote = $"planner_notice: compose attempt {attempt}/{MaxComposeAttempts} hit a transient provider error ({ex.GetType().Name}: {ex.Message}); retrying.";
-                _logger.LogWarning(ex, "{Note}", tnote);
-                await _trace.ThinkingAsync(tnote);
-                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+                await BackOffAsync("compose", attempt, MaxComposeAttempts, ex, ct);
                 continue;
             }
 
@@ -1519,6 +1530,8 @@ public sealed class GoalAgent
         IChatCompletionService chat, ChatHistory history, LlmCallSite site, CancellationToken ct)
     {
         var maxTokens = MaxTokensFor(site);
+        // Whatever the last 429 implied applies here too — see AwaitProviderCoolAsync.
+        await AwaitProviderCoolAsync(ct);
         if (JsonModeFor(site) == JsonModeHealth.Broken)
         {
             return new ComposeContent(await GetStrictComposeContentAsync(chat, history, site, ct), false);
@@ -1864,6 +1877,12 @@ public sealed class GoalAgent
             - Keep each row's original date in "when". You are re-planning days, not moving them.
             - Leave every unaffected row completely alone — do not restate it.
             - Give each changed row a "why" that names the real cause.
+            - A row you change is still the SAME KIND OF THING it was: a dinner stays the name
+              of a dinner, a chore stays the name of a chore. "Use up leftovers before away" and
+              "Light meal after away" are descriptions of the instruction you were given, not
+              rows of a plan — a person reading the plan wants to know what is happening, and
+              the reason it changed belongs in "why". The only exception is a skipped row,
+              whose title the steer dictates verbatim.
             """;
     }
 
@@ -1989,6 +2008,7 @@ public sealed class GoalAgent
         {
             try
             {
+                await AwaitProviderCoolAsync(ct);
                 using var cts = Deadline(ct, _llmCallBudget);
                 var resp = await chat.GetChatMessageContentAsync(history, settings, _kernel, cts.Token);
                 var content = resp.Content ?? "";
@@ -1999,8 +2019,7 @@ public sealed class GoalAgent
             }
             catch (Exception ex) when (IsTransientProviderError(ex, ct))
             {
-                _logger.LogWarning(ex, "adaptation_compose_transient attempt {Attempt}/{Max}; retrying", attempt, MaxComposeAttempts);
-                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+                await BackOffAsync("adaptation", attempt, MaxComposeAttempts, ex, ct);
             }
         }
         return "";
@@ -2773,6 +2792,196 @@ public sealed class GoalAgent
     /// </summary>
     internal static bool IsTransientProviderErrorForTests(Exception ex, CancellationToken ct)
         => IsTransientProviderError(ex, ct);
+
+    /// <summary>
+    /// HTTP 429 specifically — a transient error, but not the same KIND of transient error
+    /// as a dropped stream, and the difference is the whole of <see cref="RetryDelay"/>.
+    /// Matched on the status and on the phrase, because the provider says it both ways and
+    /// the SDK wraps it in a <c>ClientResultException</c> that keeps only the text.
+    /// </summary>
+    private static bool IsRateLimited(Exception ex)
+    {
+        var text = ex.ToString();
+        return text.Contains(" 429", StringComparison.Ordinal)
+            || text.Contains("Too Many Requests", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("rate limit", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("rate-limit", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// HOW LONG TO WAIT BEFORE RETRYING — and why a rate limit is not a dropped socket.
+    ///
+    /// <para>
+    /// Every retry site here used to wait <c>400ms × attempt</c>: 0.4s, then 0.8s. That is
+    /// the right order of magnitude for a stream that hiccupped and the wrong one by two
+    /// orders for HTTP 429, whose quota windows are measured in seconds. Retrying a closed
+    /// window 400ms later does not ask a different question — it asks the same question
+    /// sooner, and spends another <c>planner_notice</c> in the user's transcript doing it.
+    /// The observed symptom is exactly that: three grounding attempts, all 429, all inside
+    /// ~1.2s, all doomed before the first one was sent.
+    /// </para>
+    ///
+    /// <para>
+    /// So a rate limit backs off exponentially from <see cref="RateLimitBaseDelay"/> (2s,
+    /// 4s, 8s…) up to <see cref="RateLimitMaxDelay"/>, plus jitter — jitter because the
+    /// device fires grounding and compose back to back, and identical waits rebuild the
+    /// same burst that got throttled. When the provider says when to come back, that wins
+    /// outright: a guess never beats the server (<see cref="RetryAfterFrom"/>).
+    /// </para>
+    /// </summary>
+    private static TimeSpan RetryDelay(int attempt, Exception ex)
+    {
+        if (!IsRateLimited(ex))
+        {
+            return TimeSpan.FromMilliseconds(400 * attempt);
+        }
+
+        var stated = RetryAfterFrom(ex);
+        if (stated is { } wait)
+        {
+            return wait > RateLimitMaxDelay ? RateLimitMaxDelay : wait;
+        }
+
+        var backoff = RateLimitBaseDelay * Math.Pow(2, Math.Max(0, attempt - 1));
+        if (backoff > RateLimitMaxDelay) backoff = RateLimitMaxDelay;
+        return backoff + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 500));
+    }
+
+    private static readonly TimeSpan RateLimitBaseDelay = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// The ceiling on a single wait. Past this the person at the fridge is watching a
+    /// spinner for a provider's benefit, and the run may as well fail and say so.
+    /// </summary>
+    private static readonly TimeSpan RateLimitMaxDelay = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// The provider's own answer to "when?", dug out of the exception text — the SDK
+    /// throws away the response headers, so a <c>Retry-After</c> only survives if it was
+    /// echoed into the message or the body. Best effort by construction: no match simply
+    /// means the exponential backoff decides instead.
+    /// </summary>
+    private static TimeSpan? RetryAfterFrom(Exception ex)
+    {
+        var match = Regex.Match(
+            ex.ToString(),
+            @"retry[-\s]?after[""'`:=\s]+(\d+(?:\.\d+)?)|try again in (\d+(?:\.\d+)?)\s*s",
+            RegexOptions.IgnoreCase);
+        if (!match.Success) return null;
+        var raw = match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value;
+        return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds) && seconds > 0
+            ? TimeSpan.FromSeconds(seconds)
+            : null;
+    }
+
+    /// <summary>
+    /// A PROCESS-WIDE COOL-OFF, because a 429 is a statement about the next call as much
+    /// as about the one that failed.
+    ///
+    /// <para>
+    /// Retrying with a real backoff fixes ONE call. It does nothing about the shape of a
+    /// run, which is decompose → grounding → compose in quick succession: grounding waits
+    /// out its 429, succeeds, and compose then fires immediately into the same still-closed
+    /// window and pays the whole price again. Every LLM call therefore waits out the window
+    /// the last 429 implied, so a throttled run slows down ONCE instead of at every site.
+    /// </para>
+    ///
+    /// <para>
+    /// Static, and stored as ticks with <see cref="Interlocked"/>, because the goal loop
+    /// and the board's adaptation path can be in flight at the same time and the provider's
+    /// quota does not care which of them is asking. It is a floor, never a rollback: a
+    /// later, longer cool-off extends it, an earlier one leaves it alone.
+    /// </para>
+    /// </summary>
+    private static long _providerCoolUntilTicks;
+
+    /// <summary>Extend the cool-off to <paramref name="delay"/> from now. Never shortens it.</summary>
+    private static void ArmCoolOff(TimeSpan delay)
+    {
+        var until = (DateTimeOffset.UtcNow + delay).UtcTicks;
+        long seen;
+        while ((seen = Interlocked.Read(ref _providerCoolUntilTicks)) < until)
+        {
+            if (Interlocked.CompareExchange(ref _providerCoolUntilTicks, until, seen) == seen) break;
+        }
+    }
+
+    /// <summary>How much of the cool-off is left — zero (never negative) when it has passed.</summary>
+    private static TimeSpan CoolOffRemaining()
+    {
+        var until = new DateTimeOffset(Interlocked.Read(ref _providerCoolUntilTicks), TimeSpan.Zero);
+        var remaining = until - DateTimeOffset.UtcNow;
+        if (remaining <= TimeSpan.Zero) return TimeSpan.Zero;
+        return remaining > RateLimitMaxDelay ? RateLimitMaxDelay : remaining;
+    }
+
+    /// <summary>Gate 30's window onto the backoff. See <c>--verify-backoff</c>.</summary>
+    internal static bool IsRateLimitedForTests(Exception ex) => IsRateLimited(ex);
+    internal static TimeSpan RetryDelayForTests(int attempt, Exception ex) => RetryDelay(attempt, ex);
+    internal static void ArmCoolOffForTests(TimeSpan delay) => ArmCoolOff(delay);
+    internal static TimeSpan CoolOffRemainingForTests() => CoolOffRemaining();
+    internal static void ClearCoolOffForTests() => Interlocked.Exchange(ref _providerCoolUntilTicks, 0);
+
+    private void NoteRateLimit(TimeSpan delay)
+    {
+        ArmCoolOff(delay);
+        _logger.LogWarning("provider_rate_limited cooling_ms={Delay}", (long)delay.TotalMilliseconds);
+    }
+
+    /// <summary>Hold here until the cool-off set by the last 429 has passed.</summary>
+    private async Task AwaitProviderCoolAsync(CancellationToken ct)
+    {
+        var remaining = CoolOffRemaining();
+        if (remaining <= TimeSpan.Zero) return;
+        _logger.LogInformation("provider_cooloff_wait ms={Remaining}", (long)remaining.TotalMilliseconds);
+        await Task.Delay(remaining, ct);
+    }
+
+    /// <summary>
+    /// The transcript line for a transient retry, as a NOTICE STEP rather than prose.
+    ///
+    /// <para>
+    /// A rate limit gets English and a number of seconds; everything else keeps the raw
+    /// exception, which is what a genuinely unexpected failure is worth reading. The old
+    /// line pasted <c>"ClientResultException: Service request failed. Status: 429 (Too Many
+    /// Requests)"</c> — newlines and all — into the thinking stream three times in a row.
+    /// </para>
+    ///
+    /// <para>
+    /// It goes down the STEP channel because a step arrives whole and prose does not:
+    /// consecutive prose fragments from one engine are concatenated by design (that is how
+    /// streaming works), so two retries in a row rendered as
+    /// <c>"…retrying grounding (1/3).planner_notice: the model provider…"</c> — one run-on
+    /// paragraph, seen in a live run that really was throttled. A notice is a discrete
+    /// event, and the wire has had a kind for exactly that since v7.
+    /// </para>
+    /// </summary>
+    private static (string Step, string Detail) TransientNote(string what, int attempt, int max, Exception ex, TimeSpan delay)
+        => IsRateLimited(ex)
+            ? ($"Provider rate-limited us (429) — waiting {delay.TotalSeconds:0.#}s",
+               $"retrying {what}, attempt {attempt} of {max}")
+            : ($"{what} hit a transient provider error — retrying",
+               $"attempt {attempt} of {max} · {ex.GetType().Name}: {ex.Message}");
+
+    /// <summary>
+    /// One place that turns "this attempt failed transiently" into "wait, then go again":
+    /// the delay, the cool-off it implies for every other call site, the log and the
+    /// transcript line. Five retry loops used to carry five copies of the first two, which
+    /// is why only some of them would ever have been fixed.
+    /// </summary>
+    private async Task BackOffAsync(string what, int attempt, int max, Exception ex, CancellationToken ct)
+    {
+        var delay = RetryDelay(attempt, ex);
+        if (IsRateLimited(ex))
+        {
+            NoteRateLimit(delay);
+        }
+        _logger.LogWarning(ex, "transient_retry site={Site} attempt={Attempt}/{Max} delay_ms={Delay}",
+            what, attempt, max, (long)delay.TotalMilliseconds);
+        var (step, detail) = TransientNote(what, attempt, max, ex, delay);
+        await _trace.ThinkingStepAsync(step, detail, ThinkingKinds.Notice);
+        await Task.Delay(delay, ct);
+    }
 
     private static bool IsTransientProviderError(Exception ex, CancellationToken ct)
     {

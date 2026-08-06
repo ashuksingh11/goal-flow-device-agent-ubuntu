@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json.Nodes;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using GoalFlow.Device.Contracts;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
@@ -268,12 +269,48 @@ public sealed class SafetyFilter : IFunctionInvocationFilter
         }
     }
 
-    /// <summary>The function's own [Description] as a step headline, or "Module · Function".</summary>
+    /// <summary>
+    /// The function's own [Description] as a step headline — but only its FIRST CLAUSE.
+    ///
+    /// <para>
+    /// A [Description] has two audiences and only one of them is a person. It opens by
+    /// saying what the tool returns, and then keeps going for the model: "— prime
+    /// candidates for waste-rescue meals", "Call once; do not repeat it and do not follow
+    /// it with GetRecipe", "preferTags only re-orders". Printed whole, as it was through
+    /// v8, the transcript read a 45-word instruction to a language model back at the
+    /// person who asked for dinner.
+    /// </para>
+    ///
+    /// <para>
+    /// The first clause is the half written for a reader, and it is still product-authored
+    /// text — the harness grows no vocabulary of its own here, which is the constraint that
+    /// made us print the whole thing in the first place. Cut at the first sentence end,
+    /// em dash, colon or semicolon, whichever comes first.
+    /// </para>
+    /// </summary>
     private static string Describe(KernelFunction fn, string module, string function)
     {
-        var described = (fn.Description ?? "").Trim().TrimEnd('.');
+        var described = (fn.Description ?? "").Trim();
+        var cut = FirstClauseEnd.Match(described);
+        if (cut.Success && cut.Index > 0) described = described[..cut.Index];
+        described = described.Trim().TrimEnd(',');
         return described.Length > 0 ? described : $"{module} · {function}";
     }
+
+    /// <summary>
+    /// Where the first clause ends: an em dash, a colon, a semicolon, or a full stop that
+    /// actually ends a sentence.
+    ///
+    /// <para>
+    /// The lookbehinds are why this is a regex and not <c>IndexOfAny</c>. Descriptions are
+    /// full of "(e.g. bake at 180C)", and a naive cut on the first '.' turned
+    /// <c>"Marks a quantity of an item as used/consumed (e.g. …)"</c> into
+    /// <c>"Marks a quantity of an item as used/consumed (e"</c>. A single letter before a
+    /// dot is an abbreviation, not the end of a thought.
+    /// </para>
+    /// </summary>
+    private static readonly Regex FirstClauseEnd =
+        new(@"[—:;]|(?<!\b[A-Za-z])\.(?=\s|$)", RegexOptions.Compiled);
 
     /// <summary>
     /// A tool result as one short line. Counts where there is something to count, because
