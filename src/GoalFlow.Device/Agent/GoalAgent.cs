@@ -723,31 +723,33 @@ public sealed class GoalAgent
     /// <para>Returns true when this call is what completed it.</para>
     /// </summary>
     /// <summary>
-    /// The last day a goal is still running — THE WINDOW THE USER ASKED FOR decides.
+    /// The last day a goal is still running — the LATER of its window and its plan.
     ///
     /// <para>
-    /// v11.2, and this replaces two versions that were each wrong in one direction. It
-    /// used to derive the last day from the plan's own span (window start + max
-    /// <c>Day</c> - 1), on the reasoning that completion should line up with the board's
-    /// day-by-day progress. But <c>Day</c> is an index the PLANNER chooses, with nothing
-    /// tying it to the window, and measured across four identical runs of "I'll be out
-    /// Sunday and Monday" — a two-day window — it broke both ways:
+    /// v11.2, and this is the third rule in one day because the first two were each
+    /// right about one half of the problem. Both halves are real and both were measured
+    /// on "I'll be out Sunday and Monday" and "prepare the weekly meal plan":
     /// </para>
     ///
     /// <list type="bullet">
-    /// <item>day sets [1,2,4] and [1,5] pushed the last day PAST the away period, so the
-    /// card sat on the board after its own dates — the reported bug;</item>
-    /// <item>and a plan anchored at the dispatch day with a short span resolved to
-    /// 08/08 for a 08/09-08/10 window, retiring the card BEFORE the days it was for had
-    /// even arrived. Clamping to the earlier of the two fixed the first and left the
-    /// second, which is worse: a goal that vanishes while its work is still ahead.</item>
+    /// <item><b>The plan alone overshoots.</b> `Day` is an index the planner chooses;
+    /// four identical away runs returned [1,2,4], [1,5], [1,3] and [1,2]. Trusting it
+    /// blindly left cards on the board past their dates — the reported bug.</item>
+    /// <item><b>The window alone undershoots.</b> The interpreter read "this week" as
+    /// ending Sunday (today+3) while the device composed a SEVEN-day meal plan, so a
+    /// window-authoritative rule retired the card with four days of dinners still to
+    /// come — the reported bug's mirror image, and the worse of the two: a goal that
+    /// vanishes while its work is visibly unfinished.</item>
     /// </list>
     ///
     /// <para>
-    /// So the calendar decides and the planner does not get a vote. A goal covers the
-    /// period the user asked for; it is finished when that period has passed, whatever
-    /// day indices the model happened to emit. The plan span survives only as a FALLBACK
-    /// for a goal with no window end at all, where it is the only signal there is.
+    /// Neither number is reliable alone, and each is a genuine claim about the goal: the
+    /// window is the horizon the user asked for, the plan is the work that will actually
+    /// be done — including steps that fall AFTER the window, like coming home the day
+    /// after a trip ends. A goal is finished when both have passed, so the answer is the
+    /// later of the two. The cost is bounded (a card can outlive its window by the
+    /// planner's own overshoot, a day or two) and the benefit is that nothing ever
+    /// retires with planned work still in the future.
     /// </para>
     ///
     /// <para>Pure and internal so gate 34 can exercise it.</para>
@@ -756,28 +758,28 @@ public sealed class GoalAgent
         string? windowStart,
         string? windowEnd,
         int? maxPlanDay,
-        Action<DateOnly, DateOnly, int>? onOverridden = null)
+        Action<DateOnly, DateOnly, int>? onDisagreement = null)
     {
-        if (DateOnly.TryParse(windowEnd, out var end))
-        {
-            // Logged when the plan disagreed, so a planner drifting from its window stays
-            // visible rather than being silently overruled.
-            if (DateOnly.TryParse(windowStart, out var s) && maxPlanDay is int m)
-            {
-                var planLast = s.AddDays(Math.Max(1, m) - 1);
-                if (planLast != end)
-                {
-                    onOverridden?.Invoke(planLast, end, Math.Max(1, m));
-                }
-            }
-            return end;
-        }
-        // No window end — the plan's own span is all we have.
+        DateOnly? planLast = null;
         if (DateOnly.TryParse(windowStart, out var start) && maxPlanDay is int rawMax)
         {
-            return start.AddDays(Math.Max(1, rawMax) - 1);
+            planLast = start.AddDays(Math.Max(1, rawMax) - 1);
         }
-        return null;
+        if (!DateOnly.TryParse(windowEnd, out var end))
+        {
+            return planLast;   // no horizon; the plan's own span is all there is
+        }
+        if (planLast is null)
+        {
+            return end;        // no plan; the window decides
+        }
+        if (planLast.Value != end)
+        {
+            // Logged either way, because a planner and an interpreter disagreeing about
+            // how long a goal lasts is worth seeing — it is what produced both bugs.
+            onDisagreement?.Invoke(planLast.Value, end, Math.Max(1, maxPlanDay ?? 1));
+        }
+        return planLast.Value > end ? planLast.Value : end;
     }
 
     private async Task<bool> CompleteIfWindowPassedAsync(GoalRecord goal, CancellationToken ct)
@@ -787,7 +789,7 @@ public sealed class GoalAgent
             goal.Dispatch.TimeWindow?.End,
             goal.Plan.Count > 0 ? goal.Plan.Max(p => p.Day) : null,
             (planLast, windowEnd, maxDay) => _logger.LogInformation(
-                "goal_last_day_from_window {GoalId} plan_last={PlanLast} window_end={WindowEnd} max_day={MaxDay}",
+                "goal_last_day {GoalId} plan_last={PlanLast} window_end={WindowEnd} max_day={MaxDay} — taking the later",
                 goal.Dispatch.GoalId, planLast, windowEnd, maxDay));
         if (lastDay is null)
         {

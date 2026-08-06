@@ -3011,43 +3011,60 @@ public static Task<int> VerifyCompletionAsync(ILoggerFactory loggerFactory)
         else Console.WriteLine($"  ok   {what}");
     }
 
-    // THE REPORT: a home-away card stayed on the board after its away days had passed,
-    // "sometimes". The sometimes was the clue — completion derived the last day from the
-    // PLAN's span, and `Day` is an index the planner picks with nothing tying it to the
-    // window. Measured across four identical runs of "I'll be out for Sunday and Monday"
-    // (a TWO-day window) it broke in BOTH directions, and every case below is verbatim
-    // from one of those runs.
-    var start = "2026-08-09";   // Sunday
-    var end = "2026-08-10";     // Monday — the last day the user asked for
-    var windowEnd = DateOnly.Parse(end);
+    // TWO REPORTS, MIRROR IMAGES, and the rule has to satisfy both.
+    //
+    // (1) "the home-away card doesn't disappear after its end date — sometimes". `Day` is
+    //     a planner-chosen index: four identical runs of "out Sunday and Monday" gave
+    //     [1,2,4], [1,5], [1,3], [1,2]. Trusting it blindly left cards past their dates.
+    // (2) "the meal plan is going earlier now, before its completion date". The
+    //     interpreter read "this week" as ending Sunday (today+3) while the device
+    //     composed a SEVEN-day plan, so a window-authoritative rule retired the card with
+    //     four days of dinners still to come.
+    //
+    // Neither number is reliable alone, so the goal covers BOTH. Every case below is
+    // verbatim from a measured run.
+    var awayStart = "2026-08-07";   // dispatch start = today
+    var awayEnd = "2026-08-10";     // Monday, the last away day
 
-    // Overshoot: the reported bug. The card outlived its own dates.
-    foreach (var (maxDay, label) in new[] { (4, "[1,2,4]"), (5, "[1,5]"), (3, "[1,3]") })
-    {
-        Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(start, end, maxDay) == windowEnd,
-            $"plan days {label} -> the goal still ends on {end}, not days later");
-    }
+    // (2) A plan LONGER than its window keeps the goal alive to the end of the plan —
+    // a weekly meal plan does not stop being a weekly meal plan because "this week" was
+    // read short.
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay("2026-08-06", "2026-08-09", 7)
+          == DateOnly.Parse("2026-08-12"),
+        "a 7-day plan under a 4-day window runs to the PLAN's end (2026-08-12) — nothing "
+        + "retires with planned work still in the future");
 
-    // Undershoot: worse, and what a naive clamp left behind. A plan anchored at the
-    // dispatch day with a short span resolved to 08/08 for an 08/09-08/10 window, so the
-    // card vanished BEFORE the days it was for had arrived.
-    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay("2026-08-07", end, 2) == windowEnd,
-        "a plan anchored EARLIER than the window does not retire the goal before its days");
-    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay("2026-08-09", "2026-08-16", 2) 
-          == DateOnly.Parse("2026-08-16"),
-        "and a plan shorter than its window still covers the whole window");
+    // (1) A plan SHORTER than its window still runs to the window: the user asked for
+    // that horizon.
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, awayEnd, 2)
+          == DateOnly.Parse(awayEnd),
+        "a 2-day plan under a 4-day window still runs to the window end");
 
-    // No window end: the plan span is the only signal there is.
-    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(start, null, 3) == DateOnly.Parse("2026-08-11"),
+    // And a plan step AFTER the window is real work (coming home the day after a trip),
+    // so it extends the goal rather than being ignored.
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, awayEnd, 5)
+          == DateOnly.Parse("2026-08-11"),
+        "a plan step past the window (day 5 = coming home) keeps the goal open for it");
+
+    // Fallbacks.
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, null, 3)
+          == DateOnly.Parse("2026-08-09"),
         "with no window end, the plan's own span decides");
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(null, awayEnd, null)
+          == DateOnly.Parse(awayEnd),
+        "with no plan, the window decides");
     Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(null, null, 3) is null,
         "with no dates at all it returns null — a goal with no window is never swept");
-    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(start, null, 0) == DateOnly.Parse(start),
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, null, 0)
+          == DateOnly.Parse(awayStart),
         "day 0 is treated as day 1 — never a last day BEFORE the goal began");
 
     var noted = 0;
-    GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(start, end, 4, (_, _, _) => noted++);
-    Check(noted == 1, "and a planner disagreeing with its window is LOGGED, not silently overruled");
+    GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, awayEnd, 5, (_, _, _) => noted++);
+    Check(noted == 1, "a planner and an interpreter disagreeing about the length is LOGGED");
+    noted = 0;
+    GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, awayEnd, 4, (_, _, _) => noted++);
+    Check(noted == 0, "and when they agree, nothing is logged");
 
     log.LogInformation("completion gate: {Failures} failure(s)", failures);
     Console.WriteLine($"gate 34 (a goal retires on its own dates): {(failures == 0 ? "PASS" : $"FAIL: {failures}")}");
