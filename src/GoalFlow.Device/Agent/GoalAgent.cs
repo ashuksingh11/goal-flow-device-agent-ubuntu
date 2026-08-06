@@ -722,24 +722,79 @@ public sealed class GoalAgent
     ///
     /// <para>Returns true when this call is what completed it.</para>
     /// </summary>
+    /// <summary>
+    /// The last day a goal is still running — THE WINDOW THE USER ASKED FOR decides.
+    ///
+    /// <para>
+    /// v11.2, and this replaces two versions that were each wrong in one direction. It
+    /// used to derive the last day from the plan's own span (window start + max
+    /// <c>Day</c> - 1), on the reasoning that completion should line up with the board's
+    /// day-by-day progress. But <c>Day</c> is an index the PLANNER chooses, with nothing
+    /// tying it to the window, and measured across four identical runs of "I'll be out
+    /// Sunday and Monday" — a two-day window — it broke both ways:
+    /// </para>
+    ///
+    /// <list type="bullet">
+    /// <item>day sets [1,2,4] and [1,5] pushed the last day PAST the away period, so the
+    /// card sat on the board after its own dates — the reported bug;</item>
+    /// <item>and a plan anchored at the dispatch day with a short span resolved to
+    /// 08/08 for a 08/09-08/10 window, retiring the card BEFORE the days it was for had
+    /// even arrived. Clamping to the earlier of the two fixed the first and left the
+    /// second, which is worse: a goal that vanishes while its work is still ahead.</item>
+    /// </list>
+    ///
+    /// <para>
+    /// So the calendar decides and the planner does not get a vote. A goal covers the
+    /// period the user asked for; it is finished when that period has passed, whatever
+    /// day indices the model happened to emit. The plan span survives only as a FALLBACK
+    /// for a goal with no window end at all, where it is the only signal there is.
+    /// </para>
+    ///
+    /// <para>Pure and internal so gate 34 can exercise it.</para>
+    /// </summary>
+    internal static DateOnly? ResolveLastDay(
+        string? windowStart,
+        string? windowEnd,
+        int? maxPlanDay,
+        Action<DateOnly, DateOnly, int>? onOverridden = null)
+    {
+        if (DateOnly.TryParse(windowEnd, out var end))
+        {
+            // Logged when the plan disagreed, so a planner drifting from its window stays
+            // visible rather than being silently overruled.
+            if (DateOnly.TryParse(windowStart, out var s) && maxPlanDay is int m)
+            {
+                var planLast = s.AddDays(Math.Max(1, m) - 1);
+                if (planLast != end)
+                {
+                    onOverridden?.Invoke(planLast, end, Math.Max(1, m));
+                }
+            }
+            return end;
+        }
+        // No window end — the plan's own span is all we have.
+        if (DateOnly.TryParse(windowStart, out var start) && maxPlanDay is int rawMax)
+        {
+            return start.AddDays(Math.Max(1, rawMax) - 1);
+        }
+        return null;
+    }
+
     private async Task<bool> CompleteIfWindowPassedAsync(GoalRecord goal, CancellationToken ct)
     {
-        // A plan is complete once the clock passes its LAST DAY. Derive that from the
-        // plan's OWN day span (Day 1..N, anchored at the dispatch start) rather than the
-        // LLM's dispatch-window end — so completion lines up with the board's day-by-day
-        // progress reaching 100%. Fall back to the dispatch window end when there is no plan.
-        DateOnly lastDay;
-        if (DateOnly.TryParse(goal.Dispatch.TimeWindow?.Start, out var start) && goal.Plan.Count > 0)
-        {
-            var maxDay = Math.Max(1, goal.Plan.Max(p => p.Day));
-            lastDay = start.AddDays(maxDay - 1);
-        }
-        else if (!DateOnly.TryParse(goal.Dispatch.TimeWindow?.End, out lastDay))
+        var lastDay = ResolveLastDay(
+            goal.Dispatch.TimeWindow?.Start,
+            goal.Dispatch.TimeWindow?.End,
+            goal.Plan.Count > 0 ? goal.Plan.Max(p => p.Day) : null,
+            (planLast, windowEnd, maxDay) => _logger.LogInformation(
+                "goal_last_day_from_window {GoalId} plan_last={PlanLast} window_end={WindowEnd} max_day={MaxDay}",
+                goal.Dispatch.GoalId, planLast, windowEnd, maxDay));
+        if (lastDay is null)
         {
             return false;
         }
 
-        if (_clock.Today <= lastDay)
+        if (_clock.Today <= lastDay.Value)
         {
             return false;
         }
@@ -765,7 +820,7 @@ public sealed class GoalAgent
         }
 
         _logger.LogInformation("goal_complete {GoalId} last_day={LastDay} progress={Progress}%",
-            goal.Dispatch.GoalId, lastDay, goal.ProgressPercent);
+            goal.Dispatch.GoalId, lastDay.Value, goal.ProgressPercent);
         return true;
     }
 

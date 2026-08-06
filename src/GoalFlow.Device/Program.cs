@@ -278,6 +278,12 @@ if (options.VerifyRequestShape)
     return;
 }
 
+if (options.VerifyCompletion)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyCompletionAsync(loggerFactory);
+    return;
+}
+
 if (options.VerifyBackoff)
 {
     Environment.ExitCode = await ProgramHelpers.VerifyBackoffAsync(loggerFactory);
@@ -475,6 +481,9 @@ internal sealed record CliOptions
     /// <summary>--verify-backoff — assert a 429 waits seconds, not milliseconds (v9 gate 30).</summary>
     public bool VerifyBackoff { get; init; }
 
+    /// <summary>--verify-completion — assert a goal retires on its own dates (v11.2 gate 34).</summary>
+    public bool VerifyCompletion { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -532,6 +541,7 @@ internal sealed record CliOptions
                 "--verify-deadline" => options with { VerifyDeadline = true },
                 "--verify-request-shape" => options with { VerifyRequestShape = true },
                 "--verify-backoff" => options with { VerifyBackoff = true },
+                "--verify-completion" => options with { VerifyCompletion = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -2990,6 +3000,60 @@ public static async Task<int> VerifyRequestShapeAsync(ILoggerFactory loggerFacto
 /// one already knew was closed.
 /// </para>
 /// </summary>
+/// <summary>--verify-completion — gate 34: a goal retires on its own dates (v11.2).</summary>
+public static Task<int> VerifyCompletionAsync(ILoggerFactory loggerFactory)
+{
+    var log = loggerFactory.CreateLogger("verify-completion");
+    var failures = 0;
+    void Check(bool ok, string what)
+    {
+        if (!ok) { failures++; Console.WriteLine($"  FAIL {what}"); }
+        else Console.WriteLine($"  ok   {what}");
+    }
+
+    // THE REPORT: a home-away card stayed on the board after its away days had passed,
+    // "sometimes". The sometimes was the clue — completion derived the last day from the
+    // PLAN's span, and `Day` is an index the planner picks with nothing tying it to the
+    // window. Measured across four identical runs of "I'll be out for Sunday and Monday"
+    // (a TWO-day window) it broke in BOTH directions, and every case below is verbatim
+    // from one of those runs.
+    var start = "2026-08-09";   // Sunday
+    var end = "2026-08-10";     // Monday — the last day the user asked for
+    var windowEnd = DateOnly.Parse(end);
+
+    // Overshoot: the reported bug. The card outlived its own dates.
+    foreach (var (maxDay, label) in new[] { (4, "[1,2,4]"), (5, "[1,5]"), (3, "[1,3]") })
+    {
+        Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(start, end, maxDay) == windowEnd,
+            $"plan days {label} -> the goal still ends on {end}, not days later");
+    }
+
+    // Undershoot: worse, and what a naive clamp left behind. A plan anchored at the
+    // dispatch day with a short span resolved to 08/08 for an 08/09-08/10 window, so the
+    // card vanished BEFORE the days it was for had arrived.
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay("2026-08-07", end, 2) == windowEnd,
+        "a plan anchored EARLIER than the window does not retire the goal before its days");
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay("2026-08-09", "2026-08-16", 2) 
+          == DateOnly.Parse("2026-08-16"),
+        "and a plan shorter than its window still covers the whole window");
+
+    // No window end: the plan span is the only signal there is.
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(start, null, 3) == DateOnly.Parse("2026-08-11"),
+        "with no window end, the plan's own span decides");
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(null, null, 3) is null,
+        "with no dates at all it returns null — a goal with no window is never swept");
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(start, null, 0) == DateOnly.Parse(start),
+        "day 0 is treated as day 1 — never a last day BEFORE the goal began");
+
+    var noted = 0;
+    GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(start, end, 4, (_, _, _) => noted++);
+    Check(noted == 1, "and a planner disagreeing with its window is LOGGED, not silently overruled");
+
+    log.LogInformation("completion gate: {Failures} failure(s)", failures);
+    Console.WriteLine($"gate 34 (a goal retires on its own dates): {(failures == 0 ? "PASS" : $"FAIL: {failures}")}");
+    return Task.FromResult(failures == 0 ? 0 : 1);
+}
+
 public static Task<int> VerifyBackoffAsync(ILoggerFactory loggerFactory)
 {
     var log = loggerFactory.CreateLogger("verify-backoff");
