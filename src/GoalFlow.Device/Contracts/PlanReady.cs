@@ -49,6 +49,18 @@ public sealed record PlanReadyPayload
     public string? Explanation { get; init; }
 
     /// <summary>
+    /// v11.1: the plan in TWO SHORT SENTENCES, written to be spoken aloud.
+    ///
+    /// <para>
+    /// Not a shorter <see cref="Explanation"/> — a different medium. Explanation is read
+    /// on a screen and can be a paragraph; this is heard once, possibly by someone across
+    /// the kitchen who is not looking at anything. The cloud speaks it at the moment the
+    /// plan lands; absent or empty, the voice simply says nothing about the plan.
+    /// </para>
+    /// </summary>
+    public string? Narration { get; init; }
+
+    /// <summary>
     /// How many options the planner weighed before choosing (v7). Optional — a model
     /// that omits it costs a line of UI, not a plan.
     /// </summary>

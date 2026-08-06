@@ -1026,6 +1026,16 @@ public sealed class GoalAgent
           inventing a number — a fabricated rejection is worse than a missing one. Every
           rejected option must be something you could have put in THIS plan: a home-prep goal
           rejecting a dinner is not a rejection, it is noise from another goal's vocabulary.
+        - "narration" is NOT "explanation". Explanation is READ, on screen, and may be a
+          paragraph. Narration is HEARD, once, by someone who may not be looking.
+        - "narration" is this plan SPOKEN ALOUD to the family, in TWO SHORT SENTENCES, at
+          most 40 words total. It is read by a text-to-speech voice on a fridge, so: no
+          markdown, no lists, no numbers read as digits, no dates in ISO. Say what the
+          plan actually IS and the one thing that makes it fit this household ("Chicken
+          three nights, fish on Thursday, and everything that would have spoiled gets
+          used up before you go away."). Do NOT count rows, list every day, mention
+          approvals, or describe what you did — the screen shows all of that. If you
+          cannot say something worth hearing, return an empty string.
         - The response must start with { and end with }. Do not output whitespace, Markdown, code fences, or prose outside the JSON object.
 
         Final answer must be only valid JSON with this shape. EVERY VALUE BELOW IS A
@@ -1042,7 +1052,8 @@ public sealed class GoalAgent
           "impact": [{"label":"<short noun>","value":"<what this plan changes>"}],
           "considered": 17,
           "rejected": [{"option":"<an option you weighed and did not take>","reason":"<what ruled it out>"}],
-          "explanation": "one concise paragraph"
+          "explanation": "one concise paragraph",
+          "narration": "<two short sentences, spoken aloud>"
         }
         """;
 
@@ -1060,7 +1071,8 @@ public sealed class GoalAgent
             {"proposal_id":"p1","action":"...","module":"ShoppingList","function":"Add","args":{"items":["..."],"reason":"..."},"tier":"light","reason":"...","requires_approval":true}
           ],
           "impact": [{"label":"...","value":"..."}],
-          "explanation": "one concise paragraph"
+          "explanation": "one concise paragraph",
+          "narration": "<two short sentences, spoken aloud>"
         }
         """;
 
@@ -1295,6 +1307,8 @@ public sealed class GoalAgent
                 Impact = modelPlan.Impact,
                 DemoEvents = demoEvents,
                 Explanation = modelPlan.Explanation,
+                // v11.1: model-authored, spoken, and OPTIONAL — see ModelPlan.Narration.
+                Narration = modelPlan.Narration,
                 // v7, model-authored and display-only: what it weighed and what it threw
                 // away. Nothing downstream reads these — a wrong rejection reason costs a
                 // wrong sentence, which is the right price for the clearest evidence a
@@ -3019,6 +3033,24 @@ public sealed class GoalAgent
         public IReadOnlyList<ProposalItem> Proposals { get; init; } = [];
         public IReadOnlyList<ImpactItem> Impact { get; init; } = [];
         public string? Explanation { get; init; }
+
+        /// <summary>
+        /// v11.1: the plan SPOKEN ALOUD — two short sentences for the fridge's voice.
+        ///
+        /// <para>
+        /// Deliberately NOT <see cref="Explanation"/>. That is read, on screen, and may
+        /// be a paragraph; this is heard, once, by someone who may not be looking. The
+        /// same compose call writes both, which is the point: a narration produced by a
+        /// second model reading the plan afterwards could contradict it, and would cost
+        /// a round trip at the one moment the user is waiting for good news.
+        /// </para>
+        ///
+        /// <para>Optional. Absent or empty means the voice says nothing about the plan —
+        /// the screen still shows all of it. Never fabricate a fallback here: code can
+        /// only count rows, and "seven items, three needing approval" describes a data
+        /// structure rather than a week of dinners.</para>
+        /// </summary>
+        public string? Narration { get; init; }
 
         /// <summary>v7: how many options were weighed, and which were discarded and why.</summary>
         public int? Considered { get; init; }
