@@ -369,6 +369,9 @@ public sealed class GoalAgent
             {
                 _tasks.RemoveGoal(g.Dispatch.GoalId);
                 _safety.RemoveGoal(g.Dispatch.GoalId);
+                // ...and forget that it was ever announced, or a reset followed by the same
+                // goal running again would complete in silence.
+                _reportedComplete.Remove(g.Dispatch.GoalId);
             }
             return new ControlResult(
                 Array.Empty<Status>(),
@@ -754,6 +757,33 @@ public sealed class GoalAgent
     ///
     /// <para>Pure and internal so gate 34 can exercise it.</para>
     /// </summary>
+    /// <summary>
+    /// Does a task in this state stop its goal being finished?
+    ///
+    /// <para>
+    /// v11.3. The old rule asked the opposite question — "is there anything to sweep?" —
+    /// and treated NOTHING as a reason to refuse. But an empty sweep set is the definition
+    /// of finished: a goal whose tasks had all reached Completed returned false on every
+    /// tick, never reported `task_status: done`, and its card stayed on the board at 100%
+    /// for the rest of the session. Reported twice, and intermittent because it depended
+    /// on whether any task happened to end in Monitoring rather than Completed.
+    /// </para>
+    ///
+    /// <para>
+    /// WAITING is what blocks. Created/Ready/Planning/AwaitingApproval/Paused are a goal
+    /// that has not started or is waiting on a person — retiring it would answer for them.
+    /// Adapting and Retrying are in here too, and the transition table is why: neither has
+    /// a legal edge to Completed, so sweeping them would call a transition that returns
+    /// false, leave the task where it was, and declare the goal done anyway.
+    /// </para>
+    ///
+    /// <para>Pure and internal so gate 34 can exercise it without a goal or a clock.</para>
+    /// </summary>
+    internal static bool BlocksCompletion(TaskState state) => state is
+        TaskState.Created or TaskState.Ready or TaskState.Planning
+        or TaskState.AwaitingApproval or TaskState.Paused
+        or TaskState.Adapting or TaskState.Retrying;
+
     internal static DateOnly? ResolveLastDay(
         string? windowStart,
         string? windowEnd,
@@ -801,24 +831,52 @@ public sealed class GoalAgent
             return false;
         }
 
-        // EXECUTING COUNTS, NOT JUST MONITORING. Tasks reach Monitoring on the LAST line of
-        // ApplyApprovalCoreAsync, so anything that stops it getting there strands them in
-        // Executing — and sweeping only Monitoring meant the goal could then never complete,
-        // leaving its card on the board past its dates for the rest of the session.
+        // WHAT STOPS A GOAL COMPLETING IS A TASK WAITING ON A PERSON — nothing else.
         //
-        // Still NOT swept: Created / Ready / Planning / AwaitingApproval. A goal waiting on
-        // a person is not complete, and retiring it would answer for them.
-        var outstanding = goal.Tasks
-            .Where(t => t.State is TaskState.Monitoring or TaskState.Executing)
-            .ToArray();
-        if (outstanding.Length == 0)
+        // v11.3, and this is the bug the user hit twice. The old rule collected tasks in
+        // Monitoring or Executing and returned false when that set was EMPTY. But an empty
+        // set is the definition of finished, not a reason to refuse: a goal whose tasks
+        // have all reached Completed had nothing to sweep, so it returned false on every
+        // tick, `task_status` never became "done", and the board never retired the card.
+        // It sat there at 100% for the rest of the session — which is exactly what was
+        // reported ("advanced seven days and Goal 2 still did not go"), and why it was
+        // intermittent: it depended on whether any task happened to end in Monitoring
+        // rather than Completed.
+        //
+        // The comment above that guard already said the right thing — "a goal waiting on a
+        // person is not complete" — so this is that sentence, as code. WAITING is what
+        // blocks: a task the user has not approved, or one that never started. Anything
+        // else has either finished or is in flight and can be closed out.
+        // Adapting and Retrying are in here, not in the sweep below, for a reason the
+        // transition table settles: neither has a legal edge to Completed (Adapting goes to
+        // AwaitingApproval/Monitoring, Retrying to Ready/Failed). Sweeping them would call a
+        // transition that returns false, leave the task exactly where it was, and mark the
+        // goal complete anyway — a silent lie. They are also genuinely unfinished: an
+        // adaptation in flight and a task about to try again are both still work.
+        var waiting = goal.Tasks.Where(t => BlocksCompletion(t.State)).ToArray();
+        if (waiting.Length > 0)
         {
+            _logger.LogInformation(
+                "goal_not_complete {GoalId} last_day={LastDay} waiting={Waiting} — a goal waiting on a person is not finished",
+                goal.Dispatch.GoalId, lastDay.Value,
+                string.Join(",", waiting.Select(w => $"{w.TaskId}:{w.State}")));
             return false;
         }
 
-        foreach (var task in outstanding)
+        // Close out anything still in flight. EXECUTING COUNTS, NOT JUST MONITORING: tasks
+        // reach Monitoring on the LAST line of ApplyApprovalCoreAsync, so anything that
+        // stops them getting there strands them in Executing. This set may legitimately be
+        // empty — that is a goal whose work is already done, and it completes.
+        foreach (var task in goal.Tasks
+                     .Where(t => t.State is TaskState.Monitoring or TaskState.Executing)
+                     .ToArray())
         {
             await _tasks.TransitionAsync(goal.Dispatch.GoalId, task.TaskId, TaskState.Completed);
+        }
+
+        if (!_reportedComplete.Add(goal.Dispatch.GoalId))
+        {
+            return false;   // already announced; a transition does not repeat
         }
 
         _logger.LogInformation("goal_complete {GoalId} last_day={LastDay} progress={Progress}%",
@@ -3055,6 +3113,21 @@ public sealed class GoalAgent
     /// </para>
     /// </summary>
     private const int RateLimitRetries = 6;
+
+    /// <summary>
+    /// Goals already reported complete, so a finished goal says so ONCE.
+    ///
+    /// <para>
+    /// v11.3. Completion is re-evaluated on every world tick and a finished goal is not
+    /// removed from the ledger (only a reset does that), so once the fix below let an
+    /// all-Completed goal answer "yes" it answered yes on every tick thereafter — a
+    /// status frame per finished goal per day, forever, growing as the demo went on. The
+    /// board tolerated it (a retired goal is unknown to the fold and ignored), but it is
+    /// noise in the log and on the wire, and "the goal finished" is a transition, not a
+    /// standing fact.
+    /// </para>
+    /// </summary>
+    private readonly HashSet<string> _reportedComplete = new(StringComparer.Ordinal);
 
     private static readonly TimeSpan RateLimitBaseDelay = TimeSpan.FromSeconds(2);
 

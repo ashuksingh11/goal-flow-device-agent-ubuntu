@@ -3059,6 +3059,39 @@ public static Task<int> VerifyCompletionAsync(ILoggerFactory loggerFactory)
           == DateOnly.Parse(awayStart),
         "day 0 is treated as day 1 — never a last day BEFORE the goal began");
 
+    // (3) "advanced seven days and Goal 2 still did not go." The old rule collected tasks
+    // in Monitoring/Executing and returned false when that set was EMPTY — but an empty
+    // set is the definition of finished. A goal whose tasks had ALL reached Completed
+    // therefore returned false on every tick and its card sat at 100% forever. Reported
+    // twice; intermittent because it depended on whether any task happened to end in
+    // Monitoring rather than Completed.
+    Check(!GoalFlow.Device.Agent.GoalAgent.BlocksCompletion(TaskState.Completed),
+        "a COMPLETED task does not block its goal — a goal with nothing left to sweep is "
+        + "FINISHED, not stuck (this is the bug that stranded a card at 100% for a session)");
+    foreach (var done in new[] { TaskState.Failed, TaskState.Cancelled })
+    {
+        Check(!GoalFlow.Device.Agent.GoalAgent.BlocksCompletion(done),
+            $"a {done} task does not block either — it is terminal");
+    }
+    foreach (var inflight in new[] { TaskState.Monitoring, TaskState.Executing })
+    {
+        Check(!GoalFlow.Device.Agent.GoalAgent.BlocksCompletion(inflight),
+            $"a {inflight} task does not block — it is swept to Completed");
+    }
+    foreach (var person in new[] { TaskState.Created, TaskState.Ready, TaskState.Planning,
+                                   TaskState.AwaitingApproval, TaskState.Paused })
+    {
+        Check(GoalFlow.Device.Agent.GoalAgent.BlocksCompletion(person),
+            $"a {person} task DOES block — a goal waiting on a person is not finished, and "
+            + "retiring it would answer for them");
+    }
+    foreach (var moving in new[] { TaskState.Adapting, TaskState.Retrying })
+    {
+        Check(GoalFlow.Device.Agent.GoalAgent.BlocksCompletion(moving),
+            $"a {moving} task DOES block — it has no legal edge to Completed, so sweeping "
+            + "it would no-op and declare the goal done anyway");
+    }
+
     var noted = 0;
     GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, awayEnd, 5, (_, _, _) => noted++);
     Check(noted == 1, "a planner and an interpreter disagreeing about the length is LOGGED");
