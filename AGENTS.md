@@ -222,8 +222,21 @@ is an empty link kept because v6-m2 chains it.)
 - **Workflow:** plan=Opus · design=Fable · coding=Opus · browsing=Sonnet.
 - **Do NOT `git checkout -- data/` blindly:** `data/daily_events.json` is now a
   STRUCTURAL file (labels + the 6th event), not just runtime-mutated seed — reverting
-  it drops the 6th event. Only reset appliances/shopping_list/inventory/calendar/
-  guests/recipes/reminders.json.
+  it drops the 6th event. **v12.2: `data/recipes.json` is structural too** — `rcp-007`
+  carries `requires_fresh`, see below. Only reset appliances/shopping_list/inventory/
+  calendar/guests/reminders.json.
+- **`requires_fresh` (v12.2) — why the fish recipe hides.** `Recipes.FindRecipes`
+  withholds a recipe whose `requires_fresh` ingredient is not in the fridge, and says in
+  the reply that it did and why (never which recipe — naming it invites the model to buy
+  the ingredient and plan it anyway).
+  Exactly ONE recipe carries the field: `rcp-007`, the only fish dish in the box. Fish
+  arrives on day 2 (`daily_events.json/day1-fish`) and the event asks the planner to swap
+  that evening's dinner to use it. If the FIRST plan already chose `rcp-007`, that swap
+  proposes the dinner that is already there — the same recipe twice, and an adaptation
+  the audience watches do nothing. A pre-demo run hit exactly that.
+  **This is not a general stock filter and must not become one.** The fridge also holds no
+  beef, lamb or turkey, and those recipes must stay: the planner is supposed to put
+  missing items on the shopping list. Gate 28, half one-b, asserts both halves.
 - The device's domain string must match the cloud's canonicalized domain slug exactly —
   one of the six (`meal_plan`, `guest_dinner`, `vacation_prep`, `birthday_party`,
   `grocery_cost`, `energy_saving`) — or monitoring/per-day planning won't route.

@@ -43,6 +43,14 @@ OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-dump-mode}" \
 # meaning: call once, never follow with GetRecipe, preferTags only re-orders. Nothing
 # else in the frame moved (the diff was that one string). If a future edit drops one of
 # those three clauses, gate 28 is the one that will notice, not this one.
+#
+# v12.2 REGENERATED IT A THIRD TIME, and it is the same line again. FindRecipes no longer
+# returns the whole box unconditionally: a recipe whose `requires_fresh` ingredient is not
+# in the fridge is withheld, and the reply reports the count and the reason. The sentence
+# had to stop saying "the whole recipe box — every recipe", because that is now false, and
+# a tool description that overstates what it returns is the v7.1 lie in a new form. All
+# three load-bearing clauses survive verbatim. The reason for the withhold is the demo's
+# day-2 fish swap: see data/recipes.json rcp-007 and gate 28 half one-b.
 # NB: every gate uses `if ! diff` and NOT `diff && echo PASS` — under `set -e`, a
 # command in a && list does NOT trigger errexit unless it is the LAST one, so
 # `diff && echo PASS` silently swallows the failure and the gate can never fail.

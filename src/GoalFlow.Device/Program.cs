@@ -741,7 +741,11 @@ public static async Task<int> VerifyRepeatReadsAsync(IServiceProvider provider, 
     var box = pdoc["recipes"]!.AsArray().Select(n => n!.AsObject()).ToArray();
     string[] TagsOf(System.Text.Json.Nodes.JsonObject r) =>
         r["tags"]!.AsArray().Select(t => t!.GetValue<string>()).ToArray();
-    Check(box.Count(r => TagsOf(r).Contains("white_meat")) >= 3,
+    // v12.2: this was `>= 3` and it counted the fish dish. The fish dish is now withheld
+    // while the fridge holds no fish, so the honest floor is 2 (chicken and turkey). The
+    // number moved for a REASON, and the reason is asserted in half one-b below — do not
+    // raise it back without putting fish in the seed inventory, which would undo the fix.
+    Check(box.Count(r => TagsOf(r).Contains("white_meat")) >= 2,
         "the box carries white-meat dishes, so the preference has something to CHOOSE");
     Check(box.Count(r => TagsOf(r).Contains("red_meat")) >= 2,
         "...and red-meat dishes, so it has something to REJECT — a preference that only ever agrees is undemonstrable");
@@ -750,6 +754,50 @@ public static async Task<int> VerifyRepeatReadsAsync(IServiceProvider provider, 
     Check(box.All(r => !TagsOf(r).Contains("pork")) && box.All(r => !r["ingredients"]!.AsArray()
             .Any(i => i!.GetValue<string>().Contains("pork", StringComparison.OrdinalIgnoreCase))),
         "no pork in the seed — that 'no' belongs to the hard rule, and a hard rule must not need luck");
+
+    // --- half one-b (v12.2): a fresh ingredient the house does not have ---
+    //
+    // WHAT THIS PROTECTS. Fish arrives on day 2 (daily_events.json/day1-fish) and the
+    // event asks the planner to swap that evening's dinner to use it. There is exactly ONE
+    // fish recipe in the box. If the FIRST plan already chose it, the day-2 adaptation
+    // proposes the recipe that is already there — the same dinner, suggested twice, and an
+    // adaptation the audience watches do nothing. That is what a pre-demo run showed.
+    var seed = await recipes.FindRecipes();
+    var sdoc = System.Text.Json.Nodes.JsonNode.Parse(seed)!.AsObject();
+    var seedIds = sdoc["recipes"]!.AsArray().Select(n => n!["id"]!.GetValue<string>()).ToArray();
+
+    Check(!seedIds.Contains("rcp-007"),
+        "the fish recipe is WITHHELD while the fridge holds no fish — it is the only fish dish in the box, so a first plan that uses it makes the day-2 swap a no-op");
+    Check(seedIds.Length == 9,
+        $"...and exactly one recipe is withheld, not a general stock filter — got {seedIds.Length} of 10. The fridge also holds no beef, lamb or turkey, and those dishes MUST stay: the planner is supposed to put missing items on the shopping list.");
+    Check(sdoc["withheld_count"]?.GetValue<int>() == 1,
+        "the reply SAYS something was held back. A tool that quietly returns less than everything is the v7.1 lie that cost four minutes a plan.");
+
+    var reason = sdoc["withheld_reason"]?.GetValue<string>() ?? "";
+    Check(reason.Contains("fish", StringComparison.OrdinalIgnoreCase),
+        $"the reason names the ingredient — got \"{reason}\"");
+    Check(reason.Contains("shopping list", StringComparison.OrdinalIgnoreCase),
+        "...and forbids the shopping list. Naming the recipe would invite the model to BUY fish and plan it on day 1, which is the bug this fix exists to stop.");
+    Check(!reason.Contains("rcp-007") && !reason.Contains("lemon herb", StringComparison.OrdinalIgnoreCase),
+        "...and it must NOT name the recipe, for the same reason");
+
+    // The matching rule itself. Substring both ways, because the recipe says "fish" and a
+    // world event may write "fish", "white fish fillet" or "sea fish". An exact-name test
+    // keeps the recipe hidden with the ingredient sitting in the fridge, and NOTHING
+    // reports that: the plan is simply worse.
+    var fishRecipe = System.Text.Json.Nodes.JsonNode.Parse(
+        "{\"id\":\"t\",\"requires_fresh\":[\"fish\"]}")!.AsObject();
+    var plainRecipe = System.Text.Json.Nodes.JsonNode.Parse("{\"id\":\"t\"}")!.AsObject();
+    Check(RecipePlugin.MissingFresh(plainRecipe, []).Length == 0,
+        "a recipe with no requires_fresh is NEVER withheld — nine of the ten must be untouched");
+    Check(RecipePlugin.MissingFresh(fishRecipe, ["spinach", "rice"]).Length == 1,
+        "a required fresh item that is absent withholds the recipe");
+    Check(RecipePlugin.MissingFresh(fishRecipe, ["fish"]).Length == 0,
+        "the delivery event writes an item named 'fish' — that must release the recipe, or day 2 has nothing to swap to");
+    Check(RecipePlugin.MissingFresh(fishRecipe, ["white fish fillet"]).Length == 0,
+        "a LONGER stock name containing the term also releases it");
+    Check(RecipePlugin.MissingFresh(fishRecipe, ["FISH"]).Length == 0,
+        "and the match ignores case");
 
     // --- half two: the repeat guard, through the real kernel pipeline ---
     var filter = new RepeatReadFilter(loggerFactory.CreateLogger<RepeatReadFilter>());

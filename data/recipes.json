@@ -74,6 +74,26 @@
       "ingredients": ["white fish fillet", "spinach", "lemon", "olive oil", "garlic"],
       "tags": ["white_meat", "more_protein", "light", "quick_prep"],
       "contains": ["fish"],
+      "$comment": [
+        "v12.2 — THE ONLY RECIPE WITH requires_fresh, and it is here to make the demo's",
+        "second act real.",
+        "",
+        "Fresh fish is not a thing you plan a week around. It is a thing you cook on the day",
+        "it arrives. daily_events.json/day1-fish delivers 500 g on day 2 and asks the planner",
+        "to swap that evening's dinner to use it before it expires.",
+        "",
+        "This is the ONLY fish recipe in the box. So if the FIRST plan already chose it, the",
+        "day-2 event asks for a change that changes nothing: the same recipe suggested twice,",
+        "and an adaptation the audience watches do nothing. That happened in a pre-demo run.",
+        "",
+        "requires_fresh makes Recipes.FindRecipes withhold this recipe while the fridge holds",
+        "no fish. On day 1 there is none, so the first plan cannot contain it. The delivery",
+        "puts fish in the fridge, the recipe appears, and the swap is a real change.",
+        "",
+        "DO NOT DELETE THIS RECIPE to stop the repeat. It is the recipe the day-2 event must",
+        "swap TO. Without it the fish arrives and nothing in the box can use it."
+      ],
+      "requires_fresh": ["fish"],
       "prep_minutes": 20
     },
     {
