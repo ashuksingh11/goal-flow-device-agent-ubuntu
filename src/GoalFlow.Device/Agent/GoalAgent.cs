@@ -237,11 +237,91 @@ public sealed class GoalAgent
         {
             return await RunCoreAsync(dispatch, ct);
         }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A DISPATCH IS ALWAYS ANSWERED. This is the single most important line in
+            // the file for a demo, and it was missing.
+            //
+            // Until v11.2 an exception here propagated to Program.cs's frame handler,
+            // which caught it, wrote `frame handling failed for dispatch` to a log
+            // nobody is watching, and told NO ONE. The cloud's graph sits in
+            // collect_plan waiting for a plan_ready that will never come; the webview
+            // sits on "grounding" forever; the create-phase bracket never closes. There
+            // is no timeout anywhere in that chain, so the goal hangs until someone
+            // reloads — and on a fridge in front of an audience, that is the demo over.
+            //
+            // Reported through the PRECHECK path rather than as a new failure kind,
+            // because the semantics already match exactly: a precheck block means "not
+            // yet — the world isn't ready, this should run when it recovers", which is
+            // precisely what a provider rate limit is. The cloud routes it to
+            // `precheck_wait`, the board shows Waiting with a reason, and nothing
+            // pretends the goal completed. See nodes.py:precheck_wait.
+            using var failScope = _trace.BeginGoalScope(dispatch.GoalId, dispatch.CorrelationId);
+            var rateLimited = IsRateLimited(ex);
+            _logger.LogError(ex, "plan_failed goal={GoalId} rate_limited={RateLimited} — answering with a precheck hold rather than going silent",
+                dispatch.GoalId, rateLimited);
+            try { await _trace.ThinkingAsync(PlanFailureReason(rateLimited)); }
+            catch (Exception traceEx) { _logger.LogDebug(traceEx, "plan_failed_trace_suppressed"); }
+            return BuildFailureHold(dispatch, rateLimited);
+        }
         finally
         {
             _planningSlot.Release();
         }
     }
+
+    /// <summary>What the person at the fridge is told when planning could not finish.</summary>
+    private static string PlanFailureReason(bool rateLimited)
+        => rateLimited
+            ? "The AI service is busy right now, so I couldn't finish this plan. Ask me again in a moment."
+            : "Something went wrong while planning, so I've stopped rather than guess. Ask me again in a moment.";
+
+    /// <summary>
+    /// A plan_ready that reports FAILURE honestly, using the precheck hold the cloud
+    /// already understands.
+    ///
+    /// <para>
+    /// `Ok = false` is what routes it: the cloud's `route_on_safety` sends a
+    /// precheck-blocked plan to `precheck_wait`, which deliberately does NOT complete
+    /// the goal — an empty plan flowing on to relay_decisions would make the board read
+    /// "Completed" for a goal that never ran. Safety is reported as PASSED because
+    /// nothing was checked and nothing was violated; claiming a safety block would
+    /// accuse the household's rules of stopping a plan the provider stopped.
+    /// </para>
+    /// </summary>
+    private static PlanReady BuildFailureHold(Dispatch dispatch, bool rateLimited)
+        => new()
+        {
+            GoalId = dispatch.GoalId,
+            CorrelationId = dispatch.CorrelationId,
+            // Monitoring, not "done": the goal is waiting, not finished.
+            TaskStatus = TaskStatuses.Monitoring,
+            Payload = new PlanReadyPayload
+            {
+                Plan = [],
+                Proposals = [],
+                Safety = new SafetyVerdict { Gate = SafetyGates.Passed, Violations = [] },
+                Precheck = new PrecheckVerdict
+                {
+                    Ok = false,
+                    // The REASON lives on a result row, because that is where the cloud
+                    // reads it from (board.py takes `precheck.results[].detail` for the
+                    // card's waiting line). A verdict with no rows would route correctly
+                    // and then show a hold with no explanation attached.
+                    Results =
+                    [
+                        new PrecheckResultDto
+                        {
+                            Id = rateLimited ? "provider_available" : "planner_completed",
+                            Status = "fail",
+                            Detail = PlanFailureReason(rateLimited),
+                        },
+                    ],
+                },
+                Impact = [],
+                Explanation = PlanFailureReason(rateLimited),
+            },
+        };
 
     /// <summary>
     /// Applies an approval frame: ApprovalCoordinator flips decisions, then the
@@ -289,6 +369,9 @@ public sealed class GoalAgent
             {
                 _tasks.RemoveGoal(g.Dispatch.GoalId);
                 _safety.RemoveGoal(g.Dispatch.GoalId);
+                // ...and forget that it was ever announced, or a reset followed by the same
+                // goal running again would complete in silence.
+                _reportedComplete.Remove(g.Dispatch.GoalId);
             }
             return new ControlResult(
                 Array.Empty<Status>(),
@@ -642,50 +725,162 @@ public sealed class GoalAgent
     ///
     /// <para>Returns true when this call is what completed it.</para>
     /// </summary>
+    /// <summary>
+    /// The last day a goal is still running — the LATER of its window and its plan.
+    ///
+    /// <para>
+    /// v11.2, and this is the third rule in one day because the first two were each
+    /// right about one half of the problem. Both halves are real and both were measured
+    /// on "I'll be out Sunday and Monday" and "prepare the weekly meal plan":
+    /// </para>
+    ///
+    /// <list type="bullet">
+    /// <item><b>The plan alone overshoots.</b> `Day` is an index the planner chooses;
+    /// four identical away runs returned [1,2,4], [1,5], [1,3] and [1,2]. Trusting it
+    /// blindly left cards on the board past their dates — the reported bug.</item>
+    /// <item><b>The window alone undershoots.</b> The interpreter read "this week" as
+    /// ending Sunday (today+3) while the device composed a SEVEN-day meal plan, so a
+    /// window-authoritative rule retired the card with four days of dinners still to
+    /// come — the reported bug's mirror image, and the worse of the two: a goal that
+    /// vanishes while its work is visibly unfinished.</item>
+    /// </list>
+    ///
+    /// <para>
+    /// Neither number is reliable alone, and each is a genuine claim about the goal: the
+    /// window is the horizon the user asked for, the plan is the work that will actually
+    /// be done — including steps that fall AFTER the window, like coming home the day
+    /// after a trip ends. A goal is finished when both have passed, so the answer is the
+    /// later of the two. The cost is bounded (a card can outlive its window by the
+    /// planner's own overshoot, a day or two) and the benefit is that nothing ever
+    /// retires with planned work still in the future.
+    /// </para>
+    ///
+    /// <para>Pure and internal so gate 34 can exercise it.</para>
+    /// </summary>
+    /// <summary>
+    /// Does a task in this state stop its goal being finished?
+    ///
+    /// <para>
+    /// v11.3. The old rule asked the opposite question — "is there anything to sweep?" —
+    /// and treated NOTHING as a reason to refuse. But an empty sweep set is the definition
+    /// of finished: a goal whose tasks had all reached Completed returned false on every
+    /// tick, never reported `task_status: done`, and its card stayed on the board at 100%
+    /// for the rest of the session. Reported twice, and intermittent because it depended
+    /// on whether any task happened to end in Monitoring rather than Completed.
+    /// </para>
+    ///
+    /// <para>
+    /// WAITING is what blocks. Created/Ready/Planning/AwaitingApproval/Paused are a goal
+    /// that has not started or is waiting on a person — retiring it would answer for them.
+    /// Adapting and Retrying are in here too, and the transition table is why: neither has
+    /// a legal edge to Completed, so sweeping them would call a transition that returns
+    /// false, leave the task where it was, and declare the goal done anyway.
+    /// </para>
+    ///
+    /// <para>Pure and internal so gate 34 can exercise it without a goal or a clock.</para>
+    /// </summary>
+    internal static bool BlocksCompletion(TaskState state) => state is
+        TaskState.Created or TaskState.Ready or TaskState.Planning
+        or TaskState.AwaitingApproval or TaskState.Paused
+        or TaskState.Adapting or TaskState.Retrying;
+
+    internal static DateOnly? ResolveLastDay(
+        string? windowStart,
+        string? windowEnd,
+        int? maxPlanDay,
+        Action<DateOnly, DateOnly, int>? onDisagreement = null)
+    {
+        DateOnly? planLast = null;
+        if (DateOnly.TryParse(windowStart, out var start) && maxPlanDay is int rawMax)
+        {
+            planLast = start.AddDays(Math.Max(1, rawMax) - 1);
+        }
+        if (!DateOnly.TryParse(windowEnd, out var end))
+        {
+            return planLast;   // no horizon; the plan's own span is all there is
+        }
+        if (planLast is null)
+        {
+            return end;        // no plan; the window decides
+        }
+        if (planLast.Value != end)
+        {
+            // Logged either way, because a planner and an interpreter disagreeing about
+            // how long a goal lasts is worth seeing — it is what produced both bugs.
+            onDisagreement?.Invoke(planLast.Value, end, Math.Max(1, maxPlanDay ?? 1));
+        }
+        return planLast.Value > end ? planLast.Value : end;
+    }
+
     private async Task<bool> CompleteIfWindowPassedAsync(GoalRecord goal, CancellationToken ct)
     {
-        // A plan is complete once the clock passes its LAST DAY. Derive that from the
-        // plan's OWN day span (Day 1..N, anchored at the dispatch start) rather than the
-        // LLM's dispatch-window end — so completion lines up with the board's day-by-day
-        // progress reaching 100%. Fall back to the dispatch window end when there is no plan.
-        DateOnly lastDay;
-        if (DateOnly.TryParse(goal.Dispatch.TimeWindow?.Start, out var start) && goal.Plan.Count > 0)
-        {
-            var maxDay = Math.Max(1, goal.Plan.Max(p => p.Day));
-            lastDay = start.AddDays(maxDay - 1);
-        }
-        else if (!DateOnly.TryParse(goal.Dispatch.TimeWindow?.End, out lastDay))
+        var lastDay = ResolveLastDay(
+            goal.Dispatch.TimeWindow?.Start,
+            goal.Dispatch.TimeWindow?.End,
+            goal.Plan.Count > 0 ? goal.Plan.Max(p => p.Day) : null,
+            (planLast, windowEnd, maxDay) => _logger.LogInformation(
+                "goal_last_day {GoalId} plan_last={PlanLast} window_end={WindowEnd} max_day={MaxDay} — taking the later",
+                goal.Dispatch.GoalId, planLast, windowEnd, maxDay));
+        if (lastDay is null)
         {
             return false;
         }
 
-        if (_clock.Today <= lastDay)
+        if (_clock.Today <= lastDay.Value)
         {
             return false;
         }
 
-        // EXECUTING COUNTS, NOT JUST MONITORING. Tasks reach Monitoring on the LAST line of
-        // ApplyApprovalCoreAsync, so anything that stops it getting there strands them in
-        // Executing — and sweeping only Monitoring meant the goal could then never complete,
-        // leaving its card on the board past its dates for the rest of the session.
+        // WHAT STOPS A GOAL COMPLETING IS A TASK WAITING ON A PERSON — nothing else.
         //
-        // Still NOT swept: Created / Ready / Planning / AwaitingApproval. A goal waiting on
-        // a person is not complete, and retiring it would answer for them.
-        var outstanding = goal.Tasks
-            .Where(t => t.State is TaskState.Monitoring or TaskState.Executing)
-            .ToArray();
-        if (outstanding.Length == 0)
+        // v11.3, and this is the bug the user hit twice. The old rule collected tasks in
+        // Monitoring or Executing and returned false when that set was EMPTY. But an empty
+        // set is the definition of finished, not a reason to refuse: a goal whose tasks
+        // have all reached Completed had nothing to sweep, so it returned false on every
+        // tick, `task_status` never became "done", and the board never retired the card.
+        // It sat there at 100% for the rest of the session — which is exactly what was
+        // reported ("advanced seven days and Goal 2 still did not go"), and why it was
+        // intermittent: it depended on whether any task happened to end in Monitoring
+        // rather than Completed.
+        //
+        // The comment above that guard already said the right thing — "a goal waiting on a
+        // person is not complete" — so this is that sentence, as code. WAITING is what
+        // blocks: a task the user has not approved, or one that never started. Anything
+        // else has either finished or is in flight and can be closed out.
+        // Adapting and Retrying are in here, not in the sweep below, for a reason the
+        // transition table settles: neither has a legal edge to Completed (Adapting goes to
+        // AwaitingApproval/Monitoring, Retrying to Ready/Failed). Sweeping them would call a
+        // transition that returns false, leave the task exactly where it was, and mark the
+        // goal complete anyway — a silent lie. They are also genuinely unfinished: an
+        // adaptation in flight and a task about to try again are both still work.
+        var waiting = goal.Tasks.Where(t => BlocksCompletion(t.State)).ToArray();
+        if (waiting.Length > 0)
         {
+            _logger.LogInformation(
+                "goal_not_complete {GoalId} last_day={LastDay} waiting={Waiting} — a goal waiting on a person is not finished",
+                goal.Dispatch.GoalId, lastDay.Value,
+                string.Join(",", waiting.Select(w => $"{w.TaskId}:{w.State}")));
             return false;
         }
 
-        foreach (var task in outstanding)
+        // Close out anything still in flight. EXECUTING COUNTS, NOT JUST MONITORING: tasks
+        // reach Monitoring on the LAST line of ApplyApprovalCoreAsync, so anything that
+        // stops them getting there strands them in Executing. This set may legitimately be
+        // empty — that is a goal whose work is already done, and it completes.
+        foreach (var task in goal.Tasks
+                     .Where(t => t.State is TaskState.Monitoring or TaskState.Executing)
+                     .ToArray())
         {
             await _tasks.TransitionAsync(goal.Dispatch.GoalId, task.TaskId, TaskState.Completed);
         }
 
+        if (!_reportedComplete.Add(goal.Dispatch.GoalId))
+        {
+            return false;   // already announced; a transition does not repeat
+        }
+
         _logger.LogInformation("goal_complete {GoalId} last_day={LastDay} progress={Progress}%",
-            goal.Dispatch.GoalId, lastDay, goal.ProgressPercent);
+            goal.Dispatch.GoalId, lastDay.Value, goal.ProgressPercent);
         return true;
     }
 
@@ -1026,6 +1221,19 @@ public sealed class GoalAgent
           inventing a number — a fabricated rejection is worse than a missing one. Every
           rejected option must be something you could have put in THIS plan: a home-prep goal
           rejecting a dinner is not a rejection, it is noise from another goal's vocabulary.
+        - "narration" is REQUIRED on every plan, and it is placed FIRST in the shape below
+          on purpose — write it before you run long on the optional fields. A plan that
+          arrives without it is spoken about by nobody.
+        - "narration" is NOT "explanation". Explanation is READ, on screen, and may be a
+          paragraph. Narration is HEARD, once, by someone who may not be looking.
+        - "narration" is this plan SPOKEN ALOUD to the family, in TWO SHORT SENTENCES, at
+          most 40 words total. It is read by a text-to-speech voice on a fridge, so: no
+          markdown, no lists, no numbers read as digits, no dates in ISO. Say what the
+          plan actually IS and the one thing that makes it fit this household ("Chicken
+          three nights, fish on Thursday, and everything that would have spoiled gets
+          used up before you go away."). Do NOT count rows, list every day, mention
+          approvals, or describe what you did — the screen shows all of that. If you
+          cannot say something worth hearing, return an empty string.
         - The response must start with { and end with }. Do not output whitespace, Markdown, code fences, or prose outside the JSON object.
 
         Final answer must be only valid JSON with this shape. EVERY VALUE BELOW IS A
@@ -1039,6 +1247,7 @@ public sealed class GoalAgent
             {"proposal_id":"p1","action":"add missing groceries","module":"ShoppingList","function":"Add","args":{"items":["..."],"reason":"..."},"tier":"light","reason":"...","requires_approval":true},
             {"proposal_id":"p2","action":"place grocery order","module":"ShoppingList","function":"PlaceOrder","args":{"estimatedTotal":42.50},"tier":"firm","reason":"...","requires_approval":true}
           ],
+          "narration": "<two short sentences, spoken aloud>",
           "impact": [{"label":"<short noun>","value":"<what this plan changes>"}],
           "considered": 17,
           "rejected": [{"option":"<an option you weighed and did not take>","reason":"<what ruled it out>"}],
@@ -1059,6 +1268,7 @@ public sealed class GoalAgent
           "proposals": [
             {"proposal_id":"p1","action":"...","module":"ShoppingList","function":"Add","args":{"items":["..."],"reason":"..."},"tier":"light","reason":"...","requires_approval":true}
           ],
+          "narration": "<two short sentences, spoken aloud>",
           "impact": [{"label":"...","value":"..."}],
           "explanation": "one concise paragraph"
         }
@@ -1295,6 +1505,8 @@ public sealed class GoalAgent
                 Impact = modelPlan.Impact,
                 DemoEvents = demoEvents,
                 Explanation = modelPlan.Explanation,
+                // v11.1: model-authored, spoken, and OPTIONAL — see ModelPlan.Narration.
+                Narration = modelPlan.Narration,
                 // v7, model-authored and display-only: what it weighed and what it threw
                 // away. Nothing downstream reads these — a wrong rejection reason costs a
                 // wrong sentence, which is the right price for the clearest evidence a
@@ -1337,6 +1549,12 @@ public sealed class GoalAgent
         CancellationToken ct)
     {
         var baseline = history.Count;
+        // v11.2: a 429 is waited out, not counted as an attempt — see RateLimitRetries.
+        // Grounding is where this bites hardest: it is the LONGEST phase (~6 tool rounds
+        // with a large context each) and therefore the most likely to cross the
+        // provider's tokens-per-window limit, which is exactly where the demo was
+        // observed to stall.
+        var rateLimitRetries = 0;
 
         for (var attempt = 1; ; attempt++)
         {
@@ -1370,6 +1588,14 @@ public sealed class GoalAgent
             }
             // The final attempt's exception propagates (guard excludes it), so a real
             // failure still surfaces instead of looping.
+            catch (Exception ex) when (IsRateLimited(ex) && rateLimitRetries < RateLimitRetries)
+            {
+                rateLimitRetries++;
+                await BackOffAsync("grounding", rateLimitRetries, RateLimitRetries, ex, ct);
+                attempt--;   // the provider was busy; this was not an attempt at anything
+            }
+            // The final attempt's exception propagates (guard excludes it), so a real
+            // failure still surfaces instead of looping.
             catch (Exception ex) when (attempt < MaxComposeAttempts && IsTransientProviderError(ex, ct))
             {
                 await BackOffAsync("grounding", attempt, MaxComposeAttempts, ex, ct);
@@ -1391,6 +1617,24 @@ public sealed class GoalAgent
         // least likely to succeed. Past this line, "slow" has already been answered; trying
         // again only makes the person wait for a worse version of the same call.
         var composeClock = Stopwatch.StartNew();
+
+        // v11.2 — RATE LIMITS GET THEIR OWN COUNTER, and are not modelling attempts.
+        //
+        // A 429 used to consume one of the three compose attempts AND, on the next pass,
+        // append a "the previous response could not be parsed" instruction to the
+        // history. Both are wrong, and the second is actively harmful:
+        //
+        //   * the model did nothing wrong — it never saw the request — so telling it to
+        //     try harder at JSON is a correction for a fault it did not commit;
+        //   * that instruction GROWS the prompt, and the limit being hit is a
+        //     TOKENS-per-window one (measured: ~6 requests of ~3.5k tokens saturates
+        //     Cerebras). Retrying a token-rate limit with a bigger payload is the one
+        //     thing guaranteed to make it worse.
+        //
+        // So three modelling attempts still mean three malformed answers, and a 429 now
+        // costs a wait instead. Measured recovery is ~3s, so RateLimitRetries × the
+        // 2/4/8s backoff covers it many times over.
+        var rateLimitRetries = 0;
 
         for (var attempt = 1; attempt <= MaxComposeAttempts; attempt++)
         {
@@ -1420,6 +1664,15 @@ public sealed class GoalAgent
                 // failure — retry the LLM (still LLM-only; no scripted plan). Genuine
                 // cancellation is excluded by IsTransientProviderError and propagates.
                 lastError = $"provider/transport error: {ex.Message}";
+                if (IsRateLimited(ex) && rateLimitRetries < RateLimitRetries)
+                {
+                    // Not a modelling failure: wait, and re-enter on the SAME attempt so
+                    // the history is untouched and the prompt does not grow.
+                    rateLimitRetries++;
+                    await BackOffAsync("compose", rateLimitRetries, RateLimitRetries, ex, ct);
+                    attempt--;
+                    continue;
+                }
                 await BackOffAsync("compose", attempt, MaxComposeAttempts, ex, ct);
                 continue;
             }
@@ -2847,6 +3100,35 @@ public sealed class GoalAgent
         return backoff + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 500));
     }
 
+    /// <summary>
+    /// How many times a 429 may be waited out before it becomes a real failure.
+    ///
+    /// <para>
+    /// Separate from <c>MaxComposeAttempts</c> on purpose (v11.2): those three are for a
+    /// model that returned unusable JSON, and a rate limit is not that. MEASURED against
+    /// the live provider: ~6 requests of ~3.5k tokens saturate Cerebras, and it recovers
+    /// in about **3 seconds**. With the 2/4/8s backoff below, six retries span ~40s —
+    /// more than ten recovery windows, so a demo has to be extraordinarily unlucky to
+    /// exhaust it, while a genuinely dead provider still fails inside a minute.
+    /// </para>
+    /// </summary>
+    private const int RateLimitRetries = 6;
+
+    /// <summary>
+    /// Goals already reported complete, so a finished goal says so ONCE.
+    ///
+    /// <para>
+    /// v11.3. Completion is re-evaluated on every world tick and a finished goal is not
+    /// removed from the ledger (only a reset does that), so once the fix below let an
+    /// all-Completed goal answer "yes" it answered yes on every tick thereafter — a
+    /// status frame per finished goal per day, forever, growing as the demo went on. The
+    /// board tolerated it (a retired goal is unknown to the fold and ignored), but it is
+    /// noise in the log and on the wire, and "the goal finished" is a transition, not a
+    /// standing fact.
+    /// </para>
+    /// </summary>
+    private readonly HashSet<string> _reportedComplete = new(StringComparer.Ordinal);
+
     private static readonly TimeSpan RateLimitBaseDelay = TimeSpan.FromSeconds(2);
 
     /// <summary>
@@ -3019,6 +3301,24 @@ public sealed class GoalAgent
         public IReadOnlyList<ProposalItem> Proposals { get; init; } = [];
         public IReadOnlyList<ImpactItem> Impact { get; init; } = [];
         public string? Explanation { get; init; }
+
+        /// <summary>
+        /// v11.1: the plan SPOKEN ALOUD — two short sentences for the fridge's voice.
+        ///
+        /// <para>
+        /// Deliberately NOT <see cref="Explanation"/>. That is read, on screen, and may
+        /// be a paragraph; this is heard, once, by someone who may not be looking. The
+        /// same compose call writes both, which is the point: a narration produced by a
+        /// second model reading the plan afterwards could contradict it, and would cost
+        /// a round trip at the one moment the user is waiting for good news.
+        /// </para>
+        ///
+        /// <para>Optional. Absent or empty means the voice says nothing about the plan —
+        /// the screen still shows all of it. Never fabricate a fallback here: code can
+        /// only count rows, and "seven items, three needing approval" describes a data
+        /// structure rather than a week of dinners.</para>
+        /// </summary>
+        public string? Narration { get; init; }
 
         /// <summary>v7: how many options were weighed, and which were discarded and why.</summary>
         public int? Considered { get; init; }

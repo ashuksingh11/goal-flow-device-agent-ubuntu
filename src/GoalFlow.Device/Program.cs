@@ -278,6 +278,12 @@ if (options.VerifyRequestShape)
     return;
 }
 
+if (options.VerifyCompletion)
+{
+    Environment.ExitCode = await ProgramHelpers.VerifyCompletionAsync(loggerFactory);
+    return;
+}
+
 if (options.VerifyBackoff)
 {
     Environment.ExitCode = await ProgramHelpers.VerifyBackoffAsync(loggerFactory);
@@ -475,6 +481,9 @@ internal sealed record CliOptions
     /// <summary>--verify-backoff — assert a 429 waits seconds, not milliseconds (v9 gate 30).</summary>
     public bool VerifyBackoff { get; init; }
 
+    /// <summary>--verify-completion — assert a goal retires on its own dates (v11.2 gate 34).</summary>
+    public bool VerifyCompletion { get; init; }
+
     public static CliOptions Parse(string[] args)
     {
         var options = new CliOptions();
@@ -532,6 +541,7 @@ internal sealed record CliOptions
                 "--verify-deadline" => options with { VerifyDeadline = true },
                 "--verify-request-shape" => options with { VerifyRequestShape = true },
                 "--verify-backoff" => options with { VerifyBackoff = true },
+                "--verify-completion" => options with { VerifyCompletion = true },
                 _ => throw new ArgumentException($"Unknown option '{args[i]}'.")
             };
         }
@@ -2990,6 +3000,110 @@ public static async Task<int> VerifyRequestShapeAsync(ILoggerFactory loggerFacto
 /// one already knew was closed.
 /// </para>
 /// </summary>
+/// <summary>--verify-completion — gate 34: a goal retires on its own dates (v11.2).</summary>
+public static Task<int> VerifyCompletionAsync(ILoggerFactory loggerFactory)
+{
+    var log = loggerFactory.CreateLogger("verify-completion");
+    var failures = 0;
+    void Check(bool ok, string what)
+    {
+        if (!ok) { failures++; Console.WriteLine($"  FAIL {what}"); }
+        else Console.WriteLine($"  ok   {what}");
+    }
+
+    // TWO REPORTS, MIRROR IMAGES, and the rule has to satisfy both.
+    //
+    // (1) "the home-away card doesn't disappear after its end date — sometimes". `Day` is
+    //     a planner-chosen index: four identical runs of "out Sunday and Monday" gave
+    //     [1,2,4], [1,5], [1,3], [1,2]. Trusting it blindly left cards past their dates.
+    // (2) "the meal plan is going earlier now, before its completion date". The
+    //     interpreter read "this week" as ending Sunday (today+3) while the device
+    //     composed a SEVEN-day plan, so a window-authoritative rule retired the card with
+    //     four days of dinners still to come.
+    //
+    // Neither number is reliable alone, so the goal covers BOTH. Every case below is
+    // verbatim from a measured run.
+    var awayStart = "2026-08-07";   // dispatch start = today
+    var awayEnd = "2026-08-10";     // Monday, the last away day
+
+    // (2) A plan LONGER than its window keeps the goal alive to the end of the plan —
+    // a weekly meal plan does not stop being a weekly meal plan because "this week" was
+    // read short.
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay("2026-08-06", "2026-08-09", 7)
+          == DateOnly.Parse("2026-08-12"),
+        "a 7-day plan under a 4-day window runs to the PLAN's end (2026-08-12) — nothing "
+        + "retires with planned work still in the future");
+
+    // (1) A plan SHORTER than its window still runs to the window: the user asked for
+    // that horizon.
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, awayEnd, 2)
+          == DateOnly.Parse(awayEnd),
+        "a 2-day plan under a 4-day window still runs to the window end");
+
+    // And a plan step AFTER the window is real work (coming home the day after a trip),
+    // so it extends the goal rather than being ignored.
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, awayEnd, 5)
+          == DateOnly.Parse("2026-08-11"),
+        "a plan step past the window (day 5 = coming home) keeps the goal open for it");
+
+    // Fallbacks.
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, null, 3)
+          == DateOnly.Parse("2026-08-09"),
+        "with no window end, the plan's own span decides");
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(null, awayEnd, null)
+          == DateOnly.Parse(awayEnd),
+        "with no plan, the window decides");
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(null, null, 3) is null,
+        "with no dates at all it returns null — a goal with no window is never swept");
+    Check(GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, null, 0)
+          == DateOnly.Parse(awayStart),
+        "day 0 is treated as day 1 — never a last day BEFORE the goal began");
+
+    // (3) "advanced seven days and Goal 2 still did not go." The old rule collected tasks
+    // in Monitoring/Executing and returned false when that set was EMPTY — but an empty
+    // set is the definition of finished. A goal whose tasks had ALL reached Completed
+    // therefore returned false on every tick and its card sat at 100% forever. Reported
+    // twice; intermittent because it depended on whether any task happened to end in
+    // Monitoring rather than Completed.
+    Check(!GoalFlow.Device.Agent.GoalAgent.BlocksCompletion(TaskState.Completed),
+        "a COMPLETED task does not block its goal — a goal with nothing left to sweep is "
+        + "FINISHED, not stuck (this is the bug that stranded a card at 100% for a session)");
+    foreach (var done in new[] { TaskState.Failed, TaskState.Cancelled })
+    {
+        Check(!GoalFlow.Device.Agent.GoalAgent.BlocksCompletion(done),
+            $"a {done} task does not block either — it is terminal");
+    }
+    foreach (var inflight in new[] { TaskState.Monitoring, TaskState.Executing })
+    {
+        Check(!GoalFlow.Device.Agent.GoalAgent.BlocksCompletion(inflight),
+            $"a {inflight} task does not block — it is swept to Completed");
+    }
+    foreach (var person in new[] { TaskState.Created, TaskState.Ready, TaskState.Planning,
+                                   TaskState.AwaitingApproval, TaskState.Paused })
+    {
+        Check(GoalFlow.Device.Agent.GoalAgent.BlocksCompletion(person),
+            $"a {person} task DOES block — a goal waiting on a person is not finished, and "
+            + "retiring it would answer for them");
+    }
+    foreach (var moving in new[] { TaskState.Adapting, TaskState.Retrying })
+    {
+        Check(GoalFlow.Device.Agent.GoalAgent.BlocksCompletion(moving),
+            $"a {moving} task DOES block — it has no legal edge to Completed, so sweeping "
+            + "it would no-op and declare the goal done anyway");
+    }
+
+    var noted = 0;
+    GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, awayEnd, 5, (_, _, _) => noted++);
+    Check(noted == 1, "a planner and an interpreter disagreeing about the length is LOGGED");
+    noted = 0;
+    GoalFlow.Device.Agent.GoalAgent.ResolveLastDay(awayStart, awayEnd, 4, (_, _, _) => noted++);
+    Check(noted == 0, "and when they agree, nothing is logged");
+
+    log.LogInformation("completion gate: {Failures} failure(s)", failures);
+    Console.WriteLine($"gate 34 (a goal retires on its own dates): {(failures == 0 ? "PASS" : $"FAIL: {failures}")}");
+    return Task.FromResult(failures == 0 ? 0 : 1);
+}
+
 public static Task<int> VerifyBackoffAsync(ILoggerFactory loggerFactory)
 {
     var log = loggerFactory.CreateLogger("verify-backoff");
